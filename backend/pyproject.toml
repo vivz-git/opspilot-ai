@@ -1,0 +1,104 @@
+# ---------------------------------------------------------------------------
+# OpsPilot AI — backend package.
+#
+# Version constraints are intentionally lower bounds. The authoritative pins
+# live in the lockfile produced at implementation time (FOUND-002); this file
+# records the *dependency decisions*, not the resolved graph.
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opspilot-backend"
+version = "0.1.0"
+description = "OpsPilot AI — production-style AI operations agent (backend)"
+requires-python = ">=3.12"
+dependencies = [
+  # --- API surface ---
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "sse-starlette>=2.1",            # trace streaming (GET /runs/{id}/events)
+  # --- Typed contracts / configuration ---
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  # --- Agent runtime ---
+  "langgraph>=0.2.50",
+  "langgraph-checkpoint-postgres>=2.0",   # durable pause/resume for HITL
+  "anthropic>=0.40",
+  # --- Persistence ---
+  "sqlalchemy[asyncio]>=2.0",
+  "alembic>=1.14",
+  "asyncpg>=0.30",
+  "psycopg[binary,pool]>=3.2",     # required by the LangGraph Postgres saver
+  # --- Observability ---
+  "structlog>=24.4",
+  "tenacity>=9.0",                 # retry/backoff primitives (bounded only)
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "httpx>=0.27",                   # ASGI transport for API contract tests
+  "freezegun>=1.5",                # deterministic timestamps in evals
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "types-python-dateutil",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ---------------------------------------------------------------------------
+# Lint / format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",   # pycodestyle / pyflakes
+  "I",             # import order
+  "UP",            # pyupgrade
+  "B",             # bugbear
+  "ASYNC",         # async correctness (blocking calls in async defs)
+  "S",             # bandit security rules
+  "T20",           # no print()
+  "RET", "SIM", "C4",
+  "ANN",           # require annotations (typed contracts are load-bearing)
+]
+ignore = ["ANN101", "ANN102", "B008"]  # self/cls annotations; FastAPI Depends()
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN"]           # asserts and loose annotations are fine in tests
+
+# ---------------------------------------------------------------------------
+# Types — the agent state and tool contracts must typecheck strictly.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["langgraph.*", "langgraph_checkpoint.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+  "unit: no I/O, no database",
+  "integration: requires Postgres",
+  "contract: validates a published contract (tool, API, or state)",
+  "eval: deterministic end-to-end evaluation scenario",
+]

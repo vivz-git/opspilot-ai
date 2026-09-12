@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Secrets — never commit real credentials. Only .env.example is tracked.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.sqlite3
+*.db
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+.vitest/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local infrastructure state
+.pgdata/
+pgdata/
+docker-compose.override.yml
+
+# Local scratch
+tmp/
+scratch/
