@@ -2141,7 +2141,7 @@ start on:
 | `OPSPILOT_PLANNER=llm` with no `ANTHROPIC_API_KEY` | Explicitly requesting the LLM planner without a key is a misconfiguration, not something to silently degrade |
 | `OPSPILOT_INTEGRATIONS=real` | No real adapter exists; refusing beats a half-wired external call (§19.4) |
 | `OPSPILOT_ENV=production` and no auth mode | §16.6 fuse |
-| `OPSPILOT_ENV=production` and a default/placeholder `POSTGRES_PASSWORD` | §16.6 fuse |
+| `OPSPILOT_ENV=production` and a placeholder password inside `DATABASE_URL` | §16.6 fuse. It checks the URL the app actually connects with — compose composes `POSTGRES_PASSWORD` into it, so one check covers both deployment shapes |
 | `OPSPILOT_ENV=production` and `CORS_ALLOW_ORIGINS` containing `*` | §16.1 |
 | any budget ≤ 0, or `MAX_RETRIES > 10` | An unbounded-by-typo budget defeats §10.5 |
 | `DATABASE_URL` not using an async driver | Fails loudly at startup rather than mysteriously at first query |

@@ -12,6 +12,7 @@ from app.errors import ConfigurationError
 pytestmark = [pytest.mark.unit]
 
 KEY = "test-key-not-a-real-credential"
+PROD_URL = "postgresql+asyncpg://opspilot:not-a-placeholder-pw@db:5432/opspilot"
 
 
 def settings(**overrides: object) -> Settings:
@@ -50,22 +51,31 @@ class TestStartupFuses:
         """OpsPilot has no authentication; a fuse is worth more than a
         paragraph in a README (§16.6)."""
         with pytest.raises(ConfigurationError, match="OPSPILOT_AUTH_MODE"):
+            settings(OPSPILOT_ENV=Environment.PRODUCTION, DATABASE_URL=PROD_URL).validate_runtime()
+
+    def test_production_refuses_a_placeholder_database_password(self) -> None:
+        with pytest.raises(ConfigurationError, match="database password"):
             settings(
-                OPSPILOT_ENV=Environment.PRODUCTION, POSTGRES_PASSWORD="a-real-secret"
+                OPSPILOT_ENV=Environment.PRODUCTION,
+                OPSPILOT_AUTH_MODE="oidc",
+                DATABASE_URL="postgresql+asyncpg://opspilot:change-me-locally@db:5432/opspilot",
             ).validate_runtime()
 
-    def test_production_refuses_a_placeholder_password(self) -> None:
-        with pytest.raises(ConfigurationError, match="POSTGRES_PASSWORD"):
-            settings(
-                OPSPILOT_ENV=Environment.PRODUCTION, OPSPILOT_AUTH_MODE="oidc"
-            ).validate_runtime()
+    def test_the_fuse_checks_the_url_the_app_actually_connects_with(self) -> None:
+        """A deployment that sets only DATABASE_URL must not trip on
+        POSTGRES_PASSWORD, which exists for docker-compose."""
+        s = settings(
+            OPSPILOT_ENV=Environment.PRODUCTION, OPSPILOT_AUTH_MODE="oidc", DATABASE_URL=PROD_URL
+        )
+        assert s.postgres_password.get_secret_value() == "change-me-locally"
+        s.validate_runtime()
 
     def test_production_refuses_wildcard_cors(self) -> None:
         with pytest.raises(ConfigurationError, match="CORS"):
             settings(
                 OPSPILOT_ENV=Environment.PRODUCTION,
                 OPSPILOT_AUTH_MODE="oidc",
-                POSTGRES_PASSWORD="a-real-secret",
+                DATABASE_URL=PROD_URL,
                 CORS_ALLOW_ORIGINS="*",
             ).validate_runtime()
 
@@ -73,7 +83,7 @@ class TestStartupFuses:
         settings(
             OPSPILOT_ENV=Environment.PRODUCTION,
             OPSPILOT_AUTH_MODE="oidc",
-            POSTGRES_PASSWORD="a-real-secret",
+            DATABASE_URL=PROD_URL,
             CORS_ALLOW_ORIGINS="https://ops.example.com",
         ).validate_runtime()
 

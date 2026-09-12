@@ -11,6 +11,7 @@ from __future__ import annotations
 from enum import StrEnum
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -38,7 +39,9 @@ class Environment(StrEnum):
 
 
 #: Placeholder values that must never reach a production deployment.
-_PLACEHOLDER_PASSWORDS = frozenset({"change-me-locally", "opspilot", "postgres", ""})
+_PLACEHOLDER_PASSWORDS = frozenset(
+    {"change-me-locally", "opspilot", "postgres", "password", "changeme", ""}
+)
 
 
 class Settings(BaseSettings):
@@ -125,6 +128,17 @@ class Settings(BaseSettings):
         return PlannerKind.LLM if self.has_anthropic_key else PlannerKind.RULES
 
     @property
+    def database_password(self) -> str | None:
+        """The password that actually grants database access.
+
+        The fuse below checks this rather than POSTGRES_PASSWORD: the app
+        connects via DATABASE_URL, and docker-compose composes POSTGRES_PASSWORD
+        into it, so checking the URL covers both deployment shapes without
+        falsely tripping on a deployment that sets only DATABASE_URL.
+        """
+        return urlsplit(self.database_url.get_secret_value()).password
+
+    @property
     def budgets(self) -> Budgets:
         return Budgets(
             max_retries=self.max_retries,
@@ -181,8 +195,10 @@ class Settings(BaseSettings):
                     "OPSPILOT_ENV=production requires OPSPILOT_AUTH_MODE; "
                     "OpsPilot has no authentication and must not be exposed (see §16.6)"
                 )
-            if self.postgres_password.get_secret_value() in _PLACEHOLDER_PASSWORDS:
-                problems.append("OPSPILOT_ENV=production requires a real POSTGRES_PASSWORD")
+            if (self.database_password or "") in _PLACEHOLDER_PASSWORDS:
+                problems.append(
+                    "OPSPILOT_ENV=production requires a real database password in DATABASE_URL"
+                )
             if "*" in self.cors_allow_origins:
                 problems.append("OPSPILOT_ENV=production forbids wildcard CORS_ALLOW_ORIGINS")
 
