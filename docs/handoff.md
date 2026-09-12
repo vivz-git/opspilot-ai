@@ -155,6 +155,7 @@ it.
 | Obtain an `ANTHROPIC_API_KEY` from <https://console.anthropic.com/settings/keys> and put it in `.env` | `OPSPILOT_PLANNER=llm`; LLM-written plans and outreach copy | **No.** With no key, `auto` uses the deterministic rule planner and the template content generator. All nine tools, approvals, verification, the evaluation suite and the dashboard work unchanged. |
 | Choose and add a license file | Reuse and contribution clarity on a public repository | No, but decide early |
 | Provide a deployment target and credentials | Anything beyond local Docker | No. Local `docker compose` is the supported environment, and `OPSPILOT_ENV=production` deliberately refuses to start without authentication (ADR-017). |
+| Grant the Claude GitHub App access to `vivz-git/opspilot-ai` | Pushing this branch to the remote | **Yes, for pushing only.** The architecture session's ten commits exist locally on `claude/great-euler-ql1wxj`; `git push` returned 403 because the app is not installed for the repository. An org admin can install it at <https://github.com/apps/claude/installations/select_target>, or reconnect GitHub from claude.ai settings. Re-run `git push -u origin claude/great-euler-ql1wxj` afterwards — nothing needs rebuilding. |
 
 If you hit a new blocker of this kind: add the correct placeholder to
 `.env.example`, wire it through `app/config.py`, document it in this table, and

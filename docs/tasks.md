@@ -166,7 +166,7 @@ finished while the properties the product claims are unimplemented.
 Use the stronger model where a wrong decision is expensive to unwind, not where
 the work is merely long.
 
-### OPUS 5 — 15 tasks
+### OPUS 5 — 16 of 70 tasks
 
 | Task | Why it needs deeper reasoning |
 |---|---|
@@ -186,11 +186,13 @@ the work is merely long.
 | TEST-002 | Choosing which graph behaviours to pin, and how |
 | TEST-003 | The tests that carry the product's safety claims |
 
+| DOC-003 | Writing an ADR for a deviation — deciding whether a change is architectural is the judgement |
+
 Also OPUS, by policy rather than by task: any architectural refactor, any
 change to the approval or verification path, any difficult debugging session,
 and any change that would alter a metric definition.
 
-### SONNET 5 — everything else (≈60 tasks)
+### SONNET 5 — the other 53 tasks (AGENT-001 is already done)
 
 All CRUD and repositories, every migration, the nine tool implementations
 (contracts are already fixed), all API route handlers once API-001 defines the
