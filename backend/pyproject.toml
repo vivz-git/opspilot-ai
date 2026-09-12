@@ -20,7 +20,7 @@ dependencies = [
   "uvicorn[standard]>=0.32",
   "sse-starlette>=2.1",            # trace streaming (GET /runs/{id}/events)
   # --- Typed contracts / configuration ---
-  "pydantic>=2.9",
+  "pydantic[email]>=2.9",           # EmailStr: recipients are validated, not trusted
   "pydantic-settings>=2.6",
   # --- Agent runtime ---
   "langgraph>=0.2.50",

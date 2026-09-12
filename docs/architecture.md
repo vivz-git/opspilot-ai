@@ -288,6 +288,38 @@ Two consequences worth stating as rules:
   architecture in one giant agent function"), and thinness is enforced by
   review plus the node unit tests in §18.
 
+### 4.1.1 Package layout
+
+Modules marked **[built]** exist and are covered by tests; the rest are the
+declared destinations for `docs/tasks.md`. Nothing outside `[built]` is
+implemented yet, and no document should be read as claiming otherwise.
+
+```
+backend/app/
+  errors.py          [built]  error taxonomy + recovery policy (leaf: no app deps)
+  security.py        [built]  canonical args hash + ApprovalToken (leaf)
+  config.py          [built]  the single Settings object and its startup fuses
+  tools/
+    schemas.py       [built]  typed IO contracts for all nine tools
+    contracts.py     [built]  the contract registry and its policy invariants
+    registry.py               dispatch: validate, gate, time, trace          (TOOL-002)
+    impl/                     tool implementations over ports                (TOOL-003)
+  agent/
+    state.py         [built]  AgentState, its models and its reducers
+    graph.py                  graph assembly and conditional edges           (AGENT-002)
+    nodes/                    one module per node                            (AGENT-003+)
+    planner/                  RulePlanner | LLMPlanner behind one Protocol   (AGENT-006)
+    verifiers/                invariant and readback verifiers               (VERIFY-001)
+  integrations/
+    ports.py                  Protocols; mutating methods require a token    (TOOL-001)
+    mock/                     the only adapter set; no network imports       (TOOL-001)
+  persistence/                SQLAlchemy models, repositories, Alembic       (DB-001+)
+  api/                        FastAPI routers and response models            (API-001+)
+  observability/              TraceRecorder, @traced_node, redaction         (OBS-001+)
+  evaluation/                 runner, cases, metrics                         (EVAL-001+)
+backend/tests/             [built]  policy, state, recovery, security, structure
+```
+
 ### 4.2 Planner strategy: dual implementation (ADR-002)
 
 ```python
@@ -1088,7 +1120,7 @@ at least twice per approval. It is therefore written to be idempotent:
 
 Every failure is classified into exactly one class before `recover` reasons
 about it. Classification is a pure function of the exception type plus the
-tool's contract, and it lives in `app/agent/errors.py`.
+tool's contract, and it lives in `app/errors.py` (a leaf module, so every layer may depend on it).
 
 | Class | Examples | Recoverable | Action |
 |---|---|---|---|

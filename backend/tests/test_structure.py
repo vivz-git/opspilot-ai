@@ -1,0 +1,106 @@
+"""Tests that enforce architecture rather than behaviour (§18.6).
+
+These are cheap and they prevent whole classes of regression that reviewers
+reliably miss.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+
+pytestmark = [pytest.mark.unit]
+
+APP = Path(__file__).resolve().parent.parent / "app"
+#: Anything that could open a socket. Reachable from the mock integration
+#: package, any of these would make "send_email_mock cannot send mail" false.
+NETWORK_MODULES = frozenset(
+    {"socket", "smtplib", "aiosmtplib", "httpx", "requests", "urllib", "urllib3", "http", "ftplib"}
+)
+
+
+def python_files(root: Path) -> list[Path]:
+    return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+def imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+def test_only_config_reads_the_environment() -> None:
+    """§17.1 — one settings object, no exceptions. A stray
+    os.getenv("ANTHROPIC_API_KEY") is how secrets reach log lines."""
+    offenders = []
+    for path in python_files(APP):
+        if path.name == "config.py":
+            continue
+        source = path.read_text(encoding="utf-8")
+        if "os.environ" in source or "os.getenv" in source:
+            offenders.append(str(path.relative_to(APP.parent)))
+    assert not offenders, f"these modules must read Settings instead: {offenders}"
+
+
+def test_mock_integrations_cannot_reach_the_network() -> None:
+    """§19.2 — the strongest of the three reasons send_email_mock cannot send
+    mail. Applies as soon as the package exists."""
+    mock_dir = APP / "integrations" / "mock"
+    if not mock_dir.exists():
+        pytest.skip("mock adapters not implemented yet (TOOL-001)")
+    offenders = {}
+    for path in python_files(mock_dir):
+        bad = imported_modules(path) & NETWORK_MODULES
+        if bad:
+            offenders[str(path.relative_to(APP.parent))] = sorted(bad)
+    assert not offenders, f"network-capable imports in the mock package: {offenders}"
+
+
+def test_no_real_integration_adapter_exists_yet() -> None:
+    """OPSPILOT_INTEGRATIONS=real refuses to start; nothing should quietly
+    appear under integrations/real without the config fuse being revisited."""
+    real_dir = APP / "integrations" / "real"
+    if real_dir.exists():
+        from app.config import IntegrationMode, Settings
+        from app.errors import ConfigurationError
+
+        with pytest.raises(ConfigurationError):
+            Settings(_env_file=None, OPSPILOT_INTEGRATIONS=IntegrationMode.REAL).validate_runtime()
+
+
+def test_no_dynamic_execution_of_model_output() -> None:
+    """§16.3 — no code path executes planner or tool output."""
+    forbidden = {"eval", "exec", "compile", "__import__"}
+    offenders = {}
+    for path in python_files(APP):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in forbidden
+        }
+        if found:
+            offenders[str(path.relative_to(APP.parent))] = sorted(found)
+    assert not offenders, f"dynamic execution is forbidden: {offenders}"
+
+
+def test_the_leaf_modules_stay_leaves() -> None:
+    """errors.py and security.py must remain importable from any layer, so
+    they may not depend on higher layers."""
+    for leaf, allowed in (("errors.py", set()), ("security.py", {"errors"})):
+        tree = ast.parse((APP / leaf).read_text(encoding="utf-8"), filename=leaf)
+        internal = {
+            node.module.split(".")[1]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app.")
+        }
+        assert internal <= allowed, f"{leaf} gained a dependency on {internal - allowed}"
