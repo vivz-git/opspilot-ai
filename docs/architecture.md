@@ -1291,3 +1291,412 @@ pagination loops), never mutate, and never call an LLM. Every result is
 persisted in `execution_steps.verification` and mirrored into the trace, so the
 dashboard shows a per-step badge — `verified`, `not required`, or `unconfirmed`
 — and the evaluation suite can assert on it directly (§15.3).
+
+---
+
+## 12. Persistence and domain model
+
+### 12.1 Schema layout
+
+| Schema | Owner | Contents |
+|---|---|---|
+| `opspilot` | Alembic (ours) | `agent_runs`, `execution_steps`, `tool_calls`, `approvals`, `trace_events`, `evaluation_runs`, `evaluation_results` |
+| `langgraph` | the LangGraph Postgres saver | checkpoints. **Never hand-edited, never in our migrations** — a library upgrade must not collide with an Alembic revision. |
+| `mock_crm` | Alembic (ours), but conceptually external | `companies`, `leads`, `customers`, `outreach_drafts`, `email_outbox` |
+
+### 12.2 Two sources of truth, deliberately
+
+The LangGraph checkpoint is the **resumable execution state**; the `opspilot`
+tables are the **queryable history**. They overlap, and that is intentional:
+
+- the checkpoint is opaque, versioned by a third party, and unsuitable for
+  `SELECT … WHERE status='awaiting_approval' ORDER BY created_at`;
+- the control-plane tables are stable, indexed, and safe to report on, but
+  cannot resume a graph.
+
+The rule that keeps them consistent: **the checkpoint is authoritative for
+resumption; the tables are authoritative for reporting.** Nodes write both
+through `TraceRecorder`/repositories in the same transaction boundary as their
+state delta wherever possible, and the reconciler (§2.4) repairs runs whose
+process died between the two. Recorded as ADR-012 with the divergence risk
+stated plainly rather than hidden.
+
+### 12.3 `opspilot.agent_runs`
+
+One row per run. The aggregate root.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | also the LangGraph `thread_id` — one identifier for the run everywhere |
+| `parent_run_id` | uuid FK → `agent_runs.id` null | retry lineage; history is immutable, so a retry is a new run |
+| `status` | enum | `created, queued, running, awaiting_approval, completed, failed, rejected, cancelled, expired` |
+| `status_reason` | text null | `budget_exhausted`, `approval_rejected`, `approval_expired`, `verification_failed`, `out_of_scope`, `orphaned`, … |
+| `user_request` | text | verbatim input |
+| `normalized_task` | jsonb null | `NormalizedTask` |
+| `plan` | jsonb null | current plan; revisions live in `plan_history` |
+| `plan_history` | jsonb | array of superseded plans |
+| `plan_revision` | int | current revision |
+| `final_response` | jsonb null | `FinalResponse` |
+| `planner_kind` | text | `rules` \| `llm` — reproducibility |
+| `model_id`, `prompt_version`, `seed` | text/text/bigint | reproducibility |
+| `idempotency_key` | text null | unique; de-duplicates `POST /runs` |
+| `actor_id` | text null | who submitted (auth boundary placeholder, §16.6) |
+| `step_count`, `retry_total`, `replan_count` | int | denormalised counters so the run list needs no joins |
+| `deadline_at` | timestamptz | absolute wall-clock budget |
+| `lease_expires_at` | timestamptz null | heartbeat; a stale lease on a `running` run means an orphan |
+| `created_at`, `started_at`, `finished_at`, `updated_at` | timestamptz | lifecycle |
+| `duration_ms` | int null | `finished_at - started_at`, materialised for metrics |
+| `evaluation_run_id` | uuid FK null | set when the run was produced by the eval suite |
+| `eval_case_id` | text null | which case |
+| `metadata` | jsonb | budget snapshot, client info |
+
+**Indexes** `(status, created_at desc)` (dashboard list and approval queue),
+`(created_at desc)`, unique `(idempotency_key)`, `(parent_run_id)`,
+`(evaluation_run_id)`, partial `(lease_expires_at)` where
+`status in ('running','queued')` (the reconciler's only query).
+
+### 12.4 `opspilot.execution_steps`
+
+One row per **planned step instance**, including fan-out children. This is the
+plan-vs-actual table the timeline renders.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `run_id` | uuid FK → `agent_runs` ON DELETE CASCADE | |
+| `step_id` | text | plan-local: `s2`, or `s2[1]` for a fan-out child |
+| `parent_step_id` | text null | the fan-out parent |
+| `plan_revision` | int | which revision planned it |
+| `seq` | int | execution order within the run |
+| `tool`, `tool_version` | text | |
+| `status` | enum | `pending, ready, awaiting_approval, running, succeeded, failed, skipped, rejected` |
+| `args` | jsonb | resolved arguments, redacted and truncated |
+| `args_hash` | text | joins the step to its approval (§9.4) |
+| `result` | jsonb null | validated output, redacted and truncated |
+| `attempts`, `retry_count` | int | |
+| `verification_status` | enum | `not_required, passed, failed, unconfirmed` — a column, not buried in JSON, because the UI badges and evals filter on it |
+| `verification` | jsonb null | full `VerificationResult` with per-check detail |
+| `error` | jsonb null | `{class, message, detail}` of the final failure |
+| `depends_on` | text[] | |
+| `optional` | bool | |
+| `started_at`, `finished_at`, `duration_ms` | | |
+
+**Indexes** unique `(run_id, step_id, plan_revision)`, `(run_id, seq)`,
+`(run_id, status)`, `(verification_status)` where
+`verification_status = 'failed'` (the "what silently didn't work" query).
+
+### 12.5 `opspilot.tool_calls`
+
+One row per **attempt**. Separate from `execution_steps` precisely because a
+step has many attempts, and collapsing them would erase retry evidence.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `run_id` | uuid FK | |
+| `execution_step_id` | uuid FK → `execution_steps` ON DELETE CASCADE | |
+| `step_id` | text | denormalised for direct querying |
+| `attempt` | int | 1-based |
+| `tool`, `tool_version` | text | |
+| `input`, `output` | jsonb | redacted, truncated |
+| `input_hash` | text | |
+| `status` | enum | `succeeded, failed, timeout, duplicate_suppressed` |
+| `error_class`, `error_message` | text null | `error_class` is a column so tool success rate and failure mix are single-scan aggregates |
+| `idempotency_key` | text null | |
+| `port`, `adapter` | text | e.g. `MailPort` / `mock`. **An audit record that the mock adapter served the call** (§19.3) |
+| `duration_ms`, `started_at`, `finished_at` | | |
+
+**Indexes** unique `(execution_step_id, attempt)`, `(run_id, started_at)`,
+`(tool, status)` (tool success rate), `(idempotency_key)` (double-effect
+investigation), `(error_class)` where `status='failed'`.
+
+### 12.6 `opspilot.approvals`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | the `approval_id` in the API |
+| `run_id` | uuid FK, `step_id` text | |
+| `tool`, `risk` | text/enum | |
+| `title`, `summary` | text | operator-facing |
+| `payload_preview` | jsonb | de-referenced effect: full draft, or field diff |
+| `args_hash` | text | the binding (§9.4) |
+| `status` | enum | `pending, approved, rejected, expired, superseded, cancelled` |
+| `superseded_by` | uuid FK null | chain when a replan changes the arguments |
+| `requested_at`, `expires_at` | timestamptz | |
+| `decided_at`, `decided_by`, `decision_reason` | | `decided_by` is the audit answer to "who authorised this" |
+
+**Indexes**
+- **partial unique `(run_id, step_id) WHERE status = 'pending'`** — the database
+  guarantees at most one open approval per step, which is what makes the
+  re-executed `request_approval` node idempotent (§9.7);
+- `(status, expires_at)` — the TTL sweeper's only query;
+- `(status, requested_at desc)` — the approval queue;
+- `(run_id)`.
+
+### 12.7 `opspilot.trace_events`
+
+Append-only. Never updated, never deleted except by retention.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | bigserial PK | |
+| `run_id` | uuid FK | |
+| `seq` | bigint | **per-run monotonic**; the SSE event id and the polling cursor |
+| `ts` | timestamptz | |
+| `kind` | enum | see §14.2 |
+| `severity` | enum | `debug, info, warning, error` |
+| `node`, `tool`, `step_id`, `attempt` | text/int null | |
+| `input`, `output` | jsonb null | redacted, truncated |
+| `status`, `duration_ms`, `retry_count` | | |
+| `error` | jsonb null | |
+| `payload` | jsonb | kind-specific extras (backoff delay, approval id, budget counters) |
+
+**Indexes** unique `(run_id, seq)` (cursor correctness — a gap or duplicate in
+the timeline is a bug, so the database forbids it), `(run_id, id)`,
+`(kind, ts desc)`, BRIN on `ts` for retention scans.
+
+**Growth** This is the fastest-growing table by an order of magnitude.
+Retention: 90 days, via monthly range partitions on `ts` so expiry is a
+`DROP PARTITION` rather than a mass `DELETE`. Partitioning is deferred to
+OBS-004 but the column layout already assumes it.
+
+### 12.8 `opspilot.evaluation_runs` / `evaluation_results`
+
+`evaluation_runs` — one row per suite execution:
+`id`, `suite`, `status (running|completed|failed)`, `started_at`, `finished_at`,
+`git_sha`, `planner_kind`, `model_id`, `prompt_version`, `seed`,
+`case_count`, `passed`, `failed`, `metrics jsonb` (the §15.4 snapshot).
+Index `(suite, started_at desc)`.
+
+`evaluation_results` — one row per case:
+`id`, `evaluation_run_id` FK ON DELETE CASCADE, `case_id`,
+`run_id` FK → `agent_runs` (the real run the case executed — every eval result
+links to a full, inspectable trace), `passed`, `assertions jsonb`
+(`[{name, expected, observed, passed}]`), `duration_ms`, `retry_count`,
+`tool_calls_count`, `approval_outcome`, `failure_reason`.
+Unique `(evaluation_run_id, case_id)`; index `(case_id, passed)` so
+"when did this case start failing" is one query.
+
+`git_sha` plus `prompt_version` plus `seed` is the minimum needed to attribute a
+regression to a change. Without them the metrics are numbers without a cause.
+
+### 12.9 `mock_crm` — the simulated system of record
+
+| Table | Key fields | Lifecycle |
+|---|---|---|
+| `companies` | `company_id` PK, `domain` unique, `name`, `industry`, `employee_count`, `revenue_band`, `hq_location`, `funding_stage`, `tech_stack jsonb`, `signals jsonb` | static fixture |
+| `leads` | `lead_id` PK, `full_name`, `title`, `email`, `company_id` FK, `status`, `source`, `owner`, `phone`, `timezone`, `tags text[]`, `last_contacted_at`, `notes` | `status`: `new, working, qualified, disqualified` |
+| `customers` | `customer_id` PK, `email` unique, `account_name`, `primary_contact`, `phone`, `status`, `plan`, `mrr`, `owner`, **`version int not null default 1`**, `updated_at` | `version` increments on every update — the optimistic-concurrency token `update_customer` requires |
+| `outreach_drafts` | `draft_id` PK, `lead_id` FK, `channel`, `subject`, `body`, `content_hash`, `status`, `version`, timestamps | `status`: `saved, sent, archived` |
+| `email_outbox` | `outbox_id` PK, `message_id` unique, `draft_id` FK, `to_email`, `subject`, `body`, `status`, `provider`, **`idempotency_key` unique**, `run_id`, `approval_id`, `created_at` | `status`: `sent, failed`; `provider` is always `mock` |
+
+Two of these columns are controls rather than data:
+
+- `email_outbox.idempotency_key UNIQUE` is what makes a retried send physically
+  incapable of producing a second message. It is a database constraint, not
+  application logic, because application logic is what we are trying to protect
+  against.
+- `email_outbox.run_id` / `approval_id` make **every simulated send traceable to
+  the human decision that authorised it**. An outbox row with a null
+  `approval_id` is, by definition, a safety bug — and that is an assertable
+  invariant (§18).
+
+### 12.10 JSONB where the shape evolves, columns where we query
+
+`plan`, `args`, `result`, `verification` and `payload` are JSONB: their shape
+will change as the planner improves, and they are always read by run, never
+filtered across. Anything we **aggregate or filter** on — `status`, `tool`,
+`error_class`, `verification_status`, `duration_ms`, `attempt` — is promoted to
+a real column with a real index. The hybrid is chosen consciously (ADR-014):
+fully normalising the plan would produce a schema migration per planner
+improvement, and putting `error_class` in JSONB would make the tool-success
+metric a full table scan.
+
+---
+
+## 13. API contracts
+
+Base path `/api/v1`. JSON only. All timestamps are RFC 3339 UTC. The OpenAPI
+document at `/openapi.json` is generated from the Pydantic models and is the
+normative artifact the frontend generates types from (§3.2).
+
+### 13.1 Error envelope
+
+Every non-2xx response is `application/problem+json` (RFC 9457) plus a stable
+machine-readable `code`:
+
+```json
+{
+  "type": "https://opspilot.dev/errors/approval-not-pending",
+  "title": "Approval is not pending",
+  "status": 409,
+  "detail": "Approval 6f2… was already rejected at 2026-09-12T18:04:11Z.",
+  "instance": "/api/v1/approvals/6f2.../decision",
+  "code": "approval_not_pending",
+  "errors": [],
+  "trace_id": "01JB…"
+}
+```
+
+Clients branch on `code`, never on `detail` prose. `trace_id` is echoed on every
+error so an operator report maps to logs.
+
+| `code` | HTTP | Meaning |
+|---|---|---|
+| `validation_error` | 422 | Body or query failed schema validation; `errors[]` is field-level |
+| `not_found` | 404 | Unknown run, approval or evaluation |
+| `run_not_startable` | 409 | Start attempted on a run not in `created` |
+| `run_not_resumable` | 409 | Decision posted against a terminal run |
+| `approval_not_pending` | 409 | Already decided; response echoes the recorded decision |
+| `approval_expired` | 409 | TTL elapsed |
+| `approval_superseded` | 409 | Arguments changed since the operator saw them |
+| `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
+| `budget_exhausted` | 409 | Operation would exceed a configured budget |
+| `integration_unavailable` | 503 | Adapter or database unreachable; retryable |
+| `internal_error` | 500 | Bug. Generic message only; detail goes to logs, never to the client (§16.5) |
+
+### 13.2 Runs
+
+#### `POST /api/v1/runs` → `201`
+Header: `Idempotency-Key` (optional, recommended).
+```json
+{ "user_request": "Find the top 3 fintech leads in London, research them, score them, draft outreach to the best one and email it.",
+  "auto_start": true,
+  "metadata": { "source": "dashboard" } }
+```
+Response `RunResource` (§13.3). `422` on empty/oversized request (`≤ 4000`
+chars). Replaying the same `Idempotency-Key` with an identical body returns the
+**same** run and `200`; a different body returns `409 idempotency_conflict`.
+
+#### `POST /api/v1/runs/{run_id}/start` → `202`
+Body-less. Transitions `created → queued` and schedules execution. `409
+run_not_startable` otherwise. Deliberately **not** synchronous: a run may take
+minutes and may pause for a human, so no HTTP request ever waits for one.
+
+#### `GET /api/v1/runs/{run_id}` → `200`
+The single resource the run-detail page needs; `?include=steps,plan,approvals`
+(default all) keeps the list endpoint cheap.
+
+#### `GET /api/v1/runs` → `200`
+Query: `status` (repeatable), `since`, `until`, `parent_run_id`, `q`,
+`limit ≤ 100` (default 25), `cursor`.
+```json
+{ "items": [ /* RunSummary */ ], "next_cursor": "eyJjcmVhdGVkX2F0…", "total_estimate": 143 }
+```
+Keyset pagination on `(created_at, id)` — offset pagination would shift rows
+under an operator while new runs arrive.
+
+#### `POST /api/v1/runs/{run_id}/cancel` → `202`
+Cooperative: sets a cancellation flag the graph observes at node boundaries.
+Terminal runs → `409`. It never kills a tool mid-effect, because a half-applied
+mutation is worse than a slightly late cancellation.
+
+#### `POST /api/v1/runs/{run_id}/retry` → `201`
+Creates a **new** run with `parent_run_id` set, copying `user_request`. The
+original is never modified (§10.6).
+
+### 13.3 `RunResource`
+
+```json
+{
+  "run_id": "0193f…", "parent_run_id": null,
+  "status": "awaiting_approval", "status_reason": null,
+  "user_request": "Find the top 3 fintech leads…",
+  "normalized_task": { "intent": "prospect_and_outreach",
+                       "entities": {"industry": "fintech", "location": "London", "limit": 3},
+                       "requires_mutation": true, "in_scope": true, "confidence": 0.93 },
+  "plan": { "plan_id": "p_1", "revision": 0, "created_by": "rules",
+            "steps": [ { "step_id": "s1", "tool": "search_leads",
+                         "args": {"industry": "fintech", "location": "London", "limit": 3},
+                         "depends_on": [], "rationale": "Locate candidate leads",
+                         "requires_approval": false, "status": "succeeded" } ] },
+  "steps": [ { "step_id": "s1", "seq": 1, "tool": "search_leads", "status": "succeeded",
+               "attempts": 1, "retry_count": 0, "verification_status": "passed",
+               "duration_ms": 42, "error": null } ],
+  "pending_approval": { "approval_id": "6f2…", "step_id": "s6", "tool": "send_email_mock",
+                        "risk": "high", "title": "Send outreach email to dana@northwind.example",
+                        "summary": "Sends the saved draft d_91f…",
+                        "payload_preview": { "to_email": "dana@northwind.example",
+                                             "subject": "Cutting reconciliation time at Northwind",
+                                             "body": "Hi Dana, …" },
+                        "args_hash": "9c1d…", "expires_at": "2026-09-13T18:04:11Z" },
+  "counters": { "step_count": 6, "retry_total": 1, "replan_count": 0 },
+  "resumable": true,
+  "final_response": null,
+  "timestamps": { "created_at": "…", "started_at": "…", "finished_at": null,
+                  "deadline_at": "…" },
+  "metadata": { "planner_kind": "rules", "model_id": null, "prompt_version": "v1", "seed": 1337 }
+}
+```
+
+`requires_approval` on each step and `resumable` on the run are **backend
+judgements exposed as fields** — the frontend must never compute them (§3.1).
+
+### 13.4 Trace
+
+#### `GET /api/v1/runs/{run_id}/trace` → `200`
+Query: `since_seq` (cursor), `limit ≤ 500`, `kind` (repeatable), `severity_min`.
+```json
+{ "run_id": "0193f…", "events": [
+    { "seq": 14, "ts": "…", "kind": "tool_failed", "severity": "warning",
+      "node": "execute_tool", "tool": "research_company", "step_id": "s2[1]",
+      "attempt": 1, "status": "failed", "duration_ms": 2001,
+      "error": { "class": "TRANSIENT", "message": "upstream timeout" },
+      "retry_count": 0, "payload": { "next_delay_ms": 250 } } ],
+  "next_seq": 15, "complete": false }
+```
+
+#### `GET /api/v1/runs/{run_id}/events` → SSE
+`text/event-stream`, one `TraceEvent` per message, `id:` = `seq`. Honours
+`Last-Event-ID` by replaying from that sequence, so a reconnect leaves no gap.
+Heartbeat comment every 15s. Terminates on a terminal run event. The endpoint
+is an optimization over §13.4 polling and carries no unique data (§3.3).
+
+### 13.5 Approvals
+
+#### `GET /api/v1/approvals` → `200`
+Query: `status` (default `pending`), `run_id`, `risk`, `limit`, `cursor`. This is
+the approval-queue endpoint.
+
+#### `POST /api/v1/approvals/{approval_id}/decision` → `200`
+```json
+{ "decision": "approve", "decided_by": "operator@example.com",
+  "reason": "Checked the draft; send it.", "args_hash": "9c1d…" }
+```
+- `decision` ∈ `approve | reject`; `reason` required on `reject` (`≤ 500`).
+- **`args_hash` is optional but strongly recommended**: the UI echoes the hash it
+  displayed, and a mismatch returns `409 approval_superseded`. This prevents an
+  operator approving a screen that has since gone stale — an optimistic
+  concurrency check on a human decision.
+- `200` returns the `ApprovalResource`; resume is dispatched asynchronously, so
+  the response does not wait for the agent.
+- Conflicts per §9.8.
+
+### 13.6 Evaluations
+
+| Endpoint | Method | Behaviour |
+|---|---|---|
+| `/api/v1/evaluations/runs` | `POST` | `{ "suite": "all" \| "smoke" \| "safety", "case_ids": ["…"], "planner": "rules" }` → `202` `EvaluationRunResource(status=running)` |
+| `/api/v1/evaluations/runs` | `GET` | list, newest first |
+| `/api/v1/evaluations/runs/{id}` | `GET` | run + `metrics` snapshot |
+| `/api/v1/evaluations/runs/{id}/results` | `GET` | per-case results; `?passed=false` for failures only. Each result carries `run_id` so the UI links straight to the full trace |
+| `/api/v1/evaluations/metrics` | `GET` | `?window=30d&suite=all` — metric time series for the dashboard |
+
+### 13.7 Catalog and health
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/v1/tools` | The contract registry: `name`, `version`, `purpose`, `side_effect`, `requires_approval`, `risk`, `verification`, `idempotent`, JSON Schema for input and output. Rendered by `/tools` so contract changes are visible without reading code. |
+| `GET /healthz` | Liveness. Process only, no dependencies. |
+| `GET /readyz` | Readiness: database reachable **and** Alembic head applied. Returns `503` with `code=integration_unavailable` otherwise, so a container with a stale schema never receives traffic. |
+
+### 13.8 Cross-cutting rules
+
+- **Idempotency** `POST /runs` and `POST /approvals/{id}/decision` are safe to
+  retry; both are idempotent by design, not by convention.
+- **Pagination** keyset everywhere, `limit` capped server-side.
+- **Validation** Pydantic `extra="forbid"` on request bodies: an unknown field is
+  a `422`, never a silent drop, so a frontend/backend contract drift is loud.
+- **No agent semantics in query parameters.** There is no
+  `?skip_approval=true`, and there never will be. A capability that dangerous
+  must not be reachable by editing a URL.
