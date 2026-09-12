@@ -656,3 +656,638 @@ Nodes never mutate `state` in place; the reducers own composition.
 - **Writes** terminal `status=failed`, `status_reason`, final trace event
 - **Guarantee** always reached through an explicit edge — the graph has no
   implicit error sink, so no failure mode is unrecorded.
+
+---
+
+## 8. Tool system and contracts
+
+### 8.1 A tool is a contract, not a function
+
+Every capability is declared as a `ToolContract` in a single registry
+(`backend/app/tools/contracts.py`). The contract, not the implementation, is
+what the planner reads, what the approval gate consults, what the verifier
+obeys, what the API publishes at `GET /tools`, and what the dashboard renders.
+
+```python
+class ToolContract(BaseModel):
+    name: ToolName                  # registry key; also the planner's vocabulary
+    version: str                    # semver; recorded on every tool_call
+    purpose: str                    # one line, shown to the operator
+    input_model: type[BaseModel]    # strict, extra="forbid"
+    output_model: type[BaseModel]   # strict, extra="forbid"
+    side_effect: SideEffect         # READ_ONLY | INTERNAL_WRITE | CUSTOMER_WRITE | OUTBOUND | DESTRUCTIVE
+    requires_approval: bool
+    risk: RiskLevel                 # LOW | MEDIUM | HIGH
+    verification: VerificationMode  # NONE | INVARIANT | READBACK
+    idempotent: bool                # may a failed attempt be safely retried?
+    nondeterministic: bool          # generative output; a retry may differ
+    untrusted_output: bool          # output embeds third-party text (§16.3)
+    timeout_ms: int
+    retryable_errors: frozenset[ErrorClass]
+    failure_modes: list[FailureMode]
+    port: str                       # which integration port it dispatches through
+```
+
+### 8.2 The policy invariants
+
+These are **not documentation**. They are asserted by
+`tests/test_tool_policy.py`, which iterates the registry. A future tool that
+mutates customer data without an approval flag fails CI.
+
+| # | Invariant | Rationale |
+|---|---|---|
+| P1 | `side_effect ∈ {CUSTOMER_WRITE, OUTBOUND, DESTRUCTIVE}` ⇒ `requires_approval` | The classes of operation the brief requires a human for. |
+| P2 | `side_effect != READ_ONLY` ⇒ `verification == READBACK` | Any claimed effect on the world must be independently confirmed (§11). |
+| P3 | `side_effect == READ_ONLY` ⇒ `not requires_approval` | Approving reads trains operators to click approve. Approval fatigue is a safety failure, not a safety feature. |
+| P4 | `requires_approval` ⇒ an idempotency key is derivable from the step | A retry after an approved attempt must not double-apply the effect. |
+| P5 | `not idempotent` ⇒ `ErrorClass.VERIFICATION_FAILED ∉ retryable_errors` | Never retry an unverified non-idempotent mutation; that is how one email becomes two (§11.4). |
+| P6 | `DESTRUCTIVE` ⇒ `risk == HIGH` and the readback asserts **absence** | No destructive tool exists today; the rule exists so the first one is designed correctly. |
+| P7 | Every declared `failure_mode.error_class` is in the error taxonomy (§10.1) | No tool may invent an error class the recovery node cannot classify. |
+
+### 8.3 Contract matrix
+
+| Tool | Side effect | Approval | Verification | Idempotent | Port | Risk |
+|---|---|---|---|---|---|---|
+| `search_leads` | READ_ONLY | no | INVARIANT | yes | LeadPort | LOW |
+| `get_lead` | READ_ONLY | no | NONE | yes | LeadPort | LOW |
+| `research_company` | READ_ONLY | no | INVARIANT | yes | CompanyPort | LOW |
+| `score_lead` | READ_ONLY | no | INVARIANT | yes | — (pure) | LOW |
+| `draft_outreach` | READ_ONLY | no | INVARIANT | no¹ | ContentPort | MEDIUM |
+| `save_draft` | INTERNAL_WRITE | no² | READBACK | yes | DraftPort | MEDIUM |
+| `send_email_mock` | OUTBOUND | **YES** | READBACK | yes³ | MailPort | HIGH |
+| `get_customer` | READ_ONLY | no | NONE | yes | CustomerPort | LOW |
+| `update_customer` | CUSTOMER_WRITE | **YES** | READBACK | yes³ | CustomerPort | HIGH |
+
+¹ Generative: a retry produces different text, so `nondeterministic=True`. It
+writes nothing, so re-running is safe — but the *output* must not be assumed
+stable across attempts, which is why the draft is persisted by a separate step
+before it can be sent.
+² See ADR-008. `save_draft` mutates, but only an internal, reversible,
+non-outbound artifact. Gating it would double the approval count for the
+canonical workflow and buy nothing — the operator's meaningful decision is
+"send this", and at that moment they approve the *saved* draft.
+³ Idempotent **via the step's idempotency key**, not intrinsically. The mock
+adapters enforce a unique constraint on `(idempotency_key)`; a replayed attempt
+returns the original result instead of applying a second effect.
+
+### 8.4 Per-tool contracts
+
+Schemas below are the normative field lists; the executable versions live in
+`backend/app/tools/schemas.py`. All models are `extra="forbid"` — an unexpected
+field from a planner or an adapter is an error, not a silent pass-through.
+
+#### `search_leads` — find candidate leads
+- **Purpose** Filter the lead database. The usual entry point of a workflow.
+- **Input** `industry?: str`, `location?: str`, `min_employees?: int≥0`,
+  `max_employees?: int≥0`, `status?: LeadStatus`, `query?: str(≤200)`,
+  `limit: int = 10 (1..50)`, `offset: int = 0`
+- **Output** `leads: list[LeadSummary]`, `total_matched: int`, `truncated: bool`
+  where `LeadSummary = {lead_id, full_name, title, email, company_id,
+  company_name, status, source, created_at}`
+- **Validation** `max_employees ≥ min_employees`; `limit ≤ 50` (a cost bound, not
+  a preference); at least one filter or `query` must be present, so the planner
+  cannot request the whole table
+- **Failure modes** `INPUT_VALIDATION` (contradictory filters);
+  `TRANSIENT` (store unavailable). **Zero matches is a success**, not a failure —
+  `leads: []`. Conflating the two would make the agent retry an honest answer.
+- **Verification** INVARIANT: `len(leads) ≤ limit`, `total_matched ≥ len(leads)`,
+  every returned lead satisfies every supplied filter
+
+#### `get_lead` — fetch one lead
+- **Purpose** Resolve a `lead_id` to a full record.
+- **Input** `lead_id: str`
+- **Output** `LeadDetail = LeadSummary + {phone?, timezone?, tags[], owner?,
+  last_contacted_at?, notes?}`
+- **Validation** id format
+- **Failure modes** `NOT_FOUND` (non-retryable — a missing record will still be
+  missing in 250ms); `TRANSIENT`
+- **Verification** NONE — a read of a single record has nothing to confirm
+  beyond its schema
+
+#### `research_company` — enrich a company profile
+- **Purpose** Gather firmographics and buying signals for scoring and
+  personalization. **This is the seam where a real enrichment API would sit.**
+- **Input** `company_id?: str`, `domain?: str` (exactly one required),
+  `depth: "basic" | "standard" = "standard"`
+- **Output** `company_id, name, domain, industry, employee_count,
+  revenue_band, hq_location, funding_stage, tech_stack: list[str],
+  recent_signals: list[Signal], summary: str, sources: list[str],
+  confidence: float(0..1), retrieved_at`
+- **Validation** exactly one identifier; `confidence ∈ [0,1]`
+- **Failure modes** `NOT_FOUND`; `TRANSIENT` (simulated upstream timeout — the
+  most valuable injectable failure in the eval suite); `PARTIAL_DATA`, which is
+  **not** a failure: low `confidence` with a populated `summary` is a legitimate
+  result that downstream scoring must handle
+- **Verification** INVARIANT: `confidence` in range, `summary` non-empty,
+  `company_id` equals the requested one when one was given
+- **Security** `untrusted_output=True`. `summary`, `recent_signals` and
+  `sources` are third-party text and are the system's prompt-injection surface.
+  They are always passed to the model as delimited data and never granted
+  tool-selection authority (§16.3).
+
+#### `score_lead` — qualify a lead deterministically
+- **Purpose** Turn a lead plus a company profile into a comparable score.
+- **Input** `lead_id: str`, `company: CompanyProfile` (normally a `$ref` to a
+  `research_company` result), `weights?: ScoringWeights`
+- **Output** `lead_id, score: int(0..100), band: "hot"|"warm"|"cold",
+  factors: list[ScoreFactor{name, weight, value, contribution}],
+  rationale: str, model_version: str`
+- **Validation** score range; `band` consistent with score thresholds
+- **Failure modes** `INPUT_VALIDATION` (missing company profile — normally an
+  unresolved `$ref`, which routes to replan, not retry)
+- **Verification** INVARIANT: `0 ≤ score ≤ 100`; `sum(contribution) ≈ score`
+  (±1 for rounding); `band` matches the documented thresholds; **identical
+  inputs produce an identical score**
+- **Decision** Scoring is a **rule engine, not an LLM** (ADR-009). Lead ranking
+  is an evaluated capability (§15.3); an LLM scorer would make the ranking eval
+  a test of sampling luck. The weights are configuration, and the `factors`
+  breakdown is what the dashboard shows to justify a ranking.
+
+#### `draft_outreach` — generate outreach copy
+- **Purpose** Produce a personalized subject and body. Persists nothing.
+- **Input** `lead_id: str`, `company: CompanyProfile`, `score?: ScoreResult`,
+  `channel: "email" = "email"`, `tone: "direct"|"warm"|"formal" = "direct"`,
+  `max_words: int = 180 (40..400)`
+- **Output** `subject: str(≤120)`, `body: str`, `word_count: int`,
+  `personalization_notes: list[str]`, `content_hash: str`,
+  `model_version: str`, `generated_at`
+- **Validation** `word_count ≤ max_words`; `subject` and `body` non-empty;
+  **no unresolved template placeholder** (`{{`, `TODO`, `[NAME]`) may survive —
+  shipping a literal `{{first_name}}` to a prospect is the embarrassing failure
+  this check exists to prevent
+- **Failure modes** `TRANSIENT` (model unavailable → retryable, and in `auto`
+  mode degrades to the deterministic template generator);
+  `OUTPUT_VALIDATION` (placeholder or length violation → retryable **because
+  the tool is nondeterministic**, unlike every other tool)
+- **Verification** INVARIANT as above, plus `content_hash` matches `body`
+- **Note on layering** This is the one tool that reaches the reasoning layer. It
+  does so through `ContentPort`, whose two implementations are an Anthropic
+  generator and a deterministic template generator. The tool itself contains no
+  prompt and no API client, so the "only the reasoning layer calls the LLM" rule
+  (§4.1) holds.
+
+#### `save_draft` — persist a draft
+- **Purpose** Store generated copy as a durable, addressable artifact. This is
+  the step that makes approval meaningful: the operator later approves a
+  *stored* draft, not a transient string.
+- **Input** `lead_id: str`, `subject: str`, `body: str`,
+  `channel: "email" = "email"`, `content_hash: str`, `metadata?: dict`
+- **Output** `draft_id: str`, `version: int`, `status: "saved"`, `saved_at`,
+  `content_hash: str`
+- **Validation** `content_hash` must match `hash(subject||body)` — a mismatch
+  means the content changed between generation and save, which is a
+  `POLICY_VIOLATION`, not a retry
+- **Failure modes** `NOT_FOUND` (unknown `lead_id`); `TRANSIENT`;
+  `INPUT_VALIDATION`
+- **Verification** READBACK: `DraftPort.get(draft_id)` must return a row whose
+  `content_hash` equals the hash of **what we asked to save** — not the hash the
+  tool echoed back (§11.3)
+
+#### `send_email_mock` — simulated send
+- **Purpose** Record an outbound email in the mock outbox. **It never sends
+  mail.** No SMTP or ESP client exists in the dependency graph (§19.2).
+- **Input** `draft_id: str`, `to_email: EmailStr`, `idempotency_key: str`,
+  `approval_token: ApprovalToken`
+- **Output** `message_id: str`, `outbox_id: str`, `status: "sent"`,
+  `provider: "mock"`, `to_email`, `draft_id`, `sent_at`
+- **Validation**, and every item here is a security control:
+  1. `draft_id` must reference an existing **saved** draft. The tool accepts no
+     raw `subject`/`body`, so the content that is sent is provably the content
+     that was saved, verified and approved.
+  2. `to_email` must equal the email on the lead that owns the draft. Arbitrary
+     recipients are a `POLICY_VIOLATION`. An injected instruction in a company
+     summary therefore cannot redirect an email.
+  3. `approval_token` must be a live token for this `(run_id, step_id,
+     args_hash)` (§9.5).
+  4. `idempotency_key` is unique in the outbox; a replay returns the original
+     `message_id` rather than sending twice.
+- **Failure modes** `NOT_FOUND` (draft); `POLICY_VIOLATION` (recipient mismatch,
+  missing/stale token — terminal, never retried, high-severity trace);
+  `TRANSIENT` (simulated provider error); `DUPLICATE` (returns the prior result)
+- **Approval** **required**, `risk=HIGH`
+- **Verification** READBACK: `MailPort.get_outbox(message_id)` exists with
+  `status="sent"`, `to_email` and `draft_id` matching the request, and exactly
+  **one** outbox row for the idempotency key
+
+#### `get_customer` — fetch a customer
+- **Purpose** Read the system-of-record customer, including the `version` needed
+  for a safe update.
+- **Input** `customer_id?: str`, `email?: EmailStr` (exactly one)
+- **Output** `customer_id, account_name, primary_contact, email, phone?,
+  status, plan, mrr?, owner?, version: int, updated_at`
+- **Failure modes** `NOT_FOUND`; `TRANSIENT`
+- **Verification** NONE
+- **Note** `version` is load-bearing: it is the concurrency token that makes
+  `update_customer` safe, so `update_customer` steps normally `$ref` it.
+
+#### `update_customer` — modify customer data
+- **Purpose** Apply an allowlisted patch to a customer record.
+- **Input** `customer_id: str`, `expected_version: int`,
+  `patch: CustomerPatch` (allowlist: `status`, `plan`, `owner`, `phone`,
+  `primary_contact`, `notes`), `reason: str(≤500)`,
+  `idempotency_key: str`, `approval_token: ApprovalToken`
+- **Output** `customer_id, version: int, updated_fields: list[str],
+  updated_at, previous: dict` (the prior values, so the operator can undo)
+- **Validation** `patch` non-empty; every key in the allowlist — anything else
+  (`id`, `email`, `created_at`, `mrr`) is a `POLICY_VIOLATION`, so the agent
+  cannot rewrite identity or billing fields even if it plans to;
+  `expected_version` present; `reason` non-empty (the audit record must say why)
+- **Failure modes** `NOT_FOUND`; `STALE_WRITE` (version conflict — **not
+  retryable**: the record changed, so the plan must re-read and the operator
+  must re-approve against the new state, §10.3); `POLICY_VIOLATION`;
+  `TRANSIENT`
+- **Approval** **required**, `risk=HIGH`. The approval payload shows a
+  field-by-field before/after diff.
+- **Verification** READBACK: `CustomerPort.get(customer_id)` shows every patched
+  field at its requested value, `version == expected_version + 1`, and **no
+  field outside the patch changed**
+
+### 8.5 Registry and dispatch
+
+```
+decide  ──►  ToolRegistry.contract(name)          # policy questions
+execute ──►  ToolRegistry.dispatch(name, args, ctx)
+                 │  validate input (Pydantic, extra=forbid)
+                 │  assert approval grant for gated tools
+                 │  attach idempotency key + timeout + trace span
+                 ▼
+             ToolImpl  ──►  Port (Protocol)  ──►  MockAdapter  ──►  mock_crm
+                 │
+                 └── validate output (Pydantic) ──► ToolResult
+```
+
+Dispatch is the single choke point where validation, policy, timeout,
+idempotency and tracing are applied. No node ever calls a tool implementation
+directly, so there is exactly one place these can be forgotten.
+
+---
+
+## 9. Human-in-the-loop approval workflow
+
+### 9.1 What requires approval — the policy
+
+Approval is required for an operation that is **outbound, destructive, or
+modifies records the business owns**. Expressed as the P1 invariant in §8.2, so
+it is enforced by a test rather than by reviewer vigilance.
+
+| Class | Example | Approval |
+|---|---|---|
+| Outbound communication | `send_email_mock` | **Required** |
+| Customer data modification | `update_customer` | **Required** |
+| Destructive | `delete_*`, bulk overwrite (none exist yet) | **Required**, `risk=HIGH` |
+| Internal artifact write | `save_draft` | Not required (ADR-008) |
+| Read | everything else | Never (invariant P3) |
+
+The stated non-goal is as important as the policy: **approval fatigue is a
+safety failure.** A system that asks about `save_draft` teaches operators to
+approve without reading, which defeats the gate on `send_email_mock`. Every
+approval must be a decision the operator would genuinely make differently.
+
+### 9.2 Approval request shape
+
+```python
+class ApprovalRequest(BaseModel):
+    approval_id: str
+    run_id: str
+    step_id: str
+    tool: ToolName
+    risk: RiskLevel
+    title: str            # "Send outreach email to dana@northwind.example"
+    summary: str          # one paragraph of what will happen
+    payload_preview: dict # the resolved arguments, redacted, plus the
+                          # de-referenced draft content or field-level diff
+    args_hash: str        # canonical hash of the exact arguments (§9.4)
+    requested_at: datetime
+    expires_at: datetime  # requested_at + OPSPILOT_APPROVAL_TTL_SECONDS
+    status: ApprovalStatus
+```
+
+`payload_preview` must show the **actual effect**, de-referenced: the full draft
+subject and body for a send, a before/after diff for an update. An operator
+cannot meaningfully approve `{"draft_id": "d_91f"}`.
+
+### 9.3 Approval state machine
+
+```
+pending ──approve──► approved   ──► run resumes
+        ──reject───► rejected   ──► run terminates as `rejected`
+        ──ttl──────► expired    ──► run terminates as `expired`
+        ──replan───► superseded ──► a fresh pending approval replaces it
+        ──cancel───► cancelled  ──► run cancelled by the operator
+```
+
+`superseded` is the state that prevents the subtlest failure in the whole
+design: a plan revision or re-resolution changes the arguments after a human
+approved the *old* ones. Approval is bound to `args_hash`, so changed arguments
+invalidate the grant and force a new request. Without it, "approve sending draft
+A" could authorise sending draft B.
+
+### 9.4 Approval is bound to arguments, not to a step
+
+`args_hash = sha256(canonical_json(resolved_args_without_volatile_fields))`
+
+Canonicalisation sorts keys, normalises numbers, and excludes fields that are
+legitimately attempt-dependent (`idempotency_key`, `approval_token`,
+timestamps). The gate grants a step **only** when the hash of the arguments
+about to be sent equals the hash the human saw. This closes the
+time-of-check/time-of-use gap that a step-id-only grant would leave wide open.
+
+### 9.5 `ApprovalToken` — the third barrier
+
+Three independent barriers must all fail for an unapproved mutation to occur:
+
+1. **Control flow** — `decide` rule 6 routes a gated step to
+   `request_approval` before `execute_tool` is ever reachable (§6.2).
+2. **Re-assertion** — `execute_tool` independently re-checks the grant and
+   raises `PolicyViolation` if it is absent. One bug in the router is not
+   sufficient to cause a mutation.
+3. **Type-level** — mutating adapter methods require an `ApprovalToken`
+   parameter. `ApprovalToken` has a private constructor and is only mintable by
+   `ApprovalGate.issue()`, from a **persisted** `approved` decision, carrying
+   `(run_id, step_id, args_hash, approval_id)`. The adapter re-validates the
+   hash against the payload it was handed.
+
+Barrier 3 is what makes the guarantee structural rather than procedural: code
+that calls `MailPort.send(...)` from anywhere — a script, a test, a future
+endpoint, a mistaken refactor — cannot compile a call without a token, and
+cannot obtain a token without a stored human decision for those exact
+arguments.
+
+### 9.6 Approve, reject, resume
+
+**Approve** — `POST /approvals/{id}/decision {"decision":"approve", ...}`:
+
+1. Conditional update: `UPDATE approvals SET status='approved', decided_by=…,
+   decided_at=now() WHERE approval_id=… AND status='pending' RETURNING *`.
+   Zero rows → `409 approval_not_pending`, echoing the existing decision. The
+   database, not application logic, resolves a double-click or two operators
+   racing.
+2. Emit the `approval_granted` trace event.
+3. **Only the transaction that won** dispatches
+   `Executor.resume(run_id, Command(resume=decision))`. Single-flight resume is
+   a consequence of the conditional update, not a separate lock.
+4. The graph re-enters `request_approval`, which observes a decided approval,
+   writes it into `approval_state.decisions`, and falls through to `decide`.
+5. `decide` re-evaluates rule 6 against the **current** arguments. A hash
+   mismatch sends it back to `request_approval` with a new request rather than
+   executing.
+
+**Reject** — identical transition to `rejected`, then:
+
+- the step is marked `rejected` and **is not executed**;
+- a required rejected step terminates the run as `rejected`; an `optional` one
+  is skipped and the run continues;
+- `complete` produces a response that names what was not done and why, quoting
+  the operator's reason;
+- the run's terminal status is `rejected`, never `failed` (§5.4).
+
+Rejection is not an error path. It is the mechanism working.
+
+### 9.7 Idempotency of the pause
+
+LangGraph re-executes the interrupted node on resume, so `request_approval` runs
+at least twice per approval. It is therefore written to be idempotent:
+
+- the `approvals` row is upserted on `(run_id, step_id, args_hash)`;
+- a **partial unique index** permits at most one `pending` approval per
+  `(run_id, step_id)`;
+- the `approval_state` reducer never regresses a decided approval to pending;
+- the node emits `approval_requested` only on a genuine insert, so a resume does
+  not pollute the trace with a duplicate request event.
+
+### 9.8 Expiry and invalid states
+
+| Situation | Behaviour |
+|---|---|
+| TTL passes with no decision | A sweeper marks the approval `expired` and terminates the run as `expired` with `status_reason=approval_expired`. Runs do not wait forever on a human who never returns. |
+| Decision on an expired approval | `409 approval_expired`. The operator is told to restart the run. |
+| Same decision posted twice | `200` with the existing decision (idempotent). |
+| Conflicting decision posted second | `409 approval_not_pending` with the recorded decision. First writer wins, audibly. |
+| Decision on a terminal run | `409 run_not_resumable`. |
+| Arguments changed since approval | Grant does not apply; old approval → `superseded`, new request issued. |
+| Run cancelled while pending | Approval → `cancelled`; run → `cancelled`. |
+
+### 9.9 What tests must prove (§18)
+
+1. A run reaching a gated step performs **no** `mock_crm` write — asserted by
+   comparing the outbox and customer tables before and after the pause.
+2. `execute_tool` raises `PolicyViolation` when invoked directly on a gated step
+   with no grant (barrier 2 in isolation).
+3. `MailPort.send` is uncallable without an `ApprovalToken` (barrier 3 — a type
+   check, asserted via mypy in CI and a runtime constructor test).
+4. Rejection yields `status=rejected`, zero effects, and a response naming the
+   declined action.
+5. A grant for hash A does not authorise arguments hashing to B.
+6. Resuming twice sends exactly one email (one outbox row).
+
+---
+
+## 10. Retry and recovery workflow
+
+### 10.1 Error taxonomy
+
+Every failure is classified into exactly one class before `recover` reasons
+about it. Classification is a pure function of the exception type plus the
+tool's contract, and it lives in `app/agent/errors.py`.
+
+| Class | Examples | Recoverable | Action |
+|---|---|---|---|
+| `TRANSIENT` | timeout, connection reset, upstream 5xx, adapter unavailable | yes | retry with backoff |
+| `RATE_LIMITED` | provider throttle | yes | retry, honouring `retry_after` |
+| `INPUT_VALIDATION` | argument fails the tool's input schema | no (retry is pointless) | replan |
+| `REFERENCE_RESOLUTION` | `$ref` points at a missing key/index | no | replan |
+| `NOT_FOUND` | unknown `lead_id` / `draft_id` / `customer_id` | no | replan, or skip if the step is `optional` |
+| `STALE_WRITE` | `expected_version` conflict | no | replan (re-read, then **re-approve**) |
+| `OUTPUT_VALIDATION` | tool returned data failing its output schema | **only if** `contract.nondeterministic` | retry (generative) / replan (deterministic) |
+| `VERIFICATION_FAILED` | the effect could not be confirmed | **only if** `contract.idempotent` | retry once / fail |
+| `POLICY_VIOLATION` | unapproved mutation, disallowed field, recipient mismatch | **never** | fail immediately, high-severity trace |
+| `BUDGET_EXHAUSTED` | retries, replans, steps or deadline spent | no | fail |
+| `PLANNER_ERROR` | LLM unavailable or unparsable output | yes (bounded) | retry; in `auto` mode degrade to `RulePlanner` |
+| `INTERNAL` | an OpsPilot bug | no | fail; full detail traced, generic message via the API |
+
+Two classifications deserve emphasis because getting them wrong is the classic
+way agents burn money:
+
+- **`INPUT_VALIDATION` and `REFERENCE_RESOLUTION` are planning faults.** The
+  same call with the same broken argument cannot succeed. Retrying is pure cost.
+  They route to replan.
+- **`OUTPUT_VALIDATION` is retryable only for `draft_outreach`**, the one
+  nondeterministic tool. Re-asking a rule engine for a different answer is
+  superstition.
+
+### 10.2 The recovery decision
+
+```
+recover(error, step, state):
+    if error.class is POLICY_VIOLATION or INTERNAL:      → fail(terminal)
+    if budgets_exhausted(state):                         → fail(budget_exhausted)
+    if error.class in step.contract.retryable_errors
+       and retry_count[step] < MAX_RETRIES:
+            retry_count[step] += 1
+            sleep(backoff(retry_count[step], error.retry_after))
+                                                         → execute_tool
+    if step.optional:                                    → decide   (skip)
+    if error.class is replannable and replan_count < MAX_REPLANS:
+                                                         → plan
+    else:                                                → fail(<class>)
+```
+
+Order matters: policy violations outrank budgets, budgets outrank retries, and
+optional-step skipping is considered before spending replan budget.
+
+### 10.3 Two subtle cases, decided
+
+**`STALE_WRITE` on an approved update.** The record moved under an approved
+change. Re-applying the patch would silently overwrite whatever changed. The
+correct behaviour is: replan (re-read the customer, recompute the patch), which
+produces new arguments, which produces a new `args_hash`, which invalidates the
+old grant and **forces a fresh approval**. The operator sees the new diff. This
+falls out of §9.4 rather than needing special-case code, which is the point.
+
+**`VERIFICATION_FAILED` on a non-idempotent mutation.** Retrying risks a second
+real effect on top of an unconfirmed first one. Invariant P5 forbids it: the run
+fails with `status_reason=verification_failed`, and the final response states the
+effect is **unconfirmed** rather than failed. "We could not confirm the email
+was recorded" is honest; "the email failed" and "the email was sent" are both
+lies.
+
+### 10.4 Backoff and idempotency
+
+```
+delay_ms = min(BASE * 2 ** (attempt - 1), MAX) * jitter(0.8 … 1.2)
+BASE = OPSPILOT_RETRY_BASE_DELAY_MS (250)   MAX = OPSPILOT_RETRY_MAX_DELAY_MS (8000)
+attempts = 1 + OPSPILOT_MAX_RETRIES        (default 3)
+```
+
+Jitter avoids synchronised retries; `retry_after` from a `RATE_LIMITED` error
+overrides the computed delay when it is larger.
+
+Every retry of a mutating step reuses the **same idempotency key**, derived from
+`(run_id, step_id, args_hash)` — attempt-invariant by construction. The mock
+adapters enforce uniqueness on it, so attempt 2 of a send that actually
+succeeded before timing out returns the original `message_id` instead of
+producing a second outbox row. This is the single most important reliability
+property of the retry design: retries are safe because effects are keyed, not
+because we hope the first attempt did nothing.
+
+Under evaluation the sleep is injected as a virtual clock (`Clock` protocol), so
+backoff is asserted on rather than waited for, and the suite stays fast and
+deterministic (§15.2).
+
+### 10.5 Bounded by construction
+
+| Loop | Bound | Env |
+|---|---|---|
+| Retry of one step | `MAX_RETRIES` (per step) | `OPSPILOT_MAX_RETRIES=2` |
+| Plan revisions | `MAX_REPLANS` (per run) | `OPSPILOT_MAX_REPLANS=2` |
+| Executed steps incl. fan-out | `MAX_STEPS` | `OPSPILOT_MAX_STEPS=25` |
+| Wall clock | absolute `deadline_at` | `OPSPILOT_RUN_DEADLINE_SECONDS=300` |
+| Fan-out width | mandatory `fanout.max_items` | contract-level |
+| Planner repair | exactly one attempt | constant |
+
+`decide` checks budgets **first**, on every pass, so no cycle in the graph can
+iterate without consuming a counter. The state machine cannot loop forever; the
+worst case is `MAX_STEPS × (1 + MAX_RETRIES)` tool attempts within
+`deadline_at`. This is checked by a test that drives a permanently-failing tool
+and asserts the exact attempt count.
+
+### 10.6 Terminal failure behaviour
+
+- run → `failed` with a machine-readable `status_reason`;
+- unrun steps → `skipped`; the failing step keeps its attempt history;
+- `complete`-equivalent response synthesis still occurs: the operator gets what
+  *was* accomplished, what was not, and what is unconfirmed;
+- a `run_failed` trace event closes the timeline;
+- **no automatic whole-run retry.** `POST /runs/{id}/retry` creates a **new**
+  run with `parent_run_id` set. Run history is immutable, so a retried run never
+  overwrites the evidence of why the first one failed.
+
+### 10.7 Observability requirements for recovery
+
+Non-negotiable, because retry behaviour is invisible otherwise:
+
+- every **attempt** is its own `tool_calls` row and its own trace event, with
+  `attempt`, `error_class`, `duration_ms`, and the computed `delay_ms`;
+- every `recover` decision is traced with the branch taken and the reason;
+- `retry_count` and `replan_count` are exposed on the run resource, so the
+  dashboard shows "3 attempts, 2 retries" without reading the trace;
+- `POLICY_VIOLATION` is logged at `error` severity with the full context — it
+  means either an attack or a bug, and both need to be noisy.
+
+---
+
+## 11. Verification workflow
+
+### 11.1 Validation is not verification
+
+| | Validation | Verification |
+|---|---|---|
+| Question | "Is this response well-formed?" | "Did the world actually change?" |
+| Where | `execute_tool`, universal | `verify` node, contract-driven |
+| Source of truth | the tool's own return value | an **independent read path** |
+| Catches | schema drift, type errors, garbage | lies, partial writes, silent no-ops |
+
+A tool that returns `{"status": "saved", "draft_id": "d_1"}` while writing
+nothing passes validation perfectly. That is exactly the failure the brief names
+("never assume tool success merely because a tool returned without throwing"),
+and only verification catches it.
+
+### 11.2 Three levels
+
+| Mode | What happens | Applied to |
+|---|---|---|
+| Level 0 — **schema validation** (always, not a mode) | Output parsed by `output_model` with `extra="forbid"` | every tool |
+| `NONE` | Level 0 only; recorded as `not_required` so the trace still shows the decision | `get_lead`, `get_customer` |
+| `INVARIANT` | Semantic assertions on the output: ranges, sums, consistency with the request | all other read tools |
+| `READBACK` | Re-read the affected entity through a **different port method** and compare against the **intent** | every mutating tool (invariant P2) |
+
+`NONE` still writes a `VerificationResult`. "We checked nothing here, on
+purpose" is information; a silent gap is not.
+
+### 11.3 Readback verifiers
+
+The rule that makes readback meaningful: **compare against what we asked for,
+not against what the tool told us.**
+
+| Tool | Read path | Assertions |
+|---|---|---|
+| `save_draft` | `DraftPort.get(draft_id)` | row exists; `content_hash == hash(requested subject‖body)`; `lead_id` matches; `status == "saved"` |
+| `send_email_mock` | `MailPort.get_outbox(message_id)` | row exists; `status == "sent"`; `to_email` matches the request; `draft_id` matches; **exactly one** row for the idempotency key |
+| `update_customer` | `CustomerPort.get(customer_id)` | every patched field equals the requested value; `version == expected_version + 1`; **no field outside the patch changed** |
+
+Two of those assertions exist because of specific failure classes rather than
+tidiness. The `content_hash` comparison against the *requested* content catches
+silent truncation and encoding damage that an echoed hash would hide. The
+"exactly one outbox row" count is what proves the idempotency key actually
+worked; without it, a double-send looks like a success.
+
+### 11.4 Handling verification failure
+
+```
+verify → VerificationResult(status=failed, checks=[…], expected, observed)
+       → recover
+           contract.idempotent      → retry once (same idempotency key)
+           not contract.idempotent  → fail(verification_failed)   # invariant P5
+```
+
+In both cases:
+
+- a `verification_failed` trace event is emitted at `warning` (read) or `error`
+  (mutating) severity;
+- the final response reports the effect as **unconfirmed**, never as done;
+- for an `OUTBOUND` tool the response says so explicitly, because an operator
+  who believes an email was sent will not resend it, and one who believes it
+  failed may double-send. Only "unconfirmed — check the outbox" leads to the
+  right human action.
+
+A failure *of the verifier itself* (the port raised) is a `TRANSIENT` error, not
+a verification failure. Inability to check is not evidence of a bad write, and
+conflating them would fail healthy runs during a blip.
+
+### 11.5 Verification is bounded and observable
+
+Verifiers have their own timeout, perform a bounded number of reads (no
+pagination loops), never mutate, and never call an LLM. Every result is
+persisted in `execution_steps.verification` and mirrored into the trace, so the
+dashboard shows a per-step badge — `verified`, `not required`, or `unconfirmed`
+— and the evaluation suite can assert on it directly (§15.3).
