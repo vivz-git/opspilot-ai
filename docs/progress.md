@@ -133,18 +133,19 @@ No credential was fabricated or stubbed to work around any of these.
 
 ---
 
-## Commit log for this session
+## Commit sequence for this session
 
-```
-0e4f7a1 chore: initialize project configuration
-219e4be docs: define system architecture, agent state and graph
-786abf8 docs: define tool contracts, HITL, retry and verification design
-f4665d1 docs: define persistence model and API contracts
-7cc3930 docs: define observability, evaluation, security and testing strategy
-807dd06 feat(agent): encode state, tool contracts and approval binding as typed code
-d6ada9a docs: record architecture decisions and open questions
-fed6c9f docs: add prioritized implementation backlog and model allocation
-```
+1. `chore: initialize project configuration`
+2. `docs: define system architecture, agent state and graph`
+3. `docs: define tool contracts, HITL, retry and verification design`
+4. `docs: define persistence model and API contracts`
+5. `docs: define observability, evaluation, security and testing strategy`
+6. `feat(agent): encode state, tool contracts and approval binding as typed code`
+7. `docs: record architecture decisions and open questions`
+8. `docs: add prioritized implementation backlog and model allocation`
+9. `docs: add README, progress and handoff; fix the production password fuse`
+10. `docs: sync progress with final session state`
 
 Each commit is one architectural deliverable, inspected and secret-scanned
-before committing.
+before committing. Run `git log --stat` for the detail; commit bodies record
+what was decided and why, not merely what changed.
