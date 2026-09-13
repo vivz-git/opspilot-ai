@@ -75,13 +75,18 @@ def _table_missing() -> ProgrammingError:
 
 
 class TestDiscoverAlembicHead:
-    def test_returns_none_before_alembic_is_wired_up(self, tmp_path: Any) -> None:
+    def test_returns_none_when_alembic_is_not_wired_up(self, tmp_path: Any) -> None:
+        """No `alembic.ini` at all (e.g. a repo checkout before FOUND-003):
+        readiness falls back to a pure connectivity check."""
         assert discover_alembic_head(tmp_path) is None
 
-    def test_the_real_repository_has_no_alembic_ini_yet(self) -> None:
-        """FOUND-003 adds alembic.ini; until it does, readiness falls back to
-        a pure connectivity check rather than a head comparison."""
-        assert discover_alembic_head(BACKEND_ROOT) is None
+    def test_the_real_repository_reports_its_actual_head(self) -> None:
+        """FOUND-003 added alembic.ini and the first revision; this asserts
+        readiness now enforces a real head instead of falling back. Not
+        pinned to a specific revision id, so it survives future migrations."""
+        head = discover_alembic_head(BACKEND_ROOT)
+        assert isinstance(head, str)
+        assert head != ""
 
 
 class TestCheckReadiness:

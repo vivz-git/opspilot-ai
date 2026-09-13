@@ -19,7 +19,7 @@ done. Continue at `docs/handoff.md` §3 with FOUND-002.
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
-foundation     ██████░░░░░░░░░░░░░░  FOUND-001, 002, 004 done; 003/005 outstanding
+foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ░░░░░░░░░░░░░░░░░░░░  DB-001..007
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
@@ -123,7 +123,38 @@ regardless of what's already on the machine, and `[tool.uv] link-mode =
 "copy"` in `pyproject.toml` makes `copy` the project's install mode
 everywhere (local, CI, Docker) rather than a one-off flag.
 
-**Test suite: 242 passed, 1 skipped** (`cd backend && uv run pytest`)
+### FOUND-003, Alembic init
+
+`backend/alembic.ini` + `backend/alembic/env.py` (the async template);
+`env.py` overrides `sqlalchemy.url` from `app.config.get_settings()` rather
+than trusting `alembic.ini`'s own placeholder, keeping `Settings` the only
+thing that reads the environment (§17.1). The first revision
+(`19463f144188`) issues `CREATE SCHEMA IF NOT EXISTS opspilot` and `... mock_crm`
+on upgrade, and drops both (`CASCADE`) on downgrade; `langgraph` is never
+created or touched (ADR-011) — it belongs to the LangGraph Postgres saver.
+
+Docker Desktop was started this session specifically to verify this task
+against a real `postgres:16-alpine` container, since its acceptance criteria
+cannot be checked any other way. All three behaviours were confirmed live —
+`alembic upgrade head` creates both schemas, a second `upgrade head` is a
+true no-op (no `Running upgrade` log line), `downgrade base` drops both
+schemas cleanly — and are now also encoded as `tests/test_migrations.py`
+(`@pytest.mark.integration`), so future sessions don't have to redo this by
+hand. The suite skips those 4 tests cleanly (~7s, one shared connectivity
+probe) when no database is reachable, so plain `pytest` still passes
+everywhere.
+
+`/readyz` (FOUND-001) needed no code change to pick this up — confirmed live
+against the same container: `GET /readyz` → `{"status": "ready", "revision":
+"19463f144188"}`. `tests/test_health.py`'s
+`test_the_real_repository_has_no_alembic_ini_yet` became
+`test_the_real_repository_reports_its_actual_head`, asserting a non-empty
+head without pinning the specific revision id.
+
+**Test suite: 246 passed, 1 skipped** (`cd backend && uv run pytest`, with
+`DATABASE_URL` pointed at a reachable Postgres — 4 of the 246 are the new
+migration tests; without a database they skip instead, for 242 passed + 5
+skipped)
 One intentional skip: the mock-package network-import check activates when
 TOOL-001 creates `app/integrations/mock/`.
 
@@ -240,8 +271,25 @@ green.
 
 Commit: `chore(build): lock backend dependencies with uv and wire CI/Docker to install from it`.
 
-Next task: **FOUND-003** (Alembic init with the three schemas) — the task
-that actually unblocks the critical path (`DB-001` depends on it). It needs
-a live Postgres to verify its acceptance criteria; try `docker compose up -d
-db` (or start Docker Desktop) before starting it. **FOUND-005** (CI green on
-the real matrix) is now also unblocked, since it depended only on FOUND-002.
+**FOUND-003 done** last, once Docker Desktop was started and a throwaway
+`postgres:16-alpine` container was available to verify against — see its row
+in `docs/tasks.md` and the section above for what was built and confirmed.
+
+Commit: `feat(db): initialize Alembic with the opspilot and mock_crm schemas`.
+
+Session stopped here on explicit instruction, with FOUND-003 as the last
+coherent unit finished, checked, documented and pushed. No further task was
+started automatically.
+
+Next task: **DB-001** (control-plane models: `agent_runs`, `execution_steps`,
+`tool_calls`, `approvals`) — SONNET. It depends on FOUND-003, now done, and
+is next on the critical path (`docs/handoff.md` §3: `FOUND-001 ▸ DB-001..004
+▸ TOOL-001 ▸ ...`). **FOUND-005** (CI green on the real matrix) is also
+unblocked, since it depended only on FOUND-002 — SONNET, lower priority than
+DB-001 since it is a verification task (needs a PR to actually watch CI run)
+rather than a critical-path blocker.
+
+A leftover from this session: a throwaway Postgres container
+(`opspilot-pg-dev`, port 55432) is still running locally for whoever picks up
+DB-001 next; it is not part of the committed stack and can be removed with
+`docker rm -f opspilot-pg-dev` once no longer needed.
