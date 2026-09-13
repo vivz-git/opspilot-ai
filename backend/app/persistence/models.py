@@ -1,5 +1,5 @@
-"""Control-plane ORM models: `agent_runs`, `execution_steps`, `tool_calls`
-and `approvals` (§12.3-12.6, DB-001).
+"""Control-plane ORM models: `agent_runs`, `execution_steps`, `tool_calls`,
+`approvals` (§12.3-12.6, DB-001) and `trace_events` (§12.7, DB-002).
 
 Column types follow §12.10 (ADR-014) literally: a column typed `enum` in the
 architecture becomes a real database-enforced enum (`Enum(..., native_enum=
@@ -37,6 +37,9 @@ __all__ = [
     "ExecutionStep",
     "ToolCallRow",
     "ToolCallStatus",
+    "TraceEvent",
+    "TraceEventKind",
+    "TraceEventSeverity",
 ]
 
 
@@ -52,6 +55,54 @@ class ToolCallStatus(StrEnum):
     FAILED = "failed"
     TIMEOUT = "timeout"
     DUPLICATE_SUPPRESSED = "duplicate_suppressed"
+
+
+class TraceEventKind(StrEnum):
+    """§14.2 — the fixed vocabulary of product-trace events.
+
+    Structural (§14.4): `@traced_node` and `ToolRegistry.dispatch` are the
+    only emitters, so this list is exactly what those choke points can ever
+    produce, not an open vocabulary a future call site might extend ad hoc.
+    """
+
+    RUN_CREATED = "run_created"
+    RUN_STARTED = "run_started"
+    RUN_COMPLETED = "run_completed"
+    RUN_FAILED = "run_failed"
+    RUN_REJECTED = "run_rejected"
+    RUN_EXPIRED = "run_expired"
+    RUN_CANCELLED = "run_cancelled"
+    NODE_ENTERED = "node_entered"
+    NODE_EXITED = "node_exited"
+    PLAN_CREATED = "plan_created"
+    PLAN_REVISED = "plan_revised"
+    FANOUT_EXPANDED = "fanout_expanded"
+    TOOL_STARTED = "tool_started"
+    TOOL_SUCCEEDED = "tool_succeeded"
+    TOOL_FAILED = "tool_failed"
+    TOOL_TIMEOUT = "tool_timeout"
+    TOOL_DUPLICATE_SUPPRESSED = "tool_duplicate_suppressed"
+    RETRY_SCHEDULED = "retry_scheduled"
+    STEP_SKIPPED = "step_skipped"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_GRANTED = "approval_granted"
+    APPROVAL_REJECTED = "approval_rejected"
+    APPROVAL_EXPIRED = "approval_expired"
+    APPROVAL_SUPERSEDED = "approval_superseded"
+    VERIFICATION_PASSED = "verification_passed"
+    VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_SKIPPED = "verification_skipped"
+    POLICY_VIOLATION = "policy_violation"
+
+
+class TraceEventSeverity(StrEnum):
+    """§12.7 — always `error` for `policy_violation` (§14.2)."""
+
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
 
 def _enum_values(enum_cls: type[StrEnum]) -> list[str]:
@@ -335,3 +386,66 @@ class ApprovalRow(Base):
     #: an audit guarantee.
     decided_by: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     decision_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+
+
+class TraceEvent(Base):
+    """§12.7 — append-only. Never updated, never deleted except by retention.
+
+    `seq` is **per-run monotonic** and is the SSE event id / polling cursor
+    (§14.3): it, not `ts`, is the ordering key, because two events written in
+    the same millisecond must still have a total order. Allocating a
+    duplicate-free, gap-free `seq` under concurrent writers for the same run
+    is DB-002's concurrency requirement — see `app.persistence.trace_events
+    .append_trace_event` for the allocation mechanism. `UNIQUE(run_id, seq)`
+    here is the database-level backstop, not the sole correctness mechanism.
+
+    `id` is a `bigserial`, not a uuid like the other control-plane tables
+    (§12.7 is explicit): this is the fastest-growing table by an order of
+    magnitude, and a purely sequential key avoids the write-amplification a
+    random uuid primary key causes on the very table retention/partitioning
+    (OBS-004) cares most about.
+    """
+
+    __tablename__ = "trace_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "seq", name="uq_trace_events_run_id_seq"),
+        Index("ix_trace_events_run_id_id", "run_id", "id"),
+        Index("ix_trace_events_kind_ts", "kind", sa.text("ts DESC")),
+        Index("ix_trace_events_ts_brin", "ts", postgresql_using="brin"),
+    )
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        ForeignKey("opspilot.agent_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    ts: Mapped[datetime] = mapped_column(
+        _timestamptz(), nullable=False, server_default=sa.func.now()
+    )
+    kind: Mapped[TraceEventKind] = mapped_column(
+        _enum_column(TraceEventKind, "trace_event_kind"), nullable=False
+    )
+    severity: Mapped[TraceEventSeverity] = mapped_column(
+        _enum_column(TraceEventSeverity, "trace_event_severity"),
+        nullable=False,
+        server_default=sa.text("'info'"),
+    )
+    node: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    tool: Mapped[ToolName | None] = mapped_column(sa.Text, nullable=True)
+    step_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    attempt: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    input: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    output: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    #: Plain text by design (§12.10): unlike the lifecycle `status` columns on
+    #: sibling tables, this field's vocabulary varies by `kind` rather than
+    #: naming one fixed state machine, so the architecture does not type it
+    #: `enum`.
+    status: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    retry_count: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )

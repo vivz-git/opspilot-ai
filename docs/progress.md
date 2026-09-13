@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001 are done.
-Continue at `docs/handoff.md` §3 with DB-002.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..002 are
+done. Continue at `docs/handoff.md` §3 with DB-003.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ████░░░░░░░░░░░░░░░░  DB-001 done; 002..007 outstanding
+persistence    ████████░░░░░░░░░░░░  DB-001, 002 done; 003..007 outstanding
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -383,3 +383,95 @@ rather than a critical-path blocker.
 A leftover from this session: the same throwaway Postgres container
 (`opspilot-pg-dev`, port 55432) is still running for whoever picks up DB-002
 next; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
+
+## DB-002 — `trace_events` with per-run monotonic `seq` — 2026-09-13
+
+**Done.** `app/persistence/models.py` gains `TraceEvent` (§12.7),
+`TraceEventKind` (all 29 kinds in §14.2, spelled out as a closed `StrEnum` —
+`@traced_node`/`ToolRegistry.dispatch` are the only structural emitters, so
+this is exactly what can ever be produced, not an open vocabulary) and
+`TraceEventSeverity` (`debug/info/warning/error`). Migration `21765d8fa136`
+(`Revises: c6d1db7aa718`) creates the table by hand, self-contained like
+`c6d1db7aa718` — enum values spelled out as literals rather than imported.
+Every column, nullability, default and index in §12.7 is implemented
+literally: `id bigserial` (not a uuid, unlike every other control-plane
+table — §12.7 is explicit, and this is the fastest-growing table by an order
+of magnitude so a sequential key avoids the write amplification a random
+uuid PK would cause), `UNIQUE(run_id, seq)`, `(run_id, id)`, `(kind, ts DESC)`,
+and a BRIN index on `ts` for the retention scans OBS-004 will run.
+
+**The concurrency mechanism (the point of this task).** `UNIQUE(run_id, seq)`
+alone does not make concurrent allocation correct — under `READ COMMITTED`,
+two transactions can both read the same `MAX(seq)` before either inserts and
+race to write the same value, which the constraint only catches after the
+fact. `app/persistence/trace_events.append_trace_event` instead takes a
+**transaction-scoped Postgres advisory lock keyed by `run_id`**
+(`pg_advisory_xact_lock(hashtextextended(run_id::text, 0))`) immediately
+before the `MAX(seq)+1` read and the insert. The lock blocks other writers
+for the *same* run until it releases at commit/rollback, serializing exactly
+the read-then-insert window per run; different runs proceed independently
+(a `hashtextextended` collision between two live run ids is practically
+impossible, and would only cost extra serialization, never an incorrect
+`seq`, if it happened). `UNIQUE(run_id, seq)` remains as the database-level
+backstop against any code path that bypasses this function — not the
+mechanism that makes concurrent appends correct in the first place. Chosen
+over a `SELECT ... FOR UPDATE` on a per-run row (no such row exists before
+the first event, and creating one is more moving parts for no extra
+correctness) and over a Postgres sequence per run (sequences aren't
+naturally scoped per row without one sequence object per run, which doesn't
+compose with an unbounded number of runs). No new infrastructure — Postgres
+advisory locks are built for exactly this "serialize by an application key"
+case (ADR-019).
+
+**Verified against a real `postgres:16-alpine` container**
+(`opspilot-pg-dev`, port 55432), not simulated: 25 concurrent threads, each
+with its own connection and its own committing transaction, appending to the
+*same* run, produce exactly `1, 2, ..., 25` in the database — no duplicates,
+no gaps (`tests/test_trace_events.py::TestConcurrentSequenceAllocation
+::test_concurrent_appends_yield_1_through_n_with_no_duplicates_or_gaps`).
+A second test runs two runs' workers interleaved on one thread pool and
+confirms each run's sequence is independently `1..15` with no cross-run
+interference. A third forces the actual race the constraint exists to catch
+— two threads racing to insert the same explicit `(run_id, seq)` bypassing
+the allocator — and confirms exactly one wins and one gets `IntegrityError`.
+These are genuine separate transactions racing against a live server, not
+one session's in-order calls standing in for concurrency.
+
+`tests/test_trace_events.py` (18 tests, `@pytest.mark.integration`, skips
+cleanly with no reachable database, same pattern as `test_persistence_models
+.py`) also covers: event creation (minimal and every field populated),
+`run_id`/`seq`/`kind` NOT NULL and FK enforcement, both enum `CHECK`
+constraints, cascade delete from `agent_runs`, the duplicate-`(run_id, seq)`
+rejection and the same-`seq`-different-run positive case, every named index
+present in `pg_indexes` plus a direct check that the `ts` index actually uses
+the `brin` access method and that the `run_id, seq` index is actually
+`UNIQUE`, and sequential (non-concurrent) allocation producing `1, 2, 3`
+within one run and independent counters across two runs.
+
+`tests/test_migrations.py` gains `TestTraceEventsMigration`: upgrade creates
+`trace_events`; downgrade to `c6d1db7aa718` drops only `trace_events` and
+leaves DB-001's four tables untouched; a second `upgrade head` is a true
+no-op; downgrade-then-reupgrade reproduces the same schema. One pre-existing
+DB-001 test hardcoded `c6d1db7aa718` as "the head" — true when DB-001 was the
+newest revision, false now that DB-002 sits on top of it. Fixed to compare
+against Alembic's own `ScriptDirectory.get_current_head()` instead of a
+literal id, in both the DB-001 and the new DB-002 test, so neither goes stale
+again the next time a migration lands on top. This is a test-assertion fix
+required by adding a revision, not a change to DB-001's actual schema or
+behavior — the four control-plane tables and their migration are untouched.
+
+**Test suite: 288 passed, 1 skipped** (`cd backend && uv run pytest`, with
+`DATABASE_URL` pointed at a reachable Postgres — 22 of the 288 are new:
+18 in `test_trace_events.py`, 4 in `test_migrations.py`; without a database,
+those 22 skip instead, for 241 passed + 48 skipped, matching the established
+pattern). `ruff check .`, `ruff format --check .` and `mypy app` (strict)
+are all clean.
+
+Next task: **DB-003** (`evaluation_runs`/`evaluation_results`, and the FK
+`agent_runs.evaluation_run_id` deferred by DB-001) — SONNET, depends only on
+DB-001. **DB-004** (`mock_crm` models) remains unblocked and independent,
+depending only on FOUND-003.
+
+The same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is
+still running for whoever picks up the next task; remove with
+`docker rm -f opspilot-pg-dev` once no longer needed.

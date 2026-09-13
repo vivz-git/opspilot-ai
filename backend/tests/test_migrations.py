@@ -54,6 +54,12 @@ def _schema_names() -> set[str]:
         return {row[0] for row in rows}
 
 
+def _script_head(config: Config) -> str | None:
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
 def _current_revision() -> str | None:
     with _sync_engine().connect() as conn:
         try:
@@ -136,4 +142,47 @@ class TestControlPlaneTablesMigration:
         command.downgrade(config, "19463f144188")
         command.upgrade(config, "head")
         assert _table_names("opspilot") >= self._DB001_TABLES
-        assert _current_revision() == "c6d1db7aa718"
+        # Not the literal head id: DB-002 added a revision on top of this
+        # one, so "head" has moved on. What this test actually pins is that
+        # re-upgrading through this revision is deterministic, which
+        # `_table_names` already established; re-check against Alembic's own
+        # notion of head instead of a hardcoded id that would go stale again
+        # each time a later migration lands.
+        config = _alembic_config()
+        assert _current_revision() == _script_head(config)
+
+
+class TestTraceEventsMigration:
+    """DB-002 — `trace_events` (§12.7). Must build on DB-001's head and be
+    reversible without touching the four control-plane tables it revises."""
+
+    _DB001_TABLES = frozenset({"agent_runs", "execution_steps", "tool_calls", "approvals"})
+
+    def test_upgrade_head_creates_trace_events(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        assert "trace_events" in _table_names("opspilot")
+
+    def test_downgrade_to_the_previous_revision_drops_only_trace_events(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, "c6d1db7aa718")
+        tables = _table_names("opspilot")
+        assert "trace_events" not in tables
+        assert tables >= self._DB001_TABLES  # DB-001's tables are untouched
+        command.upgrade(config, "head")  # leave the database migrated
+
+    def test_a_second_upgrade_head_is_a_true_no_op(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        before = _current_revision()
+        command.upgrade(config, "head")
+        assert _current_revision() == before
+
+    def test_downgrade_then_reupgrade_reproduces_the_same_schema(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, "c6d1db7aa718")
+        command.upgrade(config, "head")
+        assert "trace_events" in _table_names("opspilot")
+        assert _current_revision() == _script_head(config)
