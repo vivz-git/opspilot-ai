@@ -13,15 +13,15 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..007 are
-done. Continue at `docs/handoff.md` §3 with TOOL-001.
+**Phase 1 — implementation: started.** FOUND-001..004, DB-001..007, and TOOL-001
+are done. Continue at `docs/handoff.md` §3 with TOOL-002.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
-tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
+tools          ████░░░░░░░░░░░░░░░░  TOOL-001 done; TOOL-002..006 outstanding
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
@@ -914,10 +914,20 @@ database the integration classes skip and the pure-function classes still
 run). `ruff check .`, `ruff format --check .`, `mypy app` (strict) and
 `alembic check` are all clean.
 
-Next task: **TOOL-001** (`integrations/ports.py` Protocols, mock adapters,
-seed dataset) — SONNET, depends only on DB-004 and is the head of the tools
-chain. **AGENT-002** now has its checkpointer; it still depends on
-AGENT-003..008. **API-007** depends on DB-007 (done) and AGENT-002.
+Next task: **TOOL-001** (done below). **AGENT-002** now has its checkpointer;
+it still depends on AGENT-003..008. **API-007** depends on DB-007 (done) and AGENT-002.
 
-The throwaway Postgres container (`opspilot-pg-dev`, port 55432) is still
-running; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
+### Code — TOOL-001, tool ports, mock adapters, and deterministic seed dataset
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/integrations/ports.py` | Typed port protocols (`LeadPort`, `CompanyPort`, `CustomerPort`, `DraftPort`, `MailPort`, `ContentPort`), carrier models, and `Adapters` bundle. Mutating methods require `ApprovalToken` | `test_mock_integrations.py::TestProtocolConformance` |
+| `app/integrations/mock/adapters.py` | Zero-network mock implementations bound to `mock_crm` persistence with contract-driven readback queries and deterministic failure injection | `test_mock_integrations.py` (search, profile, get/update customer, save/get draft, send email, idempotency replay) |
+| `app/integrations/mock/fixtures.py` | 8 companies, 11 leads (including canonical `L-104` "Dana Miller"), and 5 customers strictly bound to RFC 2606 `*.example`/`example.com` domains | `test_mock_integrations.py::TestSeedFixturesAndRFC2606` |
+| `app/integrations/mock/seed.py` | `seed_database(session_factory, reset=True)` function and CLI entrypoint for `make seed` (`python -m app.integrations.mock.seed`) | `test_mock_integrations.py::test_seeding_is_idempotent`, manual CLI check |
+| `app/integrations/__init__.py` | Factory `build_adapters(settings, ...)` which refuses `IntegrationMode.REAL` with `ConfigurationError` | `test_mock_integrations.py::TestBuildAdapters` |
+
+**Zero network enforcement:** `tests/test_structure.py::test_mock_integrations_cannot_reach_the_network` now runs and passes (was previously skipped).
+**Test suite: 494 passed, 0 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` — 36 new tests in `test_mock_integrations.py`, 1 unskipped structural test). `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check` are all clean.
+
+Next task: **TOOL-002** (`ToolRegistry.dispatch`: input validation → approval gate re-assertion → idempotency key → timeout → dispatch → output validation → trace, as the single choke point) — OPUS.

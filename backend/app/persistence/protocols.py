@@ -575,6 +575,21 @@ class LeadRepository(Protocol):
         """Persist a lead record."""
         ...
 
+    async def search(
+        self,
+        *,
+        industry: str | None = None,
+        location: str | None = None,
+        min_employees: int | None = None,
+        max_employees: int | None = None,
+        status: LeadStatus | None = None,
+        query: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[Lead], int]:
+        """Search leads with multi-field filters, returning (leads, total_count)."""
+        ...
+
 
 @runtime_checkable
 class CustomerRepository(Protocol):

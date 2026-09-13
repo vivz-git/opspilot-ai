@@ -17,6 +17,7 @@ from typing import Any, Self
 import sqlalchemy as sa
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import joinedload
 
 from app.agent.state import ApprovalStatus, PlannerKind, RunStatus, StepStatus, VerificationStatus
 from app.persistence.mock_crm import (
@@ -956,6 +957,58 @@ class SqlLeadRepository:
         self._session.add(lead)
         await self._session.flush()
         return lead
+
+    async def search(
+        self,
+        *,
+        industry: str | None = None,
+        location: str | None = None,
+        min_employees: int | None = None,
+        max_employees: int | None = None,
+        status: LeadStatus | None = None,
+        query: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[Lead], int]:
+        stmt = (
+            select(Lead)
+            .join(Company, Lead.company_id == Company.company_id)
+            .options(joinedload(Lead.company))
+        )
+        count_stmt = (
+            select(sa.func.count(Lead.lead_id))
+            .select_from(Lead)
+            .join(Company, Lead.company_id == Company.company_id)
+        )
+
+        filters = []
+        if status is not None:
+            filters.append(Lead.status == status)
+        if industry is not None:
+            filters.append(Company.industry == industry)
+        if location is not None:
+            filters.append(Company.hq_location.ilike(f"%{location}%"))
+        if min_employees is not None:
+            filters.append(Company.employee_count >= min_employees)
+        if max_employees is not None:
+            filters.append(Company.employee_count <= max_employees)
+        if query is not None and query.strip():
+            q = f"%{query.strip()}%"
+            filters.append(sa.or_(Lead.full_name.ilike(q), Company.name.ilike(q)))
+
+        if filters:
+            cond = sa.and_(*filters)
+            stmt = stmt.where(cond)
+            count_stmt = count_stmt.where(cond)
+
+        stmt = stmt.order_by(Lead.created_at.asc(), Lead.lead_id.asc()).limit(limit).offset(offset)
+
+        total_res = await self._session.execute(count_stmt)
+        total_count = int(total_res.scalar_one() or 0)
+
+        items_res = await self._session.execute(stmt)
+        leads = list(items_res.scalars().unique().all())
+        return leads, total_count
 
 
 class SqlCustomerRepository:

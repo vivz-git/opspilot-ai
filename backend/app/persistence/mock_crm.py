@@ -21,6 +21,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy import ForeignKey, Index
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.persistence.base import MOCK_CRM_SCHEMA, Base
@@ -36,6 +37,7 @@ __all__ = [
     "LeadStatus",
     "OutreachDraft",
     "OutreachDraftStatus",
+    "reset_mock_crm",
 ]
 
 
@@ -267,3 +269,17 @@ class EmailOutbox(Base):
     sent_at: Mapped[datetime | None] = mapped_column(_timestamptz(), nullable=True)
 
     draft: Mapped[OutreachDraft] = relationship("OutreachDraft", back_populates="outbox_entries")
+
+
+async def reset_mock_crm(session: AsyncSession) -> None:
+    """Clear all mock_crm tables for deterministic reseeding."""
+    await session.execute(
+        sa.text(
+            f"TRUNCATE {MOCK_CRM_SCHEMA}.email_outbox, "
+            f"{MOCK_CRM_SCHEMA}.outreach_drafts, "
+            f"{MOCK_CRM_SCHEMA}.leads, "
+            f"{MOCK_CRM_SCHEMA}.customers, "
+            f"{MOCK_CRM_SCHEMA}.companies "
+            f"CASCADE"
+        )
+    )
