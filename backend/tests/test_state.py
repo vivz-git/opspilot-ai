@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from app.agent.state import (
     TERMINAL_RUN_STATUSES,
     AgentError,
@@ -90,8 +89,12 @@ class TestReducers:
 
     def test_merge_preserves_sibling_keys(self) -> None:
         """A node updating s3 must not drop s1's artifact."""
-        current = {"s1": ToolResult(step_id="s1", tool=ToolName.GET_LEAD, output={}, produced_at=NOW)}
-        incoming = {"s3": ToolResult(step_id="s3", tool=ToolName.SCORE_LEAD, output={}, produced_at=NOW)}
+        current = {
+            "s1": ToolResult(step_id="s1", tool=ToolName.GET_LEAD, output={}, produced_at=NOW)
+        }
+        incoming = {
+            "s3": ToolResult(step_id="s3", tool=ToolName.SCORE_LEAD, output={}, produced_at=NOW)
+        }
         assert set(merge_dict(current, incoming)) == {"s1", "s3"}
 
     def test_merge_is_per_step_for_retry_counters(self) -> None:
@@ -99,8 +102,16 @@ class TestReducers:
         assert merge_dict({"s1": 1}, {"s1": 2}) == {"s1": 2}
 
     def test_merge_keeps_verification_results_per_step(self) -> None:
-        a = {"s5": VerificationResult(step_id="s5", status=VerificationStatus.PASSED, mode="readback")}
-        b = {"s6": VerificationResult(step_id="s6", status=VerificationStatus.FAILED, mode="readback")}
+        a = {
+            "s5": VerificationResult(
+                step_id="s5", status=VerificationStatus.PASSED, mode="readback"
+            )
+        }
+        b = {
+            "s6": VerificationResult(
+                step_id="s6", status=VerificationStatus.FAILED, mode="readback"
+            )
+        }
         merged = merge_dict(a, b)
         assert merged["s5"].status is VerificationStatus.PASSED
         assert merged["s6"].status is VerificationStatus.FAILED
@@ -178,12 +189,22 @@ class TestLifecycle:
         assert RunStatus.REJECTED is not RunStatus.FAILED
 
     def test_non_terminal_statuses_are_not_terminal(self) -> None:
-        for status in (RunStatus.CREATED, RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.AWAITING_APPROVAL):
+        for status in (
+            RunStatus.CREATED,
+            RunStatus.QUEUED,
+            RunStatus.RUNNING,
+            RunStatus.AWAITING_APPROVAL,
+        ):
             assert status not in TERMINAL_RUN_STATUSES
 
     def test_all_approval_statuses_are_representable(self) -> None:
         assert {s.value for s in ApprovalStatus} == {
-            "pending", "approved", "rejected", "expired", "superseded", "cancelled"
+            "pending",
+            "approved",
+            "rejected",
+            "expired",
+            "superseded",
+            "cancelled",
         }
 
 
@@ -205,9 +226,8 @@ class TestPlan:
         assert Plan.model_validate_json(plan.model_dump_json()) == plan
 
     def test_fanout_requires_a_cap(self) -> None:
-        from pydantic import ValidationError
-
         from app.agent.state import FanOut
+        from pydantic import ValidationError
 
         FanOut(over="s1.output.leads", **{"as": "lead"}, max_items=3)
         with pytest.raises(ValidationError):
@@ -216,10 +236,26 @@ class TestPlan:
 
 def test_state_declares_every_documented_channel() -> None:
     expected = {
-        "run_id", "user_request", "normalized_task", "plan", "plan_history",
-        "current_step_id", "tool_calls", "tool_results", "approval_state", "errors",
-        "retry_count", "replan_count", "step_count", "verification_result",
-        "final_response", "status", "status_reason", "created_at", "updated_at",
-        "deadline_at", "metadata",
+        "run_id",
+        "user_request",
+        "normalized_task",
+        "plan",
+        "plan_history",
+        "current_step_id",
+        "tool_calls",
+        "tool_results",
+        "approval_state",
+        "errors",
+        "retry_count",
+        "replan_count",
+        "step_count",
+        "verification_result",
+        "final_response",
+        "status",
+        "status_reason",
+        "created_at",
+        "updated_at",
+        "deadline_at",
+        "metadata",
     }
     assert set(AgentState.__annotations__) == expected

@@ -21,14 +21,14 @@ from app.errors import ConfigurationError
 
 
 class PlannerMode(StrEnum):
-    AUTO = "auto"    # LLM when a key is present, else rules — degrades, never fails
-    LLM = "llm"      # explicit request: fails fast without a key
+    AUTO = "auto"  # LLM when a key is present, else rules — degrades, never fails
+    LLM = "llm"  # explicit request: fails fast without a key
     RULES = "rules"  # always deterministic
 
 
 class IntegrationMode(StrEnum):
     MOCK = "mock"
-    REAL = "real"    # reserved; refuses to start (§19.3)
+    REAL = "real"  # reserved; refuses to start (§19.3)
 
 
 class Environment(StrEnum):
@@ -158,11 +158,11 @@ class Settings(BaseSettings):
             for name, field in type(self).model_fields.items()
             if field.annotation in (SecretStr, SecretStr | None)
         }
-        return {
-            k: v for k, v in self.model_dump(mode="json").items() if k not in secret_fields
-        } | {"secrets_configured": sorted(
-            name for name in secret_fields if getattr(self, name) is not None
-        )}
+        return {k: v for k, v in self.model_dump(mode="json").items() if k not in secret_fields} | {
+            "secrets_configured": sorted(
+                name for name in secret_fields if getattr(self, name) is not None
+            )
+        }
 
     # --- Fail-fast startup validation (§17.3) -----------------------------
     def validate_runtime(self) -> None:
@@ -180,9 +180,7 @@ class Settings(BaseSettings):
             )
 
         if self.integrations is IntegrationMode.REAL:
-            problems.append(
-                "OPSPILOT_INTEGRATIONS=real is not implemented; no real adapter exists"
-            )
+            problems.append("OPSPILOT_INTEGRATIONS=real is not implemented; no real adapter exists")
 
         if not self.database_url.get_secret_value().startswith(
             ("postgresql+asyncpg://", "postgresql+psycopg://")

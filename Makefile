@@ -38,25 +38,29 @@ migrate: ## Apply database migrations
 seed: ## Load the mock CRM fixture dataset
 	$(COMPOSE) exec api python -m app.integrations.mock.seed
 
+.PHONY: install
+install: ## Install backend deps exactly as locked in uv.lock
+	cd backend && uv sync --locked --extra dev
+
 .PHONY: lint
-lint: ## Ruff + mypy
-	cd backend && ruff check . && ruff format --check . && mypy app
+lint: install ## Ruff + mypy
+	cd backend && uv run ruff check . && uv run ruff format --check . && uv run mypy app
 
 .PHONY: fmt
-fmt: ## Autoformat
-	cd backend && ruff format . && ruff check --fix .
+fmt: install ## Autoformat
+	cd backend && uv run ruff format . && uv run ruff check --fix .
 
 .PHONY: test
-test: ## Backend test suite
-	cd backend && pytest
+test: install ## Backend test suite
+	cd backend && uv run pytest
 
 .PHONY: test-unit
-test-unit: ## Backend tests that need no database
-	cd backend && pytest -m "unit or contract"
+test-unit: install ## Backend tests that need no database
+	cd backend && uv run pytest -m "unit or contract"
 
 .PHONY: eval
-eval: ## Run the deterministic evaluation suite
-	cd backend && python -m app.evaluation.cli run --suite all
+eval: install ## Run the deterministic evaluation suite
+	cd backend && uv run python -m app.evaluation.cli run --suite all
 
 .PHONY: web-test
 web-test: ## Frontend test suite

@@ -19,7 +19,7 @@ done. Continue at `docs/handoff.md` §3 with FOUND-002.
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
-foundation     ████░░░░░░░░░░░░░░░░  FOUND-001, 004 done; 002/003/005 outstanding
+foundation     ██████░░░░░░░░░░░░░░  FOUND-001, 002, 004 done; 003/005 outstanding
 persistence    ░░░░░░░░░░░░░░░░░░░░  DB-001..007
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
@@ -97,7 +97,33 @@ plus the structural guarantee
 (`test_structure.py::test_only_runtime_generates_time_ids_and_randomness`)
 that nothing bypasses it later.
 
-**Test suite: 242 passed, 1 skipped** (`cd backend && pytest`)
+### FOUND-002, the dependency lockfile
+
+`backend/uv.lock` pins all 86 resolved packages against Python 3.12
+(`backend/.python-version`); CI, the `Dockerfile`, and every `Makefile`
+target install from it via `uv sync --locked` / `uv run` instead of an
+unpinned `pip install -e`. `astral-sh/setup-uv@v5` in CI is pinned to
+`0.11.19` to match the uv version that wrote the lock.
+
+Verifying "`make check` reproduces CI exactly" surfaced pre-existing
+`ruff check` / `ruff format --check` violations across files nobody had
+touched this session (`app/errors.py`, `app/security.py`,
+`app/tools/contracts.py`, `app/tools/schemas.py`, and several test files) —
+they were real, just never caught because earlier local runs happened to
+review truncated output. All were mechanical (line wraps, import order, two
+narrow `# noqa`s for a recursive `Any` helper and a test's joke password) —
+no behaviour changed, and the fix is what actually makes `make check`
+green end to end for the first time.
+
+This machine also had no Python 3.12 install and lives inside a
+OneDrive-synced folder, which makes `uv`'s default hardlink-based install
+fail (`os error 396`). Fixed generally, not just worked around locally: `uv
+python install 3.12` gives every environment a real 3.12 interpreter
+regardless of what's already on the machine, and `[tool.uv] link-mode =
+"copy"` in `pyproject.toml` makes `copy` the project's install mode
+everywhere (local, CI, Docker) rather than a one-off flag.
+
+**Test suite: 242 passed, 1 skipped** (`cd backend && uv run pytest`)
 One intentional skip: the mock-package network-import check activates when
 TOOL-001 creates `app/integrations/mock/`.
 
@@ -204,11 +230,18 @@ implementation, not a real/fake pair).
 
 Commit: `feat(agent): add injected Clock, IdGenerator and SeededRandom primitives`.
 
-Next task: **FOUND-003** (Alembic init with the three schemas) is the one
-that actually unblocks the critical path (`DB-001` depends on it), but its
-acceptance criteria (`alembic upgrade head` / `downgrade base` against a real
-database) needs a live Postgres to verify — this machine's Docker Desktop
-daemon was not running when this session ended, so FOUND-003 was left for a
-session where it can be checked, rather than merged unverified.
-**FOUND-002** (dependency lockfile) is the other unblocked option and needs
-no database, so it is the safer pick if Postgres still isn't available.
+**FOUND-002 done** next, since FOUND-003's acceptance criteria need a live
+Postgres to verify (`alembic upgrade head` / `downgrade base`) and this
+machine's Docker Desktop daemon was not running — FOUND-002 needed no
+database and was the other unblocked, unambiguously independent SONNET task.
+See its row in `docs/tasks.md` for the full list of what changed, including
+the pre-existing lint violations it fixed to make `make check` actually
+green.
+
+Commit: `chore(build): lock backend dependencies with uv and wire CI/Docker to install from it`.
+
+Next task: **FOUND-003** (Alembic init with the three schemas) — the task
+that actually unblocks the critical path (`DB-001` depends on it). It needs
+a live Postgres to verify its acceptance criteria; try `docker compose up -d
+db` (or start Docker Desktop) before starting it. **FOUND-005** (CI green on
+the real matrix) is now also unblocked, since it depended only on FOUND-002.

@@ -8,20 +8,19 @@ CI rather than depending on a reviewer noticing.
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel
-
 from app.errors import ErrorClass
 from app.tools.contracts import (
     GATED_SIDE_EFFECTS,
     REGISTRY,
-    SideEffect,
     RiskLevel,
+    SideEffect,
     ToolContract,
     ToolName,
     VerificationMode,
     catalog,
     contract,
 )
+from pydantic import BaseModel
 
 ALL = pytest.mark.parametrize("c", list(REGISTRY.values()), ids=lambda c: c.name.value)
 pytestmark = [pytest.mark.contract, pytest.mark.unit]
@@ -118,7 +117,7 @@ def test_unknown_tool_cannot_be_dispatched() -> None:
     """An LLM cannot invent a capability: an undeclared name is rejected
     before dispatch (§4.2)."""
     with pytest.raises(ValueError):
-        contract("send_email")          # the future real sender does not exist
+        contract("send_email")  # the future real sender does not exist
     with pytest.raises(ValueError):
         contract("delete_all_customers")
 

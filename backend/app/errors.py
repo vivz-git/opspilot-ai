@@ -96,7 +96,11 @@ class RateLimitedError(OpsPilotError):
     error_class = ErrorClass.RATE_LIMITED
 
     def __init__(
-        self, message: str, *, retry_after_ms: int | None = None, detail: dict[str, Any] | None = None
+        self,
+        message: str,
+        *,
+        retry_after_ms: int | None = None,
+        detail: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message, detail=detail)
         self.retry_after_ms = retry_after_ms
@@ -151,9 +155,7 @@ class ConfigurationError(OpsPilotError):
     error_class = ErrorClass.INTERNAL
 
 
-def is_retryable(
-    error_class: ErrorClass, *, idempotent: bool, nondeterministic: bool
-) -> bool:
+def is_retryable(error_class: ErrorClass, *, idempotent: bool, nondeterministic: bool) -> bool:
     """Is this class retryable for a tool with these contract properties?"""
     if error_class in TERMINAL_ERRORS:
         return False

@@ -128,10 +128,15 @@ class SearchLeadsInput(Strict):
             and self.max_employees < self.min_employees
         ):
             raise ValueError("max_employees must be >= min_employees")
-        if not any(
-            v is not None
-            for v in (self.industry, self.location, self.status, self.query, self.min_employees, self.max_employees)
-        ):
+        filters = (
+            self.industry,
+            self.location,
+            self.status,
+            self.query,
+            self.min_employees,
+            self.max_employees,
+        )
+        if not any(v is not None for v in filters):
             # A cost bound: the planner may not request the whole table.
             raise ValueError("at least one filter or query is required")
         return self

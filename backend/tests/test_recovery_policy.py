@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from app.errors import (
     ALWAYS_RETRYABLE,
     REPLANNABLE,
@@ -62,7 +61,8 @@ class TestRetryability:
 
 class TestRecoveryDecision:
     def test_policy_violation_fails_before_anything_else(self) -> None:
-        assert act(ErrorClass.POLICY_VIOLATION, retries_remaining=99, step_optional=True) is RecoveryAction.FAIL
+        result = act(ErrorClass.POLICY_VIOLATION, retries_remaining=99, step_optional=True)
+        assert result is RecoveryAction.FAIL
 
     def test_budget_exhaustion_outranks_a_remaining_retry(self) -> None:
         assert act(ErrorClass.TRANSIENT, budget_exhausted=True) is RecoveryAction.FAIL

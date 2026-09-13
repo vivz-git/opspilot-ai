@@ -47,7 +47,7 @@ def canonical_args_hash(args: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _strip_volatile(value: Any) -> Any:
+def _strip_volatile(value: Any) -> Any:  # noqa: ANN401 - recurses over arbitrary JSON-like data
     if isinstance(value, dict):
         return {k: _strip_volatile(v) for k, v in value.items() if k not in VOLATILE_ARG_KEYS}
     if isinstance(value, (list, tuple)):

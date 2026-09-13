@@ -52,6 +52,15 @@ dev = [
 packages = ["app"]
 
 # ---------------------------------------------------------------------------
+# uv (FOUND-002) — uv.lock is the reproducible install; `copy` avoids a
+# hardlink failure when the project lives inside a cloud-synced folder
+# (e.g. OneDrive on Windows) and costs nothing meaningful on CI's ephemeral
+# runners.
+# ---------------------------------------------------------------------------
+[tool.uv]
+link-mode = "copy"
+
+# ---------------------------------------------------------------------------
 # Lint / format
 # ---------------------------------------------------------------------------
 [tool.ruff]

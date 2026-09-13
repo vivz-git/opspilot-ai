@@ -33,9 +33,9 @@ class RunStatus(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
-    REJECTED = "rejected"      # a human declined: the mechanism working, not a failure
+    REJECTED = "rejected"  # a human declined: the mechanism working, not a failure
     CANCELLED = "cancelled"
-    EXPIRED = "expired"        # an approval TTL elapsed
+    EXPIRED = "expired"  # an approval TTL elapsed
 
 
 TERMINAL_RUN_STATUSES: Final[frozenset[RunStatus]] = frozenset(
@@ -72,7 +72,7 @@ class ApprovalStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EXPIRED = "expired"
-    SUPERSEDED = "superseded"   # arguments changed after a human decided
+    SUPERSEDED = "superseded"  # arguments changed after a human decided
     CANCELLED = "cancelled"
 
 
@@ -119,7 +119,7 @@ class FanOut(Model):
 
 
 class PlanStep(Model):
-    step_id: str                       # stable: approvals, traces and $refs cite it
+    step_id: str  # stable: approvals, traces and $refs cite it
     tool: ToolName
     args: dict[str, Any] = Field(default_factory=dict)
     depends_on: list[str] = Field(default_factory=list)
@@ -218,7 +218,7 @@ class ApprovalDecision(Model):
     approval_id: str
     step_id: str
     decision: ApprovalDecisionKind
-    args_hash: str            # the hash the human actually saw
+    args_hash: str  # the hash the human actually saw
     decided_by: str
     decided_at: datetime
     reason: str | None = None

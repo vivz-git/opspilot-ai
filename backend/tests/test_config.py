@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import SecretStr, ValidationError
-
 from app.agent.state import PlannerKind
 from app.config import Environment, IntegrationMode, PlannerMode, Settings
 from app.errors import ConfigurationError
+from pydantic import SecretStr, ValidationError
 
 pytestmark = [pytest.mark.unit]
 
@@ -122,7 +121,7 @@ class TestSecretHandling:
         assert "anthropic_api_key" in dump["secrets_configured"]
 
     def test_secrets_are_hidden_in_repr(self) -> None:
-        s = settings(ANTHROPIC_API_KEY=KEY, POSTGRES_PASSWORD="hunter2")
+        s = settings(ANTHROPIC_API_KEY=KEY, POSTGRES_PASSWORD="hunter2")  # noqa: S106
         assert KEY not in repr(s)
         assert "hunter2" not in repr(s)
 

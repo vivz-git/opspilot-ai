@@ -1,20 +1,28 @@
 # ---------------------------------------------------------------------------
 # OpsPilot AI backend. Single stage: the app is pure Python, the wheels we
 # need ship binaries, so a builder stage buys us nothing yet.
+#
+# Installed from uv.lock (FOUND-002) so the image gets exactly what CI tested
+# against, not whatever pip's resolver picks on the day of the build.
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_LINK_MODE=copy
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /uvx /usr/local/bin/
 
 WORKDIR /srv
 
 # Dependency layer first so source edits do not invalidate the install.
-COPY pyproject.toml ./
-RUN pip install --upgrade pip && pip install -e ".[dev]"
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --extra dev --no-install-project
 
 COPY . .
+RUN uv sync --locked --extra dev
+
+ENV PATH="/srv/.venv/bin:${PATH}"
 
 # Run as non-root: the container has no business writing to its own image.
 RUN useradd --create-home --uid 10001 opspilot && chown -R opspilot:opspilot /srv

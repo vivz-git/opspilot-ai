@@ -37,10 +37,10 @@ class ToolName(StrEnum):
 
 class SideEffect(StrEnum):
     READ_ONLY = "read_only"
-    INTERNAL_WRITE = "internal_write"      # our own artifact; reversible
-    CUSTOMER_WRITE = "customer_write"      # business-owned records
-    OUTBOUND = "outbound"                  # leaves the system
-    DESTRUCTIVE = "destructive"            # irreversible removal
+    INTERNAL_WRITE = "internal_write"  # our own artifact; reversible
+    CUSTOMER_WRITE = "customer_write"  # business-owned records
+    OUTBOUND = "outbound"  # leaves the system
+    DESTRUCTIVE = "destructive"  # irreversible removal
 
 
 class RiskLevel(StrEnum):
@@ -50,9 +50,9 @@ class RiskLevel(StrEnum):
 
 
 class VerificationMode(StrEnum):
-    NONE = "none"            # schema validation only; recorded as not_required
+    NONE = "none"  # schema validation only; recorded as not_required
     INVARIANT = "invariant"  # semantic assertions on the output
-    READBACK = "readback"    # independent re-read of the affected entity
+    READBACK = "readback"  # independent re-read of the affected entity
 
 
 #: Side effects that a human must authorise (invariant P1).
@@ -258,7 +258,10 @@ _CONTRACTS: tuple[ToolContract, ...] = (
             _TRANSIENT,
             FailureMode(
                 error_class=ErrorClass.POLICY_VIOLATION,
-                description="recipient does not match the owning lead, or the approval token is absent/stale",
+                description=(
+                    "recipient does not match the owning lead, "
+                    "or the approval token is absent/stale"
+                ),
             ),
         ),
     ),

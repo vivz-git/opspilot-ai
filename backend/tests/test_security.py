@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from app.errors import PolicyViolation
 from app.security import VOLATILE_ARG_KEYS, ApprovalGate, ApprovalToken, canonical_args_hash
 
