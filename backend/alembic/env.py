@@ -20,9 +20,15 @@ if config.config_file_name is not None:
 # (§17.1) — alembic.ini's own sqlalchemy.url is a placeholder, never real.
 config.set_main_option("sqlalchemy.url", get_settings().database_url.get_secret_value())
 
-# Models arrive with DB-001/DB-004; until then there is nothing to
-# autogenerate against, and every migration here is written by hand.
-target_metadata = None
+# DB-001 adds the first ORM models. `app.persistence.models` must be imported
+# (not just `app.persistence.base`) so its mapped classes register on
+# `Base.metadata` before Alembic reads it — otherwise `--autogenerate` would
+# see an empty schema. Every migration is still written by hand (§12.1); this
+# only makes autogenerate diffs available as a check, not a generator.
+from app.persistence import models as _models  # noqa: E402,F401
+from app.persistence.base import Base as _Base  # noqa: E402
+
+target_metadata = _Base.metadata
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

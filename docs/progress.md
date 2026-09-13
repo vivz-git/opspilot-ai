@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001 (the FastAPI app factory) is
-done. Continue at `docs/handoff.md` §3 with FOUND-002.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001 are done.
+Continue at `docs/handoff.md` §3 with DB-002.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ░░░░░░░░░░░░░░░░░░░░  DB-001..007
+persistence    ████░░░░░░░░░░░░░░░░  DB-001 done; 002..007 outstanding
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -281,15 +281,105 @@ Session stopped here on explicit instruction, with FOUND-003 as the last
 coherent unit finished, checked, documented and pushed. No further task was
 started automatically.
 
-Next task: **DB-001** (control-plane models: `agent_runs`, `execution_steps`,
-`tool_calls`, `approvals`) — SONNET. It depends on FOUND-003, now done, and
-is next on the critical path (`docs/handoff.md` §3: `FOUND-001 ▸ DB-001..004
-▸ TOOL-001 ▸ ...`). **FOUND-005** (CI green on the real matrix) is also
-unblocked, since it depended only on FOUND-002 — SONNET, lower priority than
-DB-001 since it is a verification task (needs a PR to actually watch CI run)
-rather than a critical-path blocker.
-
 A leftover from this session: a throwaway Postgres container
 (`opspilot-pg-dev`, port 55432) is still running locally for whoever picks up
 DB-001 next; it is not part of the committed stack and can be removed with
 `docker rm -f opspilot-pg-dev` once no longer needed.
+
+## DB-001 — control-plane persistence models — 2026-09-13
+
+**Done.** `app/persistence/base.py` (the shared `Base` — `DeclarativeBase`
+scoped to the `opspilot` schema, with a naming convention so hand-written
+migrations and a future `--autogenerate` diff agree on constraint names) and
+`app/persistence/models.py`: `AgentRun`, `ExecutionStep`, `ToolCallRow`,
+`ApprovalRow`, matching §12.3–§12.6 column-for-column, including nullability
+and defaults. Migration `c6d1db7aa718` (`Revises: 19463f144188`) creates all
+four tables by hand, self-contained (enum values spelled out as literals
+rather than imported from the model module, so the migration's behaviour
+can't drift if that module changes later).
+
+Column typing follows §12.10 literally rather than by convenience: a column
+the architecture types `enum` (`agent_runs.status`, `execution_steps.status`
+and `.verification_status`, `tool_calls.status`, `approvals.status` and
+`.risk`) is a real database-enforced `CHECK` constraint
+(`sa.Enum(..., native_enum=False, create_constraint=True)` — a constrained
+text column, not a Postgres `CREATE TYPE`, so adding a value later is a plain
+constraint migration rather than an `ALTER TYPE` lifecycle outside a
+transaction); a column the architecture types `text` (`planner_kind`, `tool`,
+`tool_version`) stays a plain unconstrained text column even though its
+values happen to come from a Python `StrEnum` elsewhere in the codebase,
+because the architecture deliberately did not gate those at the database.
+`tool_calls.status` needed a new enum (`ToolCallStatus`:
+`succeeded/failed/timeout/duplicate_suppressed`) since nothing existing named
+it — everything else reuses `RunStatus`/`StepStatus`/`VerificationStatus`/
+`ApprovalStatus` from `app.agent.state` and `RiskLevel` from
+`app.tools.contracts`, so the DB-level vocabulary can't drift from the
+in-process one.
+
+One deliberate deviation, recorded rather than silently patched: §12.3 lists
+`evaluation_run_id` as an FK to `evaluation_runs`, but that table doesn't
+exist until DB-003 (which depends on DB-001, not the reverse). The column
+exists now with no FK constraint; DB-003's migration adds the constraint once
+its target table exists, rather than DB-001 reaching forward to create a
+table out of order.
+
+`alembic/env.py` now imports `app.persistence.models` and sets
+`target_metadata = Base.metadata` (previously `None`, per FOUND-003's
+comment that this was deferred until models existed) — migrations are still
+written by hand, but `alembic check`/`--autogenerate` are now available as a
+cross-check. (Running `alembic check` locally shows cosmetic false-positive
+FK diffs caused by this machine's Postgres role being named `opspilot`,
+which happens to collide with the schema name and change Postgres's default
+`search_path` resolution during reflection — verified as a reflection
+artifact, not a real schema mismatch, by inspecting `\d` on every table
+directly against the live container.)
+
+Verified against a real `postgres:16-alpine` container (`opspilot-pg-dev`,
+port 55432): `alembic upgrade head` creates all four tables with every
+column type, default, `CHECK`, FK and index in §12.3–§12.6; `alembic
+downgrade 19463f144188` drops exactly those four tables and leaves the
+`opspilot` schema itself (FOUND-003's) untouched; a downgrade → upgrade
+cycle reproduces an identical schema. All three behaviours are now also
+`tests/test_migrations.py::TestControlPlaneTablesMigration`, following the
+same pattern FOUND-003 established.
+
+`tests/test_persistence_models.py` (new, `@pytest.mark.integration`, skips
+cleanly with no reachable database) covers the rest of the acceptance
+criteria against the live container: every model can be created with
+sane defaults; all six enum `CHECK` constraints reject an out-of-vocabulary
+value (short enough — `"bogus"`, 5 chars — to fit inside every column's
+narrowest varchar width, so the test actually exercises the `CHECK` rather
+than tripping a column-width `DataError` first); both foreign keys reject an
+unknown parent id; deleting a run cascades to its steps, tool calls and
+approvals (checked with a direct `SELECT count(*)`, not `Session.get` — the
+ORM has no relationships declared, so its identity map has no way to know
+the DB-level `ON DELETE CASCADE` fired, and would otherwise hand back stale
+cached objects); every named index in §12.3–§12.6 is present in
+`pg_indexes`; a second **pending** approval for the same `(run_id, step_id)`
+is rejected by the partial unique index, while a new pending approval is
+allowed once the first is decided (the positive case the partial condition
+exists to permit); a second `tool_calls` row with the same
+`(execution_step_id, attempt)` is rejected, while a second attempt with a
+different number is allowed. Each test runs inside a `Session` joined to an
+external transaction via a savepoint (`join_transaction_mode=
+"create_savepoint"`) so a `pytest.raises(IntegrityError)` — which aborts the
+current savepoint — doesn't poison the rest of the test, and nothing written
+survives the test.
+
+**Test suite: 266 passed, 1 skipped** (`cd backend && uv run pytest`, with
+`DATABASE_URL` pointed at a reachable Postgres — 7 of the 266 are new
+migration-determinism tests plus 19 new model tests; without a database,
+those 26 skip instead, matching the FOUND-003 pattern). `ruff check .`,
+`ruff format --check .` and `mypy app` (strict) are all clean.
+
+Next task: **DB-002** (`trace_events` with a per-run monotonic `seq` and
+`unique(run_id, seq)`) — SONNET, next on the critical path since it depends
+only on DB-001. **DB-004** (`mock_crm` models) is also unblocked, since it
+depends only on FOUND-003 — SONNET, independent of DB-002/003. **FOUND-005**
+(CI green on the real matrix) remains unblocked and unstarted from the prior
+session, lower priority than the DB-00x chain since it's a verification task
+rather than a critical-path blocker.
+
+A leftover from this session: the same throwaway Postgres container
+(`opspilot-pg-dev`, port 55432) is still running for whoever picks up DB-002
+next; remove with `docker rm -f opspilot-pg-dev` once no longer needed.

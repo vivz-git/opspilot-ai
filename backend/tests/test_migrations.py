@@ -99,3 +99,41 @@ class TestSchemaMigrations:
         config = _alembic_config()
         command.upgrade(config, "head")
         assert "langgraph" not in _schema_names()
+
+
+def _table_names(schema: str) -> set[str]:
+    with _sync_engine().connect() as conn:
+        inspector = sa.inspect(conn)
+        return set(inspector.get_table_names(schema=schema))
+
+
+class TestControlPlaneTablesMigration:
+    """DB-001 — `agent_runs`, `execution_steps`, `tool_calls`, `approvals`
+    (§12.3-12.6). The migration must build on FOUND-003 and be reversible
+    without touching the schemas that revision owns."""
+
+    _DB001_TABLES = frozenset({"agent_runs", "execution_steps", "tool_calls", "approvals"})
+
+    def test_upgrade_head_creates_all_four_control_plane_tables(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        assert _table_names("opspilot") >= self._DB001_TABLES
+
+    def test_downgrade_to_the_previous_revision_drops_only_the_new_tables(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, "19463f144188")
+        tables = _table_names("opspilot")
+        assert not (self._DB001_TABLES & tables)
+        assert "opspilot" in _schema_names()  # FOUND-003's schema itself is untouched
+        command.upgrade(config, "head")  # leave the database migrated
+
+    def test_a_second_upgrade_head_after_downgrade_reproduces_the_same_schema(self) -> None:
+        """Determinism: downgrade then re-upgrade must not leave stray state
+        (e.g. a duplicate constraint name) behind."""
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, "19463f144188")
+        command.upgrade(config, "head")
+        assert _table_names("opspilot") >= self._DB001_TABLES
+        assert _current_revision() == "c6d1db7aa718"
