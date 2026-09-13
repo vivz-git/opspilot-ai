@@ -309,6 +309,33 @@ _CONTRACTS: tuple[ToolContract, ...] = (
 REGISTRY: Final[dict[ToolName, ToolContract]] = {c.name: c for c in _CONTRACTS}
 
 
+def policy_violations(c: ToolContract) -> list[str]:
+    """Which of P1-P6 a contract violates (empty when it is policy-clean).
+
+    `tests/test_tool_policy.py` asserts this over the shipped registry; the
+    dispatcher (`ToolRegistry`) re-asserts it over whatever contracts it is
+    constructed with, so an injected or future contract cannot be executed
+    around its own policy metadata (§8.2). P7 is enforced by the type system:
+    `FailureMode.error_class` is an `ErrorClass`.
+    """
+    violated: list[str] = []
+    if c.side_effect in GATED_SIDE_EFFECTS and not c.requires_approval:
+        violated.append("P1")
+    if c.is_mutating and c.verification is not VerificationMode.READBACK:
+        violated.append("P2")
+    if c.side_effect is SideEffect.READ_ONLY and c.requires_approval:
+        violated.append("P3")
+    if c.requires_approval:
+        fields = c.input_model.model_fields
+        if "idempotency_key" not in fields or "approval_token" not in fields:
+            violated.append("P4")
+    if not c.idempotent and ErrorClass.VERIFICATION_FAILED in c.retryable_errors:
+        violated.append("P5")
+    if c.side_effect is SideEffect.DESTRUCTIVE and c.risk is not RiskLevel.HIGH:
+        violated.append("P6")
+    return violated
+
+
 def contract(name: ToolName | str) -> ToolContract:
     """Look up a contract, rejecting anything the registry does not declare.
 

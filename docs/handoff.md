@@ -17,7 +17,7 @@ cat docs/tasks.md             # 2. what is next, with acceptance criteria
 cat docs/decisions.md         # 3. what is already decided, and why
 git status                    # 4. is the tree clean?
 git log --oneline -15         # 5. what actually landed
-cd backend && uv run pytest   # 6. still green? expect 457 passed, 1 skipped (with DATABASE_URL at a reachable Postgres)
+cd backend && uv run pytest   # 6. still green? expect 599 passed, 0 skipped (with DATABASE_URL at a reachable Postgres)
 grep -rn "TODO\|FIXME" backend/app 2>/dev/null   # 7. any unfinished edges
 ```
 
@@ -35,19 +35,33 @@ code is what runs and the document is a bug — fix the document, do not
 Architecture is **complete**. Implemented and tested: the contract spine
 (errors, security, tool schemas and registry, agent state, configuration), the
 foundation (app factory, lockfile, Alembic, injected clock/ids/randomness),
-and the whole persistence layer — every control-plane and `mock_crm` table,
-the async repositories, constraint tests against real Postgres, and DB-007's
-LangGraph checkpointer, run leases, heartbeat and crash-recovery reconciler.
-457 tests pass. `docs/progress.md` has the per-task record.
+the whole persistence layer — every control-plane and `mock_crm` table, the
+async repositories, constraint tests against real Postgres, and DB-007's
+LangGraph checkpointer, run leases, heartbeat and crash-recovery reconciler —
+the integration ports and mock adapters with the seed dataset (TOOL-001), and
+the single tool dispatch choke point `ToolRegistry.dispatch` (TOOL-002,
+ADR-024). 599 tests pass. `docs/progress.md` has the per-task record.
 
-Not yet implemented: the tools and mock adapters, the graph and its nodes,
+Not yet implemented: the nine tool implementations, the graph and its nodes,
 HITL, verification, the API, the dashboard and the evaluation runner.
 
 ## 3. Start here
 
-**Next task: `TOOL-001`** — `integrations/ports.py` Protocols (mutating
-methods take an `ApprovalToken`), the mock adapters, and the seed fixture
-dataset on RFC 2606 domains. Model class: SONNET. Depends only on DB-004.
+**Next task: `TOOL-003`** — the nine tool implementations over ports under
+`app/tools/impl/`, each honouring its declared failure modes, bound into
+`ToolRegistry` by the composition root. Model class: SONNET. Depends on
+TOOL-002 (done).
+
+An implementation is `async def name(args: <InputModel>, ctx: ToolContext) ->
+<OutputModel>`; it reaches its port only as `ctx.port` (narrow it with
+`isinstance(ctx.port, MailPort)`), takes the token and the key from the
+validated `args` for gated tools, and raises the taxonomy's exceptions. It
+never validates input, checks a grant, derives a key, records a row or emits
+a trace — the dispatcher already did or will. `tests/test_tool_dispatch.py`
+carries scripted implementations for `search_leads`, `get_lead`,
+`score_lead` and `send_email_mock` that show the shape. When `AGENT-005`
+lands, the node calls **only** `ToolRegistry.dispatch(...)`; the structural
+tests will reject anything else.
 
 When you reach **AGENT-002** and **API-007**, DB-007 already provides what
 they need — do not rebuild it: compile the graph with the saver from
@@ -97,7 +111,12 @@ every test still passes.
 1. **No mutating or outbound tool executes without a grant matching the exact
    arguments.** Three barriers (§9.5) must all remain in place. Never add a
    bypass — no `skip_approval` flag, no query parameter, no test-only switch.
-   Tests script the *human*, never disable the *gate*.
+   Tests script the *human*, never disable the *gate*. Every tool call goes
+   through `ToolRegistry.dispatch` (§8.5, ADR-024): nothing outside
+   `app/integrations/` and `app/tools/impl/` may call a mutating port method,
+   and the dispatcher alone derives idempotency keys, constructs a
+   `ToolContext` and writes `tool_calls` rows — `tests/test_structure.py`
+   enforces each of these and its scan is proven non-permissive by canaries.
 2. **Never assume a tool succeeded because it returned.** Mutating effects are
    verified through an independent read path, compared against what was
    requested, not what the tool echoed.
@@ -205,7 +224,12 @@ Things the architecture handles that are easy to get wrong on the way through.
 | Conflating `case_pass_rate` with `task_success_rate` | A case that expects rejection and gets it is a **pass**. Keep the metrics separate (§15.4). |
 | Verification reading the wrong source | Read `mock_crm` through a port, and compare against the **requested** intent — never the tool's echoed response, never the control-plane tables. |
 | Fan-out without a cap | `fanout.max_items` is mandatory, and expanded children count against `MAX_STEPS`. |
-| Adding a tool | Add the contract to the registry first. `tests/test_tool_policy.py` will tell you immediately if it violates a policy invariant. |
+| Adding a tool | Add the contract to the registry first. `tests/test_tool_policy.py` will tell you immediately if it violates a policy invariant; `ToolRegistry` refuses to construct with a violating contract, too. Then bind its implementation; an unbound contract dispatches as `ToolNotBoundError`, never as "just run it". |
+| Calling a port from a node, a service or an endpoint | Don't. Dispatch the tool. `test_no_direct_mutating_port_calls_outside_tool_implementations` fails on `adapters.mail.send(...)`, on `mail = adapters.mail`, on passing a port along, and on `ctx.port.send(...)` from anywhere but `app/tools/impl/`. Verifiers use the read methods (`get`, `get_outbox`) and nothing else. |
+| Adding a mutating port method | Add it to `MUTATING_PORT_METHODS` in `tests/test_structure.py` in the same change; `test_the_mutating_port_surface_is_declared` fails until you do. |
+| Passing `idempotency_key` or `approval_token` in a plan's arguments | The dispatcher rejects both (`INPUT_VALIDATION` / `POLICY_VIOLATION`). The key is derived from `(run_id, step_id, args_hash)`; the token is passed to `dispatch(approval_token=...)` by the node, from a stored approved decision (HITL-002). |
+| Reading `tool_calls.status` to tell a refusal from a failure | Both are `failed`. Read `error_class` (`input_validation`, `policy_violation`, `internal` with `adapter IS NULL` = refused before the port) — ADR-024. |
+| Holding the per-key dispatch lock | It pins one pooled connection per waiting dispatcher plus one for the executing adapter. Never fan out concurrent dispatches of the same keyed effect from application code; the realistic contention is two. |
 
 ## 11. Definition of done for the whole system
 

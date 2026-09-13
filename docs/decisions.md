@@ -504,6 +504,83 @@ would re-raise interrupts on paused runs and could not settle a finished one.
 
 ---
 
+## ADR-024
+### One dispatcher owns the key, the port and the record; a rejection is an attempt
+
+**Context.** §8.5 names `ToolRegistry.dispatch` as the single choke point but
+leaves five things to the implementation: who derives the idempotency key,
+how a presented `ApprovalToken` is tied to the *stored* decision, what an
+implementation may reach, how a refusal before the port is recorded in a
+`tool_calls.status` enum that has no `rejected` value, and how two concurrent
+attempts of one keyed effect are told apart in the record.
+
+**Decision.** Implemented in TOOL-002 (`app/tools/registry.py`).
+
+1. *The dispatcher derives the key.* `idempotency_key = f(run_id, step_id,
+   args_hash)` (ADR-020) is computed in one place,
+   `security.idempotency_key_for`, called only by the dispatcher. A plan's
+   arguments may not carry `idempotency_key` (rejected as
+   `INPUT_VALIDATION`) or `approval_token` (rejected as `POLICY_VIOLATION`):
+   authorisation is presented to the dispatcher by the node, never planned.
+2. *Two checks, one path.* For a gated tool the token must authorise the
+   call (`ApprovalToken.authorises`, barrier 2) **and** the `approvals` row
+   it names must be `approved` for the same run, step, tool, `args_hash` and
+   risk. The token carries no tool and no status; the row does. A token for
+   a pending, rejected, expired, cancelled or superseded row authorises
+   nothing. A token presented for an ungated tool is a `POLICY_VIOLATION`.
+3. *One port per tool.* An implementation receives a `ToolContext` holding
+   exactly the port its contract declares, and nothing else. `ToolContext`
+   is constructed only by the dispatcher, and `tests/test_structure.py` fails
+   on any module that calls a mutating port method, references a
+   mutation-capable `Adapters` field other than as the receiver of a read
+   method, imports `app.integrations.mock`, constructs a `ToolContext`,
+   writes a `tool_calls` row or derives a key elsewhere. The scan is proven
+   non-permissive by canary snippets.
+4. *A rejection is an attempt.* A refusal before the port is reached —
+   malformed input, missing or invalid grant, unbound implementation —
+   consumes its `(execution_step, attempt)` slot and is recorded as
+   `status=failed` with its `error_class` and `adapter=NULL`, plus the
+   `tool_started`/`tool_failed` pair and, for policy violations, a
+   `policy_violation` event at `error` severity. `error_class` and the null
+   adapter are what distinguish "refused" from "the integration failed";
+   the in-memory `DispatchOutcome` says `rejected` outright. An unknown tool
+   is refused before any I/O and records nothing: it is not an attempt of
+   anything.
+5. *Replay is classified under a lock.* A mutating attempt runs inside a
+   transaction-scoped advisory lock on its idempotency key (the mechanism
+   DB-002 uses per run). A concurrent duplicate waits for the winner, sees
+   its recorded attempt, and is recorded `duplicate_suppressed`; a second
+   dispatch of the *same* attempt number is refused without executing. The
+   lock is bookkeeping — the adapter's unique constraint on the key remains
+   the effect-level protection — and it is only claimed when the key
+   actually reached the effect (the input model declares the field), so
+   `save_draft` retries honestly record `succeeded`.
+
+**Consequences.** The three barriers of §9.5 stay independent and gain a
+fourth check (the stored row) without a second execution path; every
+attempt is visible in `tool_calls` and the trace whether or not it ran;
+adding a tool means binding an implementation to its contract, and adding a
+mutation means the structural scan must be updated deliberately. The costs:
+holding the key lock across execution pins one pooled connection per waiting
+dispatcher plus one for the executing adapter (fine for the realistic
+contention of a double resume or a reconciler racing a worker — nothing
+fans out); the `tool_calls` enum is not extended, so dashboards must read
+`error_class` to separate refusals from failures; and the §14.5 redaction
+rules live in `app/observability/redaction.py` ahead of OBS-001's recorder,
+which must adopt them rather than re-implement them.
+
+**Alternatives rejected.** Letting the node pass an idempotency key: a
+second scheme waiting to diverge from ADR-020. Trusting the token alone: it
+cannot know the row was superseded after minting. Adding `rejected` to the
+`tool_calls` enum: a migration and a contract change for a distinction
+`error_class` already makes. Classifying replay from the adapter's return
+value: the port carriers have no such field, and an adapter without keyed
+replay would be mis-recorded. A non-blocking `pg_try_advisory_xact_lock`
+that fails the loser as `TRANSIENT`: no held connection, but an honest
+retry recorded as a failure.
+
+---
+
 ## Open questions
 
 Recorded rather than guessed. None blocks the current backlog.

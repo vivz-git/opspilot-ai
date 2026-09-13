@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -37,7 +37,7 @@ import structlog
 from app.agent.state import RunStatus
 from app.config import Settings
 from app.persistence.models import AgentRun
-from app.persistence.protocols import UnitOfWork
+from app.persistence.protocols import UnitOfWorkFactory
 from app.runtime import Clock, IdGenerator
 
 __all__ = [
@@ -48,12 +48,6 @@ __all__ = [
     "hold_lease",
     "new_worker_id",
 ]
-
-#: How the execution layer obtains a transaction: a zero-argument callable
-#: returning a unit-of-work context (`functools.partial(unit_of_work,
-#: session_factory)` in production). Keeps this package on the repository
-#: protocols, never on a SQLAlchemy session (§12, DB-005).
-UnitOfWorkFactory = Callable[[], AbstractAsyncContextManager[UnitOfWork]]
 
 _log = structlog.get_logger("opspilot.leases")
 

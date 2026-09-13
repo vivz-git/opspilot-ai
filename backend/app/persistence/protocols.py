@@ -9,7 +9,8 @@ sessions or ORM query construction.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
@@ -54,6 +55,7 @@ __all__ = [
     "ToolCallRepository",
     "TraceEventRepository",
     "UnitOfWork",
+    "UnitOfWorkFactory",
 ]
 
 
@@ -318,7 +320,27 @@ class ToolCallRepository(Protocol):
         ...
 
     async def get_by_idempotency_key(self, idempotency_key: str) -> ToolCallRow | None:
-        """Retrieve a tool call by its idempotency key."""
+        """Retrieve the most recent tool call for an idempotency key."""
+        ...
+
+    async def list_by_idempotency_key(self, idempotency_key: str) -> list[ToolCallRow]:
+        """Every attempt ever recorded under an idempotency key, oldest first —
+        across steps and plan revisions, because the key identifies the
+        *effect*, not the step (ADR-020)."""
+        ...
+
+    async def lock_idempotency_key(self, idempotency_key: str) -> None:
+        """Serialise attempts that share an idempotency key (§10.4, ADR-020).
+
+        A transaction-scoped advisory lock on the key, released at commit or
+        rollback — the same mechanism `TraceEventRepository.append` uses per
+        run. Held by the dispatcher across an attempt's execution, it makes
+        "was this effect already applied?" an exact question: a concurrent
+        duplicate waits, then sees the winner's recorded attempt. It is not
+        the effect-level protection — the adapter's unique constraint on the
+        key is (§8.3) — it is what lets the record say `duplicate_suppressed`
+        rather than a second `succeeded`.
+        """
         ...
 
     async def list_by_step(self, execution_step_id: uuid.UUID) -> list[ToolCallRow]:
@@ -675,6 +697,13 @@ class EmailOutboxRepository(Protocol):
     async def create(self, entry: EmailOutbox) -> EmailOutbox:
         """Insert an outbox entry. Raises on duplicate idempotency_key or message_id."""
         ...
+
+
+#: How the layers above persistence obtain a transaction: a zero-argument
+#: callable returning a unit-of-work context (`functools.partial(unit_of_work,
+#: session_factory)` in production). Keeps them on the repository protocols,
+#: never on a SQLAlchemy session (§12, DB-005).
+UnitOfWorkFactory = Callable[[], AbstractAsyncContextManager["UnitOfWork"]]
 
 
 @runtime_checkable

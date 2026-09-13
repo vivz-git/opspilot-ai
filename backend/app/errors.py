@@ -148,6 +148,14 @@ class PlannerError(OpsPilotError):
     error_class = ErrorClass.PLANNER_ERROR
 
 
+class InternalError(OpsPilotError):
+    """An OpsPilot bug: an unexpected exception, a broken invariant, a caller
+    that violated a contract. Terminal; full detail traced, generic message
+    via the API (§10.1)."""
+
+    error_class = ErrorClass.INTERNAL
+
+
 class ConfigurationError(OpsPilotError):
     """Raised at startup by `Settings.validate_runtime` (§17.3). Not a run
     failure — the process refuses to serve traffic at all."""

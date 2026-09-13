@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Final, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -28,6 +28,7 @@ from app.tools.schemas import (
 )
 
 __all__ = [
+    "PORT_FIELDS",
     "Adapters",
     "CompanyPort",
     "ContentPort",
@@ -274,6 +275,19 @@ class ContentPort(Protocol):
 # ---------------------------------------------------------------------------
 # Adapters Container
 # ---------------------------------------------------------------------------
+#: The port a `ToolContract.port` name resolves to (§8.1). The dispatcher hands
+#: a tool implementation exactly the port its contract declares, and nothing
+#: else (§8.5, TOOL-002) — an unknown name fails closed.
+PORT_FIELDS: Final[dict[str, str]] = {
+    "LeadPort": "leads",
+    "CompanyPort": "companies",
+    "CustomerPort": "customers",
+    "DraftPort": "drafts",
+    "MailPort": "mail",
+    "ContentPort": "content",
+}
+
+
 @dataclass(frozen=True)
 class Adapters:
     """Bundle of all integration ports required by the agent runtime."""
@@ -284,3 +298,11 @@ class Adapters:
     drafts: DraftPort
     mail: MailPort
     content: ContentPort
+
+    def port(self, name: str) -> object:
+        """Resolve a contract's declared port name to the bound adapter.
+
+        Raises `KeyError` for a name `PORT_FIELDS` does not declare, so a
+        contract that names a port nobody provides cannot be dispatched.
+        """
+        return getattr(self, PORT_FIELDS[name])

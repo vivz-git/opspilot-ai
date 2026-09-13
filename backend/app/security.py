@@ -47,6 +47,18 @@ def canonical_args_hash(args: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def idempotency_key_for(*, run_id: str, step_id: str, args_hash: str) -> str:
+    """The attempt-invariant key under which a mutating effect is applied
+    (§10.4, ADR-020).
+
+    Derived from `(run_id, step_id, args_hash)` and nothing else, so every
+    retry of a step reuses the same key and the adapter's unique constraint
+    turns a second application into a replay of the first. Only the dispatcher
+    derives it; a plan or a caller cannot choose one (§8.5).
+    """
+    return f"{run_id}:{step_id}:{args_hash}"
+
+
 def _strip_volatile(value: Any) -> Any:  # noqa: ANN401 - recurses over arbitrary JSON-like data
     if isinstance(value, dict):
         return {k: _strip_volatile(v) for k, v in value.items() if k not in VOLATILE_ARG_KEYS}

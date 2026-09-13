@@ -345,7 +345,7 @@ backend/app/
   tools/
     schemas.py       [built]  typed IO contracts for all nine tools
     contracts.py     [built]  the contract registry and its policy invariants
-    registry.py               dispatch: validate, gate, time, trace          (TOOL-002)
+    registry.py      [built]  dispatch: validate, gate, key, time, trace     (TOOL-002)
     impl/                     tool implementations over ports                (TOOL-003)
   agent/
     state.py         [built]  AgentState, its models and its reducers
@@ -354,15 +354,16 @@ backend/app/
     planner/                  RulePlanner | LLMPlanner behind one Protocol   (AGENT-006)
     verifiers/                invariant and readback verifiers               (VERIFY-001)
   integrations/
-    ports.py                  Protocols; mutating methods require a token    (TOOL-001)
-    mock/                     the only adapter set; no network imports       (TOOL-001)
+    ports.py         [built]  Protocols; mutating methods require a token    (TOOL-001)
+    mock/            [built]  the only adapter set; no network imports       (TOOL-001)
   persistence/       [built]  SQLAlchemy models, repositories, Alembic       (DB-001..006)
     checkpointing.py [built]  the LangGraph Postgres saver, pinned to `langgraph` (DB-007)
   execution/
     leases.py        [built]  run ownership: lease, heartbeat, fencing        (DB-007)
     recovery.py      [built]  the startup reconciler for orphaned runs        (DB-007)
   api/                        FastAPI routers and response models            (API-001+)
-  observability/              TraceRecorder, @traced_node, redaction         (OBS-001+)
+  observability/              TraceRecorder, @traced_node                    (OBS-001+)
+    redaction.py     [built]  the §14.5 denylist and truncation, applied by dispatch (TOOL-002)
   evaluation/                 runner, cases, metrics                         (EVAL-001+)
 backend/tests/             [built]  policy, state, recovery, security, structure
 ```
@@ -1008,6 +1009,36 @@ execute ──►  ToolRegistry.dispatch(name, args, ctx)
 Dispatch is the single choke point where validation, policy, timeout,
 idempotency and tracing are applied. No node ever calls a tool implementation
 directly, so there is exactly one place these can be forgotten.
+
+As built (TOOL-002, ADR-024), `ToolRegistry.dispatch(run_id,
+execution_step_id, step_id, tool_name, arguments, attempt, approval_token)`
+also owns three things the diagram leaves implicit:
+
+- **The dispatcher-owned fields.** `idempotency_key` is derived here from
+  `(run_id, step_id, args_hash)` (§10.4) and `approval_token` is presented to
+  the dispatcher by the node, never carried in a plan's arguments. A plan
+  that supplies either is rejected (`INPUT_VALIDATION` for the key,
+  `POLICY_VIOLATION` for the token).
+- **Two approval checks, one path.** The token is matched against the call
+  (`ApprovalToken.authorises`) *and* its stored `approvals` row must be
+  `approved` for the same run, step, tool, `args_hash` and risk. A token
+  minted for a pending, rejected, expired, cancelled or superseded row does
+  not authorise anything, whatever it says.
+- **One port per tool.** An implementation receives exactly the port its
+  contract declares (`Adapters.port(contract.port)`) inside a `ToolContext`
+  that only the dispatcher constructs; `tests/test_structure.py` proves no
+  other module calls a mutating port method, imports the mock adapters,
+  constructs a `ToolContext`, writes a `tool_calls` row or derives a key.
+
+Outcomes are recorded as one `tool_calls` row per attempt. A rejection before
+the port is reached is `status=failed` with its `error_class`
+(`input_validation`, `policy_violation`, `internal`) and `adapter=NULL` — the
+enum of §12.5 is fixed, and `error_class` plus the null adapter is what
+distinguishes "refused" from "the integration failed". Mutating attempts run
+under a transaction-scoped advisory lock on their idempotency key, so a
+concurrent duplicate waits for the winner and is recorded
+`duplicate_suppressed` rather than as a second `succeeded`; the adapter's
+unique constraint on the key remains the effect-level protection (§8.3).
 
 ---
 

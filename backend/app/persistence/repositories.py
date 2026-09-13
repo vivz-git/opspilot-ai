@@ -512,6 +512,22 @@ class SqlToolCallRepository:
         res = await self._session.execute(stmt)
         return res.scalar_one_or_none()
 
+    async def list_by_idempotency_key(self, idempotency_key: str) -> list[ToolCallRow]:
+        stmt = (
+            select(ToolCallRow)
+            .where(ToolCallRow.idempotency_key == idempotency_key)
+            .order_by(ToolCallRow.started_at.asc(), ToolCallRow.attempt.asc())
+        )
+        res = await self._session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def lock_idempotency_key(self, idempotency_key: str) -> None:
+        # Same shape as the per-run trace lock: hashtextextended folds the key
+        # into the 64-bit advisory-lock space; the lock is released with the
+        # transaction, so a failed attempt can never leak it.
+        lock_key = sa.func.hashtextextended(sa.cast(idempotency_key, sa.Text), 0)
+        await self._session.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_key)))
+
     async def list_by_step(self, execution_step_id: uuid.UUID) -> list[ToolCallRow]:
         stmt = (
             select(ToolCallRow)

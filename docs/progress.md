@@ -13,20 +13,20 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004, DB-001..007, and TOOL-001
-are done. Continue at `docs/handoff.md` §3 with TOOL-002.
+**Phase 1 — implementation: started.** FOUND-001..004, DB-001..007, TOOL-001
+and TOOL-002 are done. Continue at `docs/handoff.md` §3 with TOOL-003.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
-tools          ████░░░░░░░░░░░░░░░░  TOOL-001 done; TOOL-002..006 outstanding
+tools          ███████░░░░░░░░░░░░░  TOOL-001, 002 done; TOOL-003..006 outstanding
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
-observability  ░░░░░░░░░░░░░░░░░░░░  OBS-001..005
+observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
 frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
 evaluation     ░░░░░░░░░░░░░░░░░░░░  EVAL-001..005
 ```
@@ -931,3 +931,99 @@ it still depends on AGENT-003..008. **API-007** depends on DB-007 (done) and AGE
 **Test suite: 494 passed, 0 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` — 36 new tests in `test_mock_integrations.py`, 1 unskipped structural test). `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check` are all clean.
 
 Next task: **TOOL-002** (`ToolRegistry.dispatch`: input validation → approval gate re-assertion → idempotency key → timeout → dispatch → output validation → trace, as the single choke point) — OPUS.
+
+## TOOL-002 — the single tool dispatch choke point — 2026-09-13
+
+**Done.** `ToolRegistry.dispatch` is the one path from the agent to any tool
+implementation and therefore to any mutating port. Recorded as ADR-024;
+§8.5 of the architecture now describes what was built.
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/tools/registry.py` | `ToolRegistry` (contracts + implementations, refuses policy-violating or unsupported-port contracts at construction), `dispatch(run_id, execution_step_id, step_id, tool_name, arguments, attempt, approval_token=None)`, `DispatchResult`/`DispatchOutcome`, `ToolContext` (the only thing an implementation receives: its declared port and the attempt's identity), and the dispatch error family (`UnknownToolError`, `ApprovalRequiredError`, `ApprovalInvalidError`, `ToolNotBoundError`, `ToolTimeoutError`, `DuplicateAttemptError` — each a member of the §10.1 taxonomy) | `tests/test_tool_dispatch.py` (53), `tests/test_tool_registry.py` (14) |
+| `app/observability/redaction.py` | `redact_payload`: the §14.5 key denylist, value patterns and byte-budget truncation, applied to every persisted input/output/error before OBS-001's recorder exists | `tests/test_redaction.py` (18) |
+| `app/security.py` | `idempotency_key_for(run_id, step_id, args_hash)` — the one derivation (ADR-020) | `test_tool_registry.py`, structural test |
+| `app/tools/contracts.py` | `policy_violations(contract)` — P1–P6 as a function, re-asserted by the registry over injected contracts | `test_tool_registry.py` |
+| `app/integrations/ports.py` | `PORT_FIELDS` and `Adapters.port(name)` — a contract's declared port resolves to exactly one adapter, fail-closed | `test_tool_registry.py` |
+| `app/persistence/protocols.py` / `repositories.py` | `ToolCallRepository.lock_idempotency_key` (transaction-scoped advisory lock, same mechanism as the per-run trace lock) and `list_by_idempotency_key`; `UnitOfWorkFactory` moved here from `app/execution/leases.py` (re-exported there) | `test_tool_dispatch.py::TestRaces` |
+| `app/errors.py` | `InternalError` (the `INTERNAL` class had no concrete exception) | — |
+
+**The dispatch sequence, as built.** resolve (unknown → refused before any
+I/O) → argument hygiene (a plan may not carry `idempotency_key` or
+`approval_token`) → `args_hash` and derived key → gate re-assertion (barrier 2:
+token required for gated tools, bound to run/step/hash; a token on an ungated
+tool is a violation) → input validation (`extra="forbid"`) → binding
+(implementation + declared port) → execution-step identity (the row is this
+run, this step, this tool) → attempt-slot check → `tool_started` committed →
+stored-decision check (the `approvals` row is `approved` for the same run,
+step, tool, hash, risk) → per-key advisory lock (mutating tools) → execute
+under `timeout_ms` → output validation → exactly one `tool_calls` row and the
+closing `tool_*` event (plus `policy_violation` at `error` severity, and an
+`error`-level structured log, when that is what happened).
+
+**Verified rather than asserted**, all against real Postgres and the real
+mock adapters, with the human scripted through the real `approvals`
+repository and the gate never disabled:
+
+- a read tool dispatches with no approval and records one `succeeded` row
+  and a `tool_started`/`tool_succeeded` pair; a pure tool sees no port;
+- unknown tool → refused, nothing recorded; malformed input (extra field,
+  missing field, wrong type, out of range, contradictory filters) → recorded
+  `failed/input_validation` with `adapter=NULL` and a `rejected` trace;
+- a gated mutation with no grant → `ApprovalRequiredError(PolicyViolation)`,
+  zero outbox rows, `policy_violation` event; with a valid grant → exactly
+  one outbox row, one `succeeded` row carrying the derived key, and no
+  `approval_token` anywhere in what was persisted;
+- grants for another run, another step, another tool, another risk, modified
+  arguments (caught by the token) and modified arguments with a forged
+  matching token (caught by the row) are all refused; tokens whose row is
+  pending/rejected/expired/cancelled/superseded, unknown or malformed are
+  stale; a retry with the same grant replays (`duplicate_suppressed`, one
+  outbox row, same `message_id`), across plan revisions and across separate
+  registry instances;
+- integration failures are recorded with their class and `adapter="mock"`;
+  timeouts as `timeout`/`transient` via `tool_timeout`; malformed or
+  non-model output as `output_validation`; unexpected exceptions as
+  `internal` with the cause chained; store unavailability as `transient`; an
+  adapter-raised `PolicyViolation` (recipient pinning) as an executed attempt
+  that failed loudly; a cancelled attempt is recorded and the cancellation
+  propagates;
+- a policy rejection and an integration failure of the same tool are
+  distinguishable by exception type, `error_class`, adapter and trace status;
+- races: six concurrent retries of one approved send → one `succeeded`, five
+  `duplicate_suppressed`, one outbox row; four concurrent dispatches of the
+  *same* attempt → one executes, three `DuplicateAttemptError`, one row; a
+  rejection racing execution never sends; an approval racing execution is
+  consistent with the effect (one row iff the dispatcher saw `approved`) and
+  a retry converges to one row;
+- structural (AST): no module outside `app/integrations/`, `app/tools/impl/`
+  and `app/persistence/` calls a mutating port method or references a
+  mutation-capable `Adapters` field except as a read receiver (with eight
+  bypass canaries proving the scan fires and five read-path canaries proving
+  it does not over-fire); `app.integrations.mock` is imported only inside
+  `app/integrations/`; `ToolContext` is constructed only by the dispatcher
+  and `app.tools.impl` is imported only inside `app/tools/` and `main.py`;
+  `authorises`/`grants`/`canonical_args_hash` are called only in the three
+  barrier modules and `ApprovalGate.issue` nowhere in the application yet;
+  `tool_calls.record_call` and the `TOOL_*` trace kinds are used only by the
+  dispatcher; `idempotency_key_for` only by the dispatcher. A live canary
+  (`app/agent/_bypass_canary.py` doing `adapters.mail.send`, importing
+  `MockMailAdapter` and constructing a `ToolContext`) failed three of them
+  and was removed.
+
+**Deliberately not done.** No `rejected` value added to `tool_calls.status`
+(no migration; `error_class` + `adapter=NULL` is the distinction — ADR-024).
+No change to the TOOL-001 adapters. No `TraceRecorder`/`@traced_node`
+(OBS-001), which must adopt `app.observability.redaction` rather than
+re-implement §14.5. No tool implementations (TOOL-003): the tests use
+scripted implementations over the real ports.
+
+**Test suite: 599 passed, 0 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 105 new: `test_tool_dispatch.py`
+53, `test_tool_registry.py` 14, `test_redaction.py` 18, `test_structure.py`
++20 including the canaries). `ruff check .`, `ruff format --check .`,
+`mypy app` (strict) and `alembic check` are all clean.
+
+Next task: **TOOL-003** (the nine tool implementations over ports, each
+honouring its declared failure modes, bound into `ToolRegistry` under
+`app/tools/impl/`) — SONNET, depends on TOOL-002.

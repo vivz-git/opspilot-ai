@@ -174,3 +174,322 @@ def test_no_orm_query_construction_outside_persistence() -> None:
             offenders[str(path.relative_to(APP.parent))] = sorted(found)
 
     assert not offenders, f"ORM query construction forbidden outside app/persistence: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# TOOL-002 — the dispatch choke point cannot be bypassed (§8.5, §9.5, §16.2)
+# ---------------------------------------------------------------------------
+#: Where a mutating port method may legitimately be *called*: the adapters
+#: that implement the ports, and the tool implementations the dispatcher
+#: invokes (TOOL-003). Nothing else — not a node, not a service, not an
+#: endpoint, not the dispatcher itself, which only hands a port to an
+#: implementation it resolved. `persistence/` is exempt because it *defines*
+#: the `customers` repository the adapters write through; everything above
+#: it that touches a customer, draft or mailbox does so through a port.
+MUTATING_PORT_CALLERS = ("integrations/", "tools/impl/", "persistence/")
+
+#: The mutation-capable port surface (§19.1). `test_the_mutating_port_surface_
+#: is_declared` fails closed if `app.integrations.ports` grows a token-taking
+#: method that is not listed here, so a new mutation cannot appear without
+#: being added to the bypass scan below.
+MUTATING_PORT_METHODS: dict[str, frozenset[str]] = {
+    "MailPort": frozenset({"send"}),
+    "CustomerPort": frozenset({"update"}),
+    "DraftPort": frozenset({"save"}),  # INTERNAL_WRITE (ADR-008): no token, still a mutation
+}
+MUTATING_METHOD_NAMES = frozenset().union(*MUTATING_PORT_METHODS.values())
+MUTATING_PORT_FIELDS = frozenset({"mail", "customers", "drafts"})  # `Adapters` attributes
+#: Read paths on the same ports, used by the verifiers (§11.3).
+READ_METHOD_NAMES = frozenset({"get", "get_outbox"})
+
+
+def _rel(path: Path) -> str:
+    return path.relative_to(APP).as_posix()
+
+
+def _under(path: Path, *prefixes: str) -> bool:
+    rel = _rel(path)
+    return any(rel.startswith(p) for p in prefixes)
+
+
+def _receiver_names(node: ast.expr) -> list[str]:
+    """`adapters.mail` → ["adapters", "mail"]; `mail` → ["mail"]."""
+    names: list[str] = []
+    while isinstance(node, ast.Attribute):
+        names.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        names.append(node.id)
+    return list(reversed(names))
+
+
+def test_the_mutating_port_surface_is_declared() -> None:
+    """Every port method that takes an `ApprovalToken` is in
+    `MUTATING_PORT_METHODS`, and every listed token-taking method exists —
+    the scan below can only be trusted if this list is complete."""
+    import inspect
+
+    from app.integrations import ports
+
+    token_taking: dict[str, set[str]] = {}
+    for name, cls in inspect.getmembers(ports, inspect.isclass):
+        if not name.endswith("Port"):
+            continue
+        for method, fn in inspect.getmembers(cls, inspect.isfunction):
+            if "token" in inspect.signature(fn).parameters:
+                token_taking.setdefault(name, set()).add(method)
+    assert token_taking == {"MailPort": {"send"}, "CustomerPort": {"update"}}, (
+        f"token-taking port methods changed: {token_taking}; update MUTATING_PORT_METHODS "
+        "and the dispatcher's structural tests deliberately"
+    )
+    for port, methods in token_taking.items():
+        assert methods <= MUTATING_PORT_METHODS[port]
+
+
+def port_bypasses(tree: ast.AST) -> list[str]:
+    """Every way a module could reach a mutating port around the dispatcher:
+    calling a mutating method on anything port-shaped, calling `.send(...)`
+    on anything at all, or referencing a mutation-capable `Adapters` field
+    other than as the immediate receiver of one of its *read* methods (the
+    verifiers' readback path). Aliasing (`mail = adapters.mail`) and passing
+    a port on are references, so they are caught too."""
+    found: list[str] = []
+    read_receivers: set[int] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in READ_METHOD_NAMES
+        ):
+            read_receivers.add(id(node.func.value))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            chain = _receiver_names(node.func.value)
+            if attr == "send":
+                found.append(f"{'.'.join(chain)}.send(...)")
+            elif (
+                attr in MUTATING_METHOD_NAMES
+                and chain
+                and (
+                    chain[-1] in MUTATING_PORT_FIELDS
+                    or any(m in chain[-1].lower() for m in ("port", "adapter", "ctx"))
+                )
+            ):
+                found.append(f"{'.'.join(chain)}.{attr}(...)")
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr in MUTATING_PORT_FIELDS
+            and id(node) not in read_receivers
+        ):
+            found.append(f"reference to .{node.attr} at line {node.lineno}")
+    return sorted(set(found))
+
+
+def test_no_direct_mutating_port_calls_outside_tool_implementations() -> None:
+    """The bypass a future developer adds by accident — `agent → adapters.mail
+    .send(...)` — is refused at review time by this scan. Outside the adapters
+    and the tool implementations, a mutating port method is never called, and
+    a mutation-capable port is never aliased, passed on or referenced except
+    as the immediate receiver of one of its *read* methods."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        if _under(path, *MUTATING_PORT_CALLERS):
+            continue
+        found = port_bypasses(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, (
+        "mutating ports are reached only through ToolRegistry.dispatch → tool "
+        f"implementation → port (§8.5): {offenders}"
+    )
+
+
+BYPASS_SNIPPETS = {
+    "mail.send": "await deps.adapters.mail.send(msg, token=t, idempotency_key=k)",
+    "customers.update": "await deps.adapters.customers.update(cid, patch, token=t)",
+    "drafts.save": "await deps.adapters.drafts.save(draft)",
+    "alias-then-send": "mail = adapters.mail\nawait mail.send(msg, token=t, idempotency_key=k)",
+    "alias-only": "port = adapters.customers",
+    "ctx.port.send": "ctx.port.send(msg, token=t, idempotency_key=k)",
+    "port-named-receiver": "await mail_port.update(x)",
+    "pass-port-on": "send_via(adapters.mail)",
+}
+
+
+@pytest.mark.parametrize("snippet", list(BYPASS_SNIPPETS.values()), ids=list(BYPASS_SNIPPETS))
+def test_the_port_bypass_scan_catches_the_bypass(snippet: str) -> None:
+    """The scan is only worth having if it fires. Each snippet is a way a
+    future node could reach a mutating port around the dispatcher."""
+    assert port_bypasses(ast.parse(snippet)), snippet
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "record = await adapters.mail.get_outbox(message_id)",  # verifier readback
+        "draft = await adapters.drafts.get(draft_id)",
+        "customer = await adapters.customers.get(customer_id=cid)",
+        "state.update({'a': 1})",  # dict.update is not CustomerPort.update
+        "await uow.agent_runs.update_status(run_id, status=s)",
+    ],
+    ids=[
+        "mail.get_outbox",
+        "drafts.get",
+        "customers.get",
+        "dict.update",
+        "repository.update_status",
+    ],
+)
+def test_the_port_bypass_scan_allows_read_paths(snippet: str) -> None:
+    assert port_bypasses(ast.parse(snippet)) == [], snippet
+
+
+def test_mock_adapters_are_not_imported_outside_the_integration_package() -> None:
+    """`app.integrations.mock` is an implementation detail of `build_adapters`.
+    Agent, tool, API and execution code sees ports, never adapters."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        if _under(path, "integrations/"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = sorted(
+            {
+                node.module
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("app.integrations.mock")
+            }
+            | {
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+                if alias.name.startswith("app.integrations.mock")
+            }
+        )
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"mock adapters imported outside app/integrations: {offenders}"
+
+
+def test_tool_implementations_are_reached_only_through_the_registry() -> None:
+    """Two locks on the implementation layer: `app.tools.impl` (TOOL-003) is
+    imported only inside `app/tools/` and by the composition root, and a
+    `ToolContext` — which every implementation requires — is constructed only
+    by the dispatcher. An implementation therefore cannot be invoked from a
+    node, even by someone who imports it."""
+    composition_roots = ("main.py",)
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        if not (_under(path, "tools/") or rel in composition_roots):
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and node.module.startswith("app.tools.impl")
+                ):
+                    found.append(f"import {node.module}")
+        if rel != "tools/registry.py":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "ToolContext")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "ToolContext")
+                ):
+                    found.append(f"ToolContext(...) at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"tool implementations reachable around the dispatcher: {offenders}"
+
+
+def test_approval_checks_have_one_execution_path() -> None:
+    """The gate is asserted in exactly the places §9.5 names — the router's
+    state (`ApprovalState.grants`), the dispatcher (barrier 2) and the token
+    itself — and tokens are minted nowhere in the application yet (HITL-002
+    adds the one issuing path and must extend this list deliberately). A
+    second, independent check is a second place to get it wrong."""
+    allowed_to_check = {"security.py", "agent/state.py", "tools/registry.py"}
+    allowed_to_mint = {"security.py"}
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                chain = _receiver_names(node.func.value)
+                if attr == "issue" and chain and chain[-1] == "ApprovalGate":
+                    if rel not in allowed_to_mint:
+                        found.append(f"ApprovalGate.issue(...) at line {node.lineno}")
+                elif attr in ("authorises", "grants") and rel not in allowed_to_check:
+                    found.append(f".{attr}(...) at line {node.lineno}")
+            elif (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "canonical_args_hash"
+                and rel not in allowed_to_check
+            ):
+                found.append(f"canonical_args_hash(...) at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"approval logic duplicated outside the three barriers: {offenders}"
+
+
+def test_tool_call_rows_are_written_only_by_the_dispatcher() -> None:
+    """§10.7, §14.4: every attempt is recorded by the choke point, so no other
+    code path may write a `tool_calls` row or a `tool_*` trace event."""
+    tool_kinds = {
+        "TOOL_STARTED",
+        "TOOL_SUCCEEDED",
+        "TOOL_FAILED",
+        "TOOL_TIMEOUT",
+        "TOOL_DUPLICATE_SUPPRESSED",
+    }
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        if rel == "tools/registry.py" or _under(path, "persistence/"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "record_call"
+            ):
+                found.append(f"record_call(...) at line {node.lineno}")
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in tool_kinds
+                and _receiver_names(node.value)[-1:] == ["TraceEventKind"]
+            ):
+                found.append(f"TraceEventKind.{node.attr} at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"tool attempts recorded outside ToolRegistry.dispatch: {offenders}"
+
+
+def test_idempotency_keys_are_derived_only_by_the_dispatcher() -> None:
+    """ADR-020: one derivation, one scheme. A second call site is a second
+    scheme waiting to diverge."""
+    offenders = []
+    for path in python_files(APP):
+        rel = _rel(path)
+        if rel in {"security.py", "tools/registry.py"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "idempotency_key_for"
+            ):
+                offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, f"idempotency keys derived outside the dispatcher: {offenders}"
