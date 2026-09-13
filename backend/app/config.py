@@ -8,6 +8,7 @@ that ends up in a log line.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from enum import StrEnum
 from functools import lru_cache
 from typing import Any
@@ -83,6 +84,12 @@ class Settings(BaseSettings):
         default=86_400, ge=60, validation_alias="OPSPILOT_APPROVAL_TTL_SECONDS"
     )
 
+    # --- Execution ownership (§2.4, DB-007) ---------------------------------
+    lease_ttl_seconds: int = Field(default=30, ge=5, validation_alias="OPSPILOT_LEASE_TTL_SECONDS")
+    heartbeat_interval_seconds: int = Field(
+        default=10, ge=1, validation_alias="OPSPILOT_HEARTBEAT_INTERVAL_SECONDS"
+    )
+
     # --- Database --------------------------------------------------------
     database_url: SecretStr = Field(
         default=SecretStr("postgresql+asyncpg://opspilot:opspilot@localhost:5432/opspilot"),
@@ -139,6 +146,14 @@ class Settings(BaseSettings):
         return urlsplit(self.database_url.get_secret_value()).password
 
     @property
+    def lease_ttl(self) -> timedelta:
+        return timedelta(seconds=self.lease_ttl_seconds)
+
+    @property
+    def heartbeat_interval(self) -> timedelta:
+        return timedelta(seconds=self.heartbeat_interval_seconds)
+
+    @property
     def budgets(self) -> Budgets:
         return Budgets(
             max_retries=self.max_retries,
@@ -181,6 +196,13 @@ class Settings(BaseSettings):
 
         if self.integrations is IntegrationMode.REAL:
             problems.append("OPSPILOT_INTEGRATIONS=real is not implemented; no real adapter exists")
+
+        if self.heartbeat_interval_seconds * 2 > self.lease_ttl_seconds:
+            problems.append(
+                "OPSPILOT_HEARTBEAT_INTERVAL_SECONDS must be at most half of "
+                "OPSPILOT_LEASE_TTL_SECONDS, or a single missed heartbeat makes the "
+                "reconciler treat a healthy worker's run as orphaned (§2.4)"
+            )
 
         if not self.database_url.get_secret_value().startswith(
             ("postgresql+asyncpg://", "postgresql+psycopg://")

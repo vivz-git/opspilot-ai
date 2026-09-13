@@ -99,12 +99,20 @@ class TestSchemaMigrations:
         assert "mock_crm" not in schemas
         command.upgrade(config, "head")  # leave the database migrated
 
-    def test_langgraph_schema_is_never_created_by_our_migrations(self) -> None:
+    def test_langgraph_schema_is_never_created_or_dropped_by_our_migrations(self) -> None:
         """§12.1 — langgraph is the checkpointer's own schema; we must never
-        create or touch it (ADR-011)."""
+        create or touch it (ADR-011). Since DB-007 the saver creates it at
+        checkpointer start-up (`app.persistence.checkpointing`), so it may
+        legitimately exist in a database the suite has already used — what
+        must hold is that a full downgrade/upgrade cycle neither removes nor
+        adds it."""
         config = _alembic_config()
         command.upgrade(config, "head")
-        assert "langgraph" not in _schema_names()
+        before = "langgraph" in _schema_names()
+        command.downgrade(config, "base")
+        assert ("langgraph" in _schema_names()) is before
+        command.upgrade(config, "head")
+        assert ("langgraph" in _schema_names()) is before
 
 
 def _table_names(schema: str) -> set[str]:
@@ -305,6 +313,91 @@ class TestMockCrmTablesMigration:
         command.downgrade(config, "62fe5fff7640")
         command.upgrade(config, "head")
         assert _table_names("mock_crm") >= self._MOCK_CRM_TABLES
+        assert _current_revision() == _script_head(config)
+
+
+def _column_names(schema: str, table: str) -> set[str]:
+    with _sync_engine().connect() as conn:
+        rows = conn.execute(
+            sa.text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table"
+            ),
+            {"schema": schema, "table": table},
+        )
+        return {row[0] for row in rows}
+
+
+def _check_constraint(schema: str, table: str, name: str) -> str | None:
+    with _sync_engine().connect() as conn:
+        return conn.execute(
+            sa.text(
+                "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                "JOIN pg_class t ON t.oid = c.conrelid "
+                "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                "WHERE n.nspname = :schema AND t.relname = :table AND c.conname = :name"
+            ),
+            {"schema": schema, "table": table, "name": name},
+        ).scalar_one_or_none()
+
+
+class TestLeaseOwnerMigration:
+    """DB-007 — `agent_runs.lease_owner`, its pairing `CHECK`, and the
+    `run_recovered` trace kind. Builds on DB-004 ('e35beebb06d0'); the
+    `langgraph` schema is still never touched by any of our revisions
+    (ADR-011) — the saver creates it at checkpointer start-up."""
+
+    _PREVIOUS = "e35beebb06d0"
+    _LEASE_CHECK = "ck_agent_runs_lease_owner_and_expiry_together"
+    _KIND_CHECK = "ck_trace_events_trace_event_kind"
+
+    def test_upgrade_head_adds_lease_owner_and_its_pairing_check(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        assert "lease_owner" in _column_names("opspilot", "agent_runs")
+        check = _check_constraint("opspilot", "agent_runs", self._LEASE_CHECK)
+        assert check is not None
+        assert "lease_owner IS NULL" in check and "lease_expires_at IS NULL" in check
+        assert _current_revision() == _script_head(config)
+
+    def test_upgrade_head_admits_run_recovered_and_nothing_else_new(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        check = _check_constraint("opspilot", "trace_events", self._KIND_CHECK)
+        assert check is not None
+        assert "'run_recovered'" in check
+        assert "'policy_violation'" in check
+
+    def test_a_second_upgrade_head_is_a_no_op(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        before = _current_revision()
+        command.upgrade(config, "head")
+        assert _current_revision() == before
+
+    def test_downgrade_to_db004_removes_exactly_what_was_added(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, self._PREVIOUS)
+        assert "lease_owner" not in _column_names("opspilot", "agent_runs")
+        assert "lease_expires_at" in _column_names("opspilot", "agent_runs")
+        assert _check_constraint("opspilot", "agent_runs", self._LEASE_CHECK) is None
+        check = _check_constraint("opspilot", "trace_events", self._KIND_CHECK)
+        assert check is not None and "'run_recovered'" not in check
+        assert _table_names("opspilot") >= {"agent_runs", "trace_events"}
+        assert _table_names("mock_crm") >= {"companies", "email_outbox"}
+        assert _current_revision() == self._PREVIOUS
+        command.upgrade(config, "head")
+
+    def test_downgrade_then_reupgrade_reproduces_the_same_schema(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, self._PREVIOUS)
+        command.upgrade(config, "head")
+        assert "lease_owner" in _column_names("opspilot", "agent_runs")
+        assert _check_constraint("opspilot", "agent_runs", self._LEASE_CHECK) is not None
+        check = _check_constraint("opspilot", "trace_events", self._KIND_CHECK)
+        assert check is not None and "'run_recovered'" in check
         assert _current_revision() == _script_head(config)
 
 

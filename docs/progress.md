@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..006 are
-done. Continue at `docs/handoff.md` §3 with DB-007.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..007 are
+done. Continue at `docs/handoff.md` §3 with TOOL-001.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ████████████████████  DB-001..006 done; 007 outstanding
+persistence    ████████████████████  DB-001..007 done
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -41,7 +41,7 @@ evaluation     ░░░░░░░░░░░░░░░░░░░░  EVA
 |---|---|
 | `README.md` | Overview, honest status, quickstart, the seven production-style properties and how each is actually guaranteed |
 | `docs/architecture.md` | 19 sections, ~2.4k lines: requirements analysis, system architecture, frontend/backend boundary, agent layering, state model with per-field justification, the LangGraph graph with exact transition conditions, node responsibilities, tool contracts, HITL, retry/recovery, verification, persistence, API, observability, evaluation, security, configuration, testing, integration boundary |
-| `docs/decisions.md` | 22 ADRs, each with the rejected alternative and the cost; 6 open questions with current defaults |
+| `docs/decisions.md` | 23 ADRs, each with the rejected alternative and the cost; 6 open questions with current defaults |
 | `docs/tasks.md` | 70 tasks, dependencies, acceptance criteria, OPUS/SONNET allocation, critical path |
 | `docs/progress.md` | This file |
 | `docs/handoff.md` | Continuation instructions |
@@ -770,3 +770,154 @@ Next task: **DB-006** (Constraint tests against real Postgres for every safety-r
 Next task: **DB-007** (LangGraph Postgres checkpointer wiring, lease heartbeat, and the startup reconciler for orphaned runs) — OPUS, depends on DB-001, AGENT-002.
 
 A leftover from this session: the throwaway Postgres container (`opspilot-pg-dev`, port 55432) remains running; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
+
+## DB-007 — LangGraph checkpointing, leases, heartbeat, crash recovery — 2026-09-13
+
+**Done.** The durable-execution and ownership layer that ADR-004 and ADR-012
+promised, recorded as ADR-023. Three modules, one migration, one `env.py`
+fix, 57 new tests, all against real Postgres and the real LangGraph saver.
+
+**Checkpointing — `app/persistence/checkpointing.py`.** The locked
+`langgraph-checkpoint-postgres` (3.1.2, LangGraph 1.2.11) ships
+`AsyncPostgresSaver` over psycopg 3, which is why `psycopg[binary,pool]` sits
+next to asyncpg; both derive their target from the one `DATABASE_URL`
+(`libpq_conninfo` strips the `+asyncpg` suffix). The saver's DDL is
+unqualified, so its tables land wherever `search_path` points — every
+checkpointer connection is opened with `-c search_path=langgraph`, which is
+what makes ADR-011 literally true (verified: all four `checkpoint*` tables
+exist in `langgraph` and nowhere else). `open_checkpointer(settings)` creates
+the schema and runs the saver's own `setup()` under a session-level advisory
+lock on a dedicated connection, so two API processes booting together
+serialize instead of racing `CREATE TABLE IF NOT EXISTS` + the versions insert
+(verified with three concurrent opens). `thread_id` is the run id
+(`thread_config(run_id)` is the only way to build a config). Every invocation
+passes `durability="sync"`: LangGraph 1.x defaults to `"async"`, which submits
+step N's checkpoint write in the background while step N+1 starts — the first
+draft of the crash test caught exactly that (the killed task had no
+checkpoint for `prepare` yet). One round trip per step is the right price for
+"the checkpoint is authoritative for resumption".
+
+**Leases — migration `c88ad060adfa`, `SqlAgentRunRepository`,
+`app/execution/leases.py`.** §12.3 had `lease_expires_at` but no owner, and
+an expiry alone cannot fence a heartbeat — a worker that lost its run could
+extend a lease that now belongs to someone else. `agent_runs.lease_owner` is
+added with `CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))`.
+Four repository operations, each exactly one conditional `UPDATE … RETURNING`:
+`acquire_lease` (free, mine, or expired), `heartbeat_lease` (mine and still
+live), `release_lease` (mine), `transition_status` (expected status, optional
+owner, optional release in the same statement). Under READ COMMITTED two
+concurrent `UPDATE`s of one row serialize on the row lock and the loser
+re-evaluates its `WHERE` against the winner's committed row — ownership is
+decided by Postgres, with no read-then-write anywhere. The expiry boundary is
+exact and complementary (`> now` live for heartbeats, `<= now` claimable);
+the first draft had `<`/`>=`, which left one instant where both the old
+owner could renew and a new one could claim — a boundary test caught it. All
+lease time comes from the injected `Clock` as a SQL parameter, so tests expire
+leases by moving a `FixedClock`. `Settings` gains `OPSPILOT_LEASE_TTL_SECONDS`
+(30) and `OPSPILOT_HEARTBEAT_INTERVAL_SECONDS` (10) with a startup fuse
+(`interval * 2 <= ttl`) so one missed beat never orphans a healthy run.
+`LeaseHeartbeat` renews on an injectable `sleep`, sets `lost` and calls
+`on_lost` on refusal, and survives a transient database error (the next real
+round trip decides); `hold_lease` is the acquire/heartbeat/release context
+API-007's executor will wrap a graph run in. DB-005's placeholder
+`heartbeat_lease(run_id, lease_expires_at)` was replaced (it was unfenced),
+and its one caller in `test_repositories.py` updated.
+
+**Reconciler — `app/execution/recovery.py`.** Candidates are exactly the
+architecture's query: `queued`/`running` with an expired *or absent* lease.
+`awaiting_approval` has no owner by design (§6.3) and is never a candidate —
+a stale lease left on a paused row by a crash after the pause is inert.
+After an atomic claim, the checkpoint decides (the table in §2.4): none →
+`failed(orphaned)`; paused at `interrupt()` → repaired to `awaiting_approval`
+(**this is the "died between checkpoint and row write" acceptance case** —
+re-entering would only re-raise the interrupt, failing it would discard a
+human's pending approval); finished → the terminal status recorded in the
+state's `status`/`status_reason` channels (`rejected` stays `rejected`,
+ADR-022); mid-execution → resumed under the reconciler's own lease and
+heartbeat, then settled the same way; a resume that raises →
+`failed(recovery_failed)`; a lease lost mid-resume → the resume is cancelled
+and nothing is written; a settling transaction that fails → rolled back as a
+unit (status and trace event share one unit of work), the run stays leased by
+the reconciler and is a candidate again when that lease lapses. The
+reconciler talks to the graph only through a `RunDriver` protocol
+(`inspect`/`resume`); `LangGraphRunDriver` implements it over any compiled
+graph by classifying `aget_state` into the four phases. One product-trace
+kind, `run_recovered` (`status` = `resumed` | `awaiting_approval` |
+`<terminal>`, payload = previous owner, expiry, new owner, checkpoint id,
+next nodes), records a takeover; lease acquisition/heartbeat/loss and every
+reconciler decision are structured logs (§14.6).
+
+**Crash-recovery methodology.** AGENT-002 is unwritten, so
+`tests/recovery_harness.py` builds a small graph over the real saver with the
+three shapes the state machine distinguishes — a node that can be killed
+mid-execution, a node with a keyed mutating effect, and an `interrupt()`
+gate — carrying the same `status`/`status_reason` channels as `AgentState`.
+Worker death is simulated at the ownership boundary, the smallest faithful
+way: the worker's graph task is *cancelled* while `work` is blocked (no
+checkpoint for that node), its heartbeat task is stopped, and nothing else is
+touched — no release, no status write, exactly what a dead process leaves.
+The lease then expires only because the `FixedClock` moves. The acceptance
+test asserts all nine steps: a valid lease; a durable checkpoint whose id is
+captured before the kill; death mid-`work`; a pass one second before expiry
+does nothing; the pass after expiry claims, resumes and completes;
+`prepare` ran once across both workers, `work` twice, `finish` once; the
+final checkpoint continues the pre-crash one; and `run_recovered(resumed)`
+carries the pre-crash checkpoint id. A second test makes `work` insert a real
+`mock_crm.email_outbox` row keyed by an attempt-invariant idempotency key
+*before* dying: recovery re-executes the node and the real
+`UNIQUE(idempotency_key)` yields `duplicate_suppressed` — one row, no
+bypass. Concurrency is real: 12 connections racing `acquire_lease` (one
+owner), four reconcilers racing over eight crashed runs (each recovered
+exactly once, one `run_recovered` each), six resumers racing an approval
+(one wins the conditional decision and the lease, one `finish`).
+
+**HITL safety, verified.** A paused run with no heartbeat for six hours is
+untouched; a stale lease on a paused row neither makes it a candidate nor
+blocks the approval path (the resume claim takes over an expired lease); a
+paused checkpoint under a wrongly-`running` row is repaired, and across three
+reconciler passes `resume` is never called and `finish` never runs; after
+approval, `Command(resume=…)` completes the run.
+
+**Migration `c88ad060adfa`** (`Revises: e35beebb06d0`): adds the column and
+`CHECK`, and rewrites `ck_trace_events_trace_event_kind` to admit
+`run_recovered` (the constraint names are wrapped in `op.f()` so Alembic does
+not apply the naming convention twice). Downgrade deletes `run_recovered`
+rows, restores the previous vocabulary, drops the constraint and column;
+upgrade / no-op / downgrade / re-upgrade all verified live and encoded as
+`TestLeaseOwnerMigration`. **`alembic/env.py` fix:** with
+`include_schemas=True`, autogenerate reflected the saver-owned `langgraph`
+schema and proposed dropping its tables; `include_name` now restricts
+comparison to `opspilot`, `mock_crm` and the default schema, which is ADR-011
+made mechanical. FOUND-003's `test_langgraph_schema_is_never_created_by_our_
+migrations` asserted the schema's *absence*, which was only true while nothing
+had ever opened a checkpointer; it now asserts the invariant that actually
+holds — a full downgrade/upgrade cycle neither creates nor drops it.
+
+**Not wired into `create_app` yet, deliberately.** API-007 owns the
+`Executor` and "reconcile on startup"; the app lifespan must keep booting
+without a database (`test_health.py`), and there is no graph to resume until
+AGENT-002. DB-007 delivers the primitives API-007 composes:
+`open_checkpointer` in the lifespan, `hold_lease` around each graph run,
+`Reconciler(driver=LangGraphRunDriver(graph)).reconcile_once()` at startup.
+
+**Local-dev note.** psycopg's async connection refuses Windows' default
+Proactor event loop; `tests/conftest.py` selects a selector loop on `win32`
+only (Linux/CI/Docker unaffected). The venv also had a half-installed
+`jsonpointer` (dist-info present, module file missing — a cloud-sync
+artefact), fixed with `uv sync --reinstall-package jsonpointer`; nothing in
+the lockfile changed.
+
+**Test suite: 457 passed, 1 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 57 new: `test_checkpointing.py` 7,
+`test_leases.py` 21, `test_recovery.py` 24, `test_migrations.py` 5; without a
+database the integration classes skip and the pure-function classes still
+run). `ruff check .`, `ruff format --check .`, `mypy app` (strict) and
+`alembic check` are all clean.
+
+Next task: **TOOL-001** (`integrations/ports.py` Protocols, mock adapters,
+seed dataset) — SONNET, depends only on DB-004 and is the head of the tools
+chain. **AGENT-002** now has its checkpointer; it still depends on
+AGENT-003..008. **API-007** depends on DB-007 (done) and AGENT-002.
+
+The throwaway Postgres container (`opspilot-pg-dev`, port 55432) is still
+running; remove with `docker rm -f opspilot-pg-dev` once no longer needed.

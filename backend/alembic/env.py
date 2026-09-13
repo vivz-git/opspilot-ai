@@ -31,6 +31,21 @@ from app.persistence.base import Base as _Base  # noqa: E402
 
 target_metadata = _Base.metadata
 
+#: The schemas Alembic owns (§12.1). `None` is the connection's default
+#: schema, where Alembic keeps `alembic_version`. Everything else — above all
+#: `langgraph`, which the LangGraph saver creates and migrates itself
+#: (`app.persistence.checkpointing`, ADR-011) — is invisible to autogenerate,
+#: so `alembic check` never proposes dropping tables we deliberately do not
+#: model, and no revision of ours can ever touch them.
+OWNED_SCHEMAS: frozenset[str | None] = frozenset({None, "opspilot", "mock_crm"})
+
+
+def include_name(name: str | None, type_: str, parent_names: dict[str, str | None]) -> bool:
+    if type_ == "schema":
+        return name in OWNED_SCHEMAS
+    return True
+
+
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")
@@ -56,6 +71,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         include_schemas=True,
+        include_name=include_name,
     )
 
     with context.begin_transaction():
@@ -63,7 +79,12 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata, include_schemas=True)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_schemas=True,
+        include_name=include_name,
+    )
 
     with context.begin_transaction():
         context.run_migrations()

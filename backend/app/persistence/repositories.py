@@ -8,7 +8,8 @@ construction escapes this module.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from collections.abc import Iterable
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
 from typing import Any, Self
@@ -205,14 +206,114 @@ class SqlAgentRunRepository:
         await self._session.flush()
         return run
 
-    async def heartbeat_lease(self, run_id: uuid.UUID, lease_expires_at: datetime) -> bool:
+    # -- Ownership and lifecycle (DB-007, ADR-023) ---------------------------
+    #
+    # Every method below is exactly one conditional `UPDATE`. Under Postgres's
+    # default READ COMMITTED isolation, two concurrent `UPDATE`s of the same
+    # row serialize on the row lock: the second waits for the first to commit,
+    # then re-evaluates its `WHERE` clause against the *new* row version
+    # (EvalPlanQual) and matches zero rows if the first one changed the lease
+    # or status out from under it. That is what makes "check the lease and
+    # take it" atomic without `SELECT … FOR UPDATE`, without SERIALIZABLE, and
+    # without any Python-side read-then-write — the ownership decision is the
+    # database's, and exactly one caller ever gets a row back.
+    #
+    # The expiry boundary is exact and complementary: a lease is *live* while
+    # `lease_expires_at > now` (heartbeat allowed) and *expired* once
+    # `lease_expires_at <= now` (claimable, and an orphan candidate). There is
+    # no instant at which the old owner can still renew and a new owner can
+    # already claim.
+
+    async def transition_status(
+        self,
+        run_id: uuid.UUID,
+        *,
+        expected: Iterable[RunStatus],
+        status: RunStatus,
+        owner: str | None = None,
+        status_reason: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+        duration_ms: int | None = None,
+        release_lease: bool = False,
+    ) -> AgentRun | None:
+        values: dict[str, Any] = {"status": status}
+        if status_reason is not None:
+            values["status_reason"] = status_reason
+        if started_at is not None:
+            values["started_at"] = started_at
+        if finished_at is not None:
+            values["finished_at"] = finished_at
+        if duration_ms is not None:
+            values["duration_ms"] = duration_ms
+        if release_lease:
+            values["lease_owner"] = None
+            values["lease_expires_at"] = None
+        conditions = [AgentRun.id == run_id, AgentRun.status.in_(list(expected))]
+        if owner is not None:
+            conditions.append(AgentRun.lease_owner == owner)
+        stmt = update(AgentRun).where(*conditions).values(**values).returning(AgentRun)
+        res = await self._session.execute(stmt)
+        await self._session.flush()
+        return res.scalar_one_or_none()
+
+    async def acquire_lease(
+        self,
+        run_id: uuid.UUID,
+        *,
+        owner: str,
+        now: datetime,
+        ttl: timedelta,
+        expected: Iterable[RunStatus] = (RunStatus.QUEUED, RunStatus.RUNNING),
+        status: RunStatus | None = None,
+    ) -> AgentRun | None:
+        values: dict[str, Any] = {"lease_owner": owner, "lease_expires_at": now + ttl}
+        if status is not None:
+            values["status"] = status
         stmt = (
-            update(AgentRun).where(AgentRun.id == run_id).values(lease_expires_at=lease_expires_at)
+            update(AgentRun)
+            .where(
+                AgentRun.id == run_id,
+                AgentRun.status.in_(list(expected)),
+                sa.or_(
+                    AgentRun.lease_owner.is_(None),
+                    AgentRun.lease_owner == owner,
+                    AgentRun.lease_expires_at <= now,
+                ),
+            )
+            .values(**values)
+            .returning(AgentRun)
         )
         res = await self._session.execute(stmt)
         await self._session.flush()
-        rowcount = getattr(res, "rowcount", 0)
-        return bool(rowcount > 0)
+        return res.scalar_one_or_none()
+
+    async def heartbeat_lease(
+        self, run_id: uuid.UUID, *, owner: str, now: datetime, ttl: timedelta
+    ) -> bool:
+        stmt = (
+            update(AgentRun)
+            .where(
+                AgentRun.id == run_id,
+                AgentRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
+                AgentRun.lease_owner == owner,
+                AgentRun.lease_expires_at > now,
+            )
+            .values(lease_expires_at=now + ttl)
+        )
+        res = await self._session.execute(stmt)
+        await self._session.flush()
+        return bool(getattr(res, "rowcount", 0) > 0)
+
+    async def release_lease(self, run_id: uuid.UUID, *, owner: str) -> bool:
+        stmt = (
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.lease_owner == owner)
+            .values(lease_owner=None, lease_expires_at=None)
+        )
+        res = await self._session.execute(stmt)
+        await self._session.flush()
+        return bool(getattr(res, "rowcount", 0) > 0)
 
     async def list_runs(
         self,
@@ -233,9 +334,9 @@ class SqlAgentRunRepository:
             select(AgentRun)
             .where(
                 AgentRun.status.in_([RunStatus.RUNNING, RunStatus.QUEUED]),
-                AgentRun.lease_expires_at < now,
+                sa.or_(AgentRun.lease_expires_at.is_(None), AgentRun.lease_expires_at <= now),
             )
-            .order_by(AgentRun.lease_expires_at.asc())
+            .order_by(AgentRun.lease_expires_at.asc().nulls_first())
             .limit(limit)
         )
         res = await self._session.execute(stmt)

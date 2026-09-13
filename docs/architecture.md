@@ -210,6 +210,48 @@ the steps and the trace are all in Postgres. A crashed process leaves a run in
 real worker (arq/Celery + `run_queue` table) is therefore an infrastructure
 change, not a redesign. Recorded as ADR-004 with the upgrade path.
 
+**Ownership, precisely (DB-007, ADR-023).** A run in `queued`/`running` is
+owned by at most one worker: `agent_runs.lease_owner` names it and
+`lease_expires_at` is the heartbeat deadline (`OPSPILOT_LEASE_TTL_SECONDS`,
+renewed every `OPSPILOT_HEARTBEAT_INTERVAL_SECONDS`). Every ownership change is
+one conditional `UPDATE` decided by Postgres — acquire only if the lease is
+absent, already yours, or expired (`lease_expires_at <= now`); heartbeat only
+if you are the current owner and the lease is still live (`> now`); every
+status transition guarded by expected status and, where it matters, owner.
+The two predicates are exact complements, so there is no instant at which the
+old owner can still renew and a new owner can already claim. A refused
+heartbeat means the lease is lost and the worker must stop; an expired lease is
+never revived. A run in `awaiting_approval` has **no** owner — the driving task
+ends on interrupt (§6.3) — so a missing heartbeat there is by design, and the
+reconciler's only query is `status IN ('queued','running') AND
+(lease_expires_at IS NULL OR lease_expires_at <= now)`.
+
+The reconciler (`app/execution/recovery.py`) then settles each candidate by
+what its checkpoint says, never the other way round:
+
+| Checkpoint | Row transition | Resumes | Trace |
+|---|---|---|---|
+| none | `failed(orphaned)`, lease released | no | `run_failed` |
+| paused at `interrupt()` | `awaiting_approval`, lease released | no | `run_recovered` (`status=awaiting_approval`) |
+| finished, terminal `status` in state | that status, lease released | no | `run_recovered` (`status=<terminal>`) |
+| finished, no terminal status | `failed(recovery_failed)` | no | `run_failed` |
+| mid-execution | stays `running` under the reconciler's own lease and heartbeat; then settled as above | **yes** | `run_recovered` (`status=resumed`) |
+| the resumed graph raised | `failed(recovery_failed)` | tried | `run_failed` |
+| lease lost while resuming | nothing — the run is someone else's now | aborted | log only |
+| a settling transaction failed | nothing — rolled back as a unit; a candidate again once the lease expires | — | log only |
+
+The "paused at interrupt" row is the case a process dying *between the
+checkpoint write and the `awaiting_approval` row write* produces, and it is
+why the reconciler inspects the checkpoint before deciding: re-entering a paused
+thread with no decision only re-raises the interrupt, and failing it would
+discard a human's pending approval. Re-entry of a mid-execution checkpoint
+re-executes the node that was in flight (§9.7); that is safe because a
+mutating retry carries the same idempotency key (§10.4, ADR-020) and a gated
+step re-asserts its grant (§9.5) — recovery is one more caller of the ordinary
+execution path and adds no bypass. Lease acquisition, heartbeats and losses are
+engineer telemetry (structured logs, §14.6); only the run-visible outcome
+reaches the product trace.
+
 ---
 
 ## 3. Frontend / backend boundary
@@ -276,6 +318,7 @@ The agent is five layers, and dependencies point downward only.
 | Capability | `app/tools/` | Contracts, validation, policy, registry, dispatch | No | Via ports only |
 | Integration | `app/integrations/` | Ports + mock adapters | No | `mock_crm` only |
 | Durability | `app/observability/`, `app/persistence/` | Trace, checkpoints, control-plane writes | No | `opspilot` only |
+| Execution ownership | `app/execution/` | Leases, heartbeats, crash recovery; drives a graph only through a `RunDriver` | No | Via repositories only |
 
 Two consequences worth stating as rules:
 
@@ -313,7 +356,11 @@ backend/app/
   integrations/
     ports.py                  Protocols; mutating methods require a token    (TOOL-001)
     mock/                     the only adapter set; no network imports       (TOOL-001)
-  persistence/                SQLAlchemy models, repositories, Alembic       (DB-001+)
+  persistence/       [built]  SQLAlchemy models, repositories, Alembic       (DB-001..006)
+    checkpointing.py [built]  the LangGraph Postgres saver, pinned to `langgraph` (DB-007)
+  execution/
+    leases.py        [built]  run ownership: lease, heartbeat, fencing        (DB-007)
+    recovery.py      [built]  the startup reconciler for orphaned runs        (DB-007)
   api/                        FastAPI routers and response models            (API-001+)
   observability/              TraceRecorder, @traced_node, redaction         (OBS-001+)
   evaluation/                 runner, cases, metrics                         (EVAL-001+)
@@ -585,7 +632,8 @@ trace record rather than an exception swallowed by the tool wrapper (§11).
 ### 6.4 Compilation
 
 ```python
-graph = builder.compile(checkpointer=PostgresSaver(...), interrupt_before=[])
+graph = builder.compile(checkpointer=AsyncPostgresSaver(...), interrupt_before=[])
+await graph.ainvoke(state, thread_config(run_id), durability="sync")
 ```
 
 No `interrupt_before` / `interrupt_after` node lists. Pausing is a **dynamic**
@@ -593,6 +641,15 @@ decision made inside `request_approval` via `interrupt()`, because whether a
 given step needs approval depends on its tool contract and its arguments, not on
 the node's identity. Static interrupts would pause on every step or none.
 Recorded as ADR-007.
+
+The saver is opened by `app/persistence/checkpointing.py` (DB-007): a psycopg
+pool pinned to `search_path=langgraph`, the schema created and the saver's own
+`setup()` run under an advisory lock at start-up. `thread_id` is the run id
+(§12.3). Every invocation passes `durability="sync"` — LangGraph's default
+(`"async"`) starts the next step before the previous checkpoint has landed,
+which would make the checkpoint only approximately authoritative for
+resumption (ADR-012); one round-trip per step is the price of a run that can be
+interrupted anywhere.
 
 ---
 
@@ -1333,7 +1390,7 @@ dashboard shows a per-step badge — `verified`, `not required`, or `unconfirmed
 | Schema | Owner | Contents |
 |---|---|---|
 | `opspilot` | Alembic (ours) | `agent_runs`, `execution_steps`, `tool_calls`, `approvals`, `trace_events`, `evaluation_runs`, `evaluation_results` |
-| `langgraph` | the LangGraph Postgres saver | checkpoints. **Never hand-edited, never in our migrations** — a library upgrade must not collide with an Alembic revision. |
+| `langgraph` | the LangGraph Postgres saver | checkpoints. **Never hand-edited, never in our migrations** — a library upgrade must not collide with an Alembic revision. The schema itself and the saver's tables are created by the saver's `setup()` at checkpointer start-up (`app/persistence/checkpointing.py`), and `alembic/env.py` excludes the schema from autogenerate so `alembic check` never proposes touching it. |
 | `mock_crm` | Alembic (ours), but conceptually external | `companies`, `leads`, `customers`, `outreach_drafts`, `email_outbox` |
 
 ### 12.2 Two sources of truth, deliberately
@@ -1375,7 +1432,8 @@ One row per run. The aggregate root.
 | `actor_id` | text null | who submitted (auth boundary placeholder, §16.6) |
 | `step_count`, `retry_total`, `replan_count` | int | denormalised counters so the run list needs no joins |
 | `deadline_at` | timestamptz | absolute wall-clock budget |
-| `lease_expires_at` | timestamptz null | heartbeat; a stale lease on a `running` run means an orphan |
+| `lease_owner` | text null | the worker holding the run (DB-007, ADR-023); `CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))` — a lease is present in full or absent in full |
+| `lease_expires_at` | timestamptz null | heartbeat deadline; expired (`<= now`) on a `running`/`queued` run means an orphan (§2.4) |
 | `created_at`, `started_at`, `finished_at`, `updated_at` | timestamptz | lifecycle |
 | `duration_ms` | int null | `finished_at - started_at`, materialised for metrics |
 | `evaluation_run_id` | uuid FK null | set when the run was produced by the eval suite |
@@ -1755,7 +1813,7 @@ ADR-015.
 
 | Group | Kinds |
 |---|---|
-| Run | `run_created`, `run_started`, `run_completed`, `run_failed`, `run_rejected`, `run_expired`, `run_cancelled` |
+| Run | `run_created`, `run_started`, `run_completed`, `run_failed`, `run_rejected`, `run_expired`, `run_cancelled`, `run_recovered` (the reconciler took over an orphaned run — `status` says whether it resumed it, repaired it to `awaiting_approval`, or finalised it; §2.4) |
 | Node | `node_entered`, `node_exited` |
 | Planning | `plan_created`, `plan_revised`, `fanout_expanded` |
 | Tool | `tool_started`, `tool_succeeded`, `tool_failed`, `tool_timeout`, `tool_duplicate_suppressed` |

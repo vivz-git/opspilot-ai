@@ -345,9 +345,22 @@ class TestAgentRunRepository:
             assert counters.retry_total == 1
             assert counters.replan_count == 1
 
-            # 5. Lease heartbeat and orphan query
-            stale_lease = datetime.now(UTC) - timedelta(seconds=10)
-            await uow.agent_runs.heartbeat_lease(run_id, stale_lease)
+            # 5. Lease heartbeat and orphan query (DB-007: leases are owned
+            # and fenced — a stale lease is one acquired at a `now` in the past)
+            ttl = timedelta(seconds=30)
+            long_ago = datetime.now(UTC) - timedelta(minutes=5)
+            claimed = await uow.agent_runs.acquire_lease(
+                run_id, owner="worker-a", now=long_ago, ttl=ttl
+            )
+            assert claimed is not None
+            assert claimed.lease_owner == "worker-a"
+            assert claimed.lease_expires_at == long_ago + ttl
+
+            # The owner cannot revive a lease that has already expired.
+            revived = await uow.agent_runs.heartbeat_lease(
+                run_id, owner="worker-a", now=datetime.now(UTC), ttl=ttl
+            )
+            assert revived is False
 
             orphans = await uow.agent_runs.list_orphaned_runs(now=datetime.now(UTC))
             orphan_ids = [o.id for o in orphans]

@@ -31,6 +31,7 @@ Reversing an accepted ADR requires a new ADR, not an edit.
 | [020](#adr-020) | Retry safety comes from keyed effects, not from hope | accepted |
 | [021](#adr-021) | Verification is a graph node, not a tool wrapper | accepted |
 | [022](#adr-022) | `rejected` is a terminal status distinct from `failed` | accepted |
+| [023](#adr-023) | Run ownership is a fenced lease; recovery is a checkpoint-driven state machine | accepted |
 
 ---
 
@@ -439,6 +440,67 @@ excludes intentionally-rejected runs from its denominator (§15.4), so a
 well-functioning gate cannot depress the success metric and create pressure to
 weaken it. The cost is one more terminal status for every consumer to handle,
 which the status machine and the API contract both enumerate explicitly.
+
+---
+
+## ADR-023
+### Run ownership is a fenced lease; recovery is a checkpoint-driven state machine
+
+**Context.** ADR-004 and ADR-012 promise that a crashed process leaves nothing
+permanently `running` and that the reconciler repairs runs whose process died
+between the checkpoint write and the row write. §12.3 gave the run row a
+`lease_expires_at` but no owner, and the architecture did not say when a
+stale lease is an orphan versus a human's pause, nor what "re-enter or mark
+orphaned" decides on.
+
+**Decision.** Three things, implemented in DB-007.
+
+1. *Fenced ownership.* `agent_runs` gains `lease_owner`; a lease is the pair
+   `(owner, expiry)` or nothing (a `CHECK` enforces it). Acquire, heartbeat,
+   release and every status transition are single conditional `UPDATE`s whose
+   `WHERE` names the expected status and owner, so ownership is decided by
+   Postgres's row lock, never by a read-then-write in Python. A heartbeat is
+   refused for a non-owner *and* for an owner whose lease has expired — an
+   expired lease is never revived, because someone else may already hold it.
+   The liveness predicate (`expiry > now`) and the claim predicate
+   (`expiry <= now`) are exact complements. All lease time comes from the
+   injected `Clock`, passed to SQL as a parameter.
+2. *Candidates.* Only `queued`/`running` runs with an expired or absent lease.
+   `awaiting_approval` has no owner by design (§6.3) and is never reconciled;
+   terminal runs never are. This is the rule that keeps an intentional pause
+   from being mistaken for a crash.
+3. *The checkpoint decides.* After an atomic claim, the reconciler inspects the
+   LangGraph checkpoint: none → `failed(orphaned)`; paused at an interrupt →
+   `awaiting_approval` (the "died between checkpoint and row write" case);
+   finished → the terminal status recorded in the state; mid-execution →
+   resumed under the reconciler's own lease and heartbeat, and settled the
+   same way once the graph next stops. Every settling write (status + trace
+   event) is one transaction; a failure rolls back as a unit and the run
+   becomes a candidate again when the reconciler's lease expires. One
+   product-trace kind, `run_recovered`, records the takeover; leases and
+   heartbeats are structured logs.
+
+Graph invocations use `durability="sync"` so a checkpoint is committed before
+the next step starts; the default `"async"` mode would make the checkpoint
+only approximately authoritative.
+
+**Consequences.** N reconcilers over the same orphans hand each run to exactly
+one of them, and a second pass is a no-op. Recovery re-executes the node that
+was in flight (ADR-001's re-execution semantics), which is safe only because
+ADR-010 and ADR-020 already make gated and mutating steps idempotent — recovery
+adds no bypass and depends on none. The costs: one more column and one more
+trace kind, a migration that alters a `CHECK` constraint, one extra round trip
+per graph step, and a second Postgres driver (psycopg, required by the saver)
+next to asyncpg. A resume that raises marks the run `failed(recovery_failed)`
+rather than retrying forever; the operator retries as a new run (§10.6).
+
+**Alternatives rejected.** `SELECT … FOR UPDATE` around a read-then-write:
+correct, but two statements and a held lock where one conditional `UPDATE`
+suffices. A lease without an owner (expiry only): cannot fence a late
+heartbeat from a worker that already lost the run. Treating every stale lease
+as a crash regardless of status: would fail runs a human is about to approve.
+Skipping the reconciler when a run has a checkpoint and simply re-entering it:
+would re-raise interrupts on paused runs and could not settle a finished one.
 
 ---
 

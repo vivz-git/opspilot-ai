@@ -24,7 +24,7 @@ from enum import StrEnum
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy import ForeignKey, Index, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -64,9 +64,10 @@ class ToolCallStatus(StrEnum):
 class TraceEventKind(StrEnum):
     """§14.2 — the fixed vocabulary of product-trace events.
 
-    Structural (§14.4): `@traced_node` and `ToolRegistry.dispatch` are the
-    only emitters, so this list is exactly what those choke points can ever
-    produce, not an open vocabulary a future call site might extend ad hoc.
+    Structural (§14.4): `@traced_node`, `ToolRegistry.dispatch` and the
+    DB-007 reconciler are the only emitters, so this list is exactly what
+    those choke points can ever produce, not an open vocabulary a future
+    call site might extend ad hoc.
     """
 
     RUN_CREATED = "run_created"
@@ -98,6 +99,11 @@ class TraceEventKind(StrEnum):
     VERIFICATION_FAILED = "verification_failed"
     VERIFICATION_SKIPPED = "verification_skipped"
     POLICY_VIOLATION = "policy_violation"
+    #: DB-007 — the reconciler took over a run whose worker died: resumed it
+    #: from its checkpoint, repaired it to `awaiting_approval`, or finalised
+    #: it from a finished checkpoint (`status` says which). The third
+    #: structural emitter after `@traced_node` and `ToolRegistry.dispatch`.
+    RUN_RECOVERED = "run_recovered"
 
 
 class TraceEventSeverity(StrEnum):
@@ -165,6 +171,14 @@ class AgentRun(Base):
             "lease_expires_at",
             postgresql_where=sa.text("status IN ('running', 'queued')"),
         ),
+        # A lease is either fully present (owner + expiry) or fully absent
+        # (DB-007). Without this, "leased by nobody until t" and "leased by
+        # X forever" would both be representable, and neither is a state the
+        # lease operations in `SqlAgentRunRepository` can reason about.
+        CheckConstraint(
+            "(lease_owner IS NULL) = (lease_expires_at IS NULL)",
+            name="lease_owner_and_expiry_together",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -203,6 +217,13 @@ class AgentRun(Base):
         sa.Integer, nullable=False, server_default=sa.text("0")
     )
     deadline_at: Mapped[datetime] = mapped_column(_timestamptz(), nullable=False)
+    #: Execution ownership (§2.4, DB-007, ADR-023). `lease_owner` is the
+    #: worker identity holding the run; `lease_expires_at` is the heartbeat
+    #: deadline. Only `SqlAgentRunRepository.acquire_lease` /
+    #: `heartbeat_lease` / `release_lease` / `transition_status` write these,
+    #: and every one of them is a single conditional `UPDATE` so ownership
+    #: is decided by the database, never by a read-then-write in Python.
+    lease_owner: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(_timestamptz(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         _timestamptz(), nullable=False, server_default=sa.func.now()

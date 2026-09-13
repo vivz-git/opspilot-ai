@@ -17,7 +17,7 @@ cat docs/tasks.md             # 2. what is next, with acceptance criteria
 cat docs/decisions.md         # 3. what is already decided, and why
 git status                    # 4. is the tree clean?
 git log --oneline -15         # 5. what actually landed
-cd backend && pytest          # 6. is the spine still green? expect 214 passed, 1 skipped
+cd backend && uv run pytest   # 6. still green? expect 457 passed, 1 skipped (with DATABASE_URL at a reachable Postgres)
 grep -rn "TODO\|FIXME" backend/app 2>/dev/null   # 7. any unfinished edges
 ```
 
@@ -32,21 +32,30 @@ code is what runs and the document is a bug — fix the document, do not
 
 ## 2. Where the project stands
 
-Architecture is **complete**. The contract spine is **implemented and tested**:
-error taxonomy and recovery policy, approval binding and the unforgeable token,
-tool IO schemas, the contract registry with its enforced invariants, the typed
-agent state with its reducers, and configuration with its startup fuses.
-214 tests pass.
+Architecture is **complete**. Implemented and tested: the contract spine
+(errors, security, tool schemas and registry, agent state, configuration), the
+foundation (app factory, lockfile, Alembic, injected clock/ids/randomness),
+and the whole persistence layer — every control-plane and `mock_crm` table,
+the async repositories, constraint tests against real Postgres, and DB-007's
+LangGraph checkpointer, run leases, heartbeat and crash-recovery reconciler.
+457 tests pass. `docs/progress.md` has the per-task record.
 
-Nothing else is implemented. The graph, the tools, persistence, the API and the
-dashboard are all specified and all unwritten.
+Not yet implemented: the tools and mock adapters, the graph and its nodes,
+HITL, verification, the API, the dashboard and the evaluation runner.
 
 ## 3. Start here
 
-**Next task: `FOUND-001`** — the FastAPI app factory (settings wiring,
-structlog, `/healthz`, `/readyz`, CORS from config, `validate_runtime()` at
-startup). Model class: SONNET. It has no dependencies and everything else needs
-it.
+**Next task: `TOOL-001`** — `integrations/ports.py` Protocols (mutating
+methods take an `ApprovalToken`), the mock adapters, and the seed fixture
+dataset on RFC 2606 domains. Model class: SONNET. Depends only on DB-004.
+
+When you reach **AGENT-002** and **API-007**, DB-007 already provides what
+they need — do not rebuild it: compile the graph with the saver from
+`app.persistence.checkpointing.open_checkpointer` and invoke with
+`durability=DURABILITY`; wrap each graph run in `app.execution.leases
+.hold_lease`; run `app.execution.recovery.Reconciler(driver=
+LangGraphRunDriver(graph)).reconcile_once()` at startup. The recovery state
+machine is in `docs/architecture.md` §2.4 and ADR-023.
 
 Then follow the critical path in `docs/tasks.md`:
 
@@ -184,6 +193,10 @@ Things the architecture handles that are easy to get wrong on the way through.
 | Trap | What to do |
 |---|---|
 | LangGraph re-executes the interrupted node on resume | `request_approval` must stay idempotent: upsert the approval row, emit `approval_requested` only on a genuine insert, and rely on `merge_approval_state` never regressing a decided approval (§9.7) |
+| Crash recovery re-executes the node that was in flight | Same rule, wider: every node must be safe to run twice. The reconciler (DB-007) resumes a mid-execution checkpoint from its last committed step; mutating effects are made idempotent by ADR-020's keyed constraint, not by recovery. Never add a "skip if recovered" flag to a node. |
+| Writing `awaiting_approval` after an interrupt | The graph task ends on interrupt; the executor must write the status *after* the checkpoint is durable (`durability="sync"`) and then release the lease. If the process dies in between, the reconciler repairs the row from the checkpoint — that is expected, not a bug to paper over. |
+| A worker that keeps going after a refused heartbeat | `LeaseHeartbeat.lost` / `on_lost` mean *stop driving this run now*. Never retry a refused heartbeat; an expired lease is never revived because someone else may own the run. |
+| Alembic proposing to drop the `checkpoint*` tables | They are the saver's, in the `langgraph` schema; `alembic/env.py`'s `include_name` excludes that schema. Do not add them to a migration. |
 | Retrying a planning fault | `INPUT_VALIDATION` and `REFERENCE_RESOLUTION` route to **replan**, never retry. The same call with the same broken argument cannot succeed. |
 | Retrying an unverified non-idempotent mutation | Forbidden by invariant P5. Report the effect as *unconfirmed* — not as done, and not as failed. |
 | A `STALE_WRITE` on an approved update | Replan, which produces new arguments, a new hash, and therefore a **fresh approval**. Do not re-apply the old patch. |

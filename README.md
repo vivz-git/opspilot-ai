@@ -81,7 +81,7 @@ pytest                        # 214 passed, 1 skipped — contracts, state, reco
 | Document | What it is for |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | The specification. System, agent, graph, state, tool contracts, approval, retry, verification, persistence, API, observability, evaluation, security, testing, integration boundary. |
-| [`docs/decisions.md`](docs/decisions.md) | 22 ADRs — each decision, the alternative rejected, and what it costs. Plus the open questions. |
+| [`docs/decisions.md`](docs/decisions.md) | 23 ADRs — each decision, the alternative rejected, and what it costs. Plus the open questions. |
 | [`docs/tasks.md`](docs/tasks.md) | The prioritized backlog: 70 tasks with dependencies, acceptance criteria and model allocation. |
 | [`docs/progress.md`](docs/progress.md) | What is done, verified and outstanding. |
 | [`docs/handoff.md`](docs/handoff.md) | How the next session continues. **Start here.** |

@@ -9,7 +9,8 @@ sessions or ORM query construction.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from collections.abc import Iterable
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
 from typing import Any, Protocol, Self, runtime_checkable
@@ -142,8 +143,66 @@ class AgentRunRepository(Protocol):
         """Atomically increment denormalized execution counters."""
         ...
 
-    async def heartbeat_lease(self, run_id: uuid.UUID, lease_expires_at: datetime) -> bool:
-        """Update the heartbeat lease expiration. Returns True if updated."""
+    async def transition_status(
+        self,
+        run_id: uuid.UUID,
+        *,
+        expected: Iterable[RunStatus],
+        status: RunStatus,
+        owner: str | None = None,
+        status_reason: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+        duration_ms: int | None = None,
+        release_lease: bool = False,
+    ) -> AgentRun | None:
+        """Conditional lifecycle transition (§5.4), decided by the database.
+
+        One `UPDATE … WHERE id = :id AND status IN :expected [AND lease_owner
+        = :owner] RETURNING *`. Returns the updated row when this call won,
+        or `None` when the run was not in an expected status (or, when
+        `owner` is given, is not currently leased by that owner) — the
+        caller must treat `None` as "someone else moved this run", never
+        retry blindly. `release_lease=True` clears the lease in the same
+        statement, for terminal transitions and for handing a paused run
+        back to nobody (§6.3: the driving task ends on interrupt).
+        """
+        ...
+
+    async def acquire_lease(
+        self,
+        run_id: uuid.UUID,
+        *,
+        owner: str,
+        now: datetime,
+        ttl: timedelta,
+        expected: Iterable[RunStatus] = (RunStatus.QUEUED, RunStatus.RUNNING),
+        status: RunStatus | None = None,
+    ) -> AgentRun | None:
+        """Atomically take ownership of a run (DB-007, ADR-023).
+
+        Succeeds only if the run is in an `expected` status AND the lease is
+        free: no owner, already this owner (idempotent re-acquire), or
+        expired as of `now` (`lease_expires_at <= now` — the exact complement
+        of `heartbeat_lease`'s liveness test). Optionally moves `status` in the same
+        statement (e.g. `awaiting_approval → running` on approval resume).
+        Returns the row on success, `None` if another live owner holds it.
+        """
+        ...
+
+    async def heartbeat_lease(
+        self, run_id: uuid.UUID, *, owner: str, now: datetime, ttl: timedelta
+    ) -> bool:
+        """Extend the lease to `now + ttl` — only for its current, unexpired
+        owner on a `queued`/`running` run. Returns `False` for a stale or
+        non-owner worker, which **must** then stop driving the run: an
+        expired lease is never revived, because someone else may already
+        own it (§2.4)."""
+        ...
+
+    async def release_lease(self, run_id: uuid.UUID, *, owner: str) -> bool:
+        """Clear the lease if `owner` still holds it. `False` means it was
+        already lost or released — not an error, just nothing to do."""
         ...
 
     async def list_runs(
@@ -157,7 +216,10 @@ class AgentRunRepository(Protocol):
         ...
 
     async def list_orphaned_runs(self, *, now: datetime, limit: int = 50) -> list[AgentRun]:
-        """List running or queued runs whose heartbeat lease has expired."""
+        """The reconciler's only query (§12.3): `queued`/`running` runs whose
+        lease has expired as of `now` or was never taken. Terminal and
+        `awaiting_approval` runs are never candidates — a paused run has no
+        worker by design (§6.3) and is not an orphan."""
         ...
 
 
