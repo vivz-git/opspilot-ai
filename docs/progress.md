@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..004 are
-done. Continue at `docs/handoff.md` §3 with DB-005.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..005 are
+done. Continue at `docs/handoff.md` §3 with DB-006.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ████████████████░░░░  DB-001..004 done; 005..007 outstanding
+persistence    ████████████████████  DB-001..005 done; 006..007 outstanding
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -674,4 +674,51 @@ cleanly without database):
 
 Next task: **DB-005** (Async repositories per aggregate; no ORM session leaks outside them) — SONNET, depends on DB-001..004.
 
-A leftover from this session: the same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is still running for whoever picks up DB-005 next; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
+## DB-005 — Async repositories per aggregate — 2026-09-13
+
+**Done.** Implemented the complete asynchronous repository layer for all persistence
+aggregates across both control plane (`opspilot` schema) and mock CRM (`mock_crm`
+schema) per §12, DB-005:
+
+- `app/persistence/protocols.py`: Runtime-checkable protocols defining strict, typed
+  contracts for all 11 aggregate repositories (`AgentRunRepository`, `ExecutionStepRepository`,
+  `ToolCallRepository`, `ApprovalRepository`, `TraceEventRepository`, `EvaluationRepository`,
+  `CompanyRepository`, `LeadRepository`, `CustomerRepository`, `OutreachDraftRepository`,
+  `EmailOutboxRepository`) plus `UnitOfWork`. Higher application layers depend exclusively
+  on these protocols.
+- `app/persistence/repositories.py`: Asynchronous SQLAlchemy implementations encapsulating
+  all `select()`, `insert()`, `update()`, and PostgreSQL advisory locks (`SqlAgentRunRepository`,
+  `SqlExecutionStepRepository`, `SqlToolCallRepository`, `SqlApprovalRepository`,
+  `SqlTraceEventRepository`, `SqlEvaluationRepository`, `SqlCompanyRepository`,
+  `SqlLeadRepository`, `SqlCustomerRepository`, `SqlOutreachDraftRepository`,
+  `SqlEmailOutboxRepository`, `SqlUnitOfWork`).
+- `app/persistence/session.py`: `create_session_factory` and `unit_of_work()` context manager.
+  Session lifecycle is strictly scoped to context blocks with explicit commit semantics:
+  changes require an explicit `await uow.commit()`; exiting without commit or upon exception
+  automatically executes rollback. Sessions are guaranteed closed in `finally:`. No global
+  mutable session object exists.
+- `app/persistence/__init__.py`: Clean public API exporting models, protocols, repositories,
+  and session utilities.
+- Architectural boundary enforcement: `tests/test_structure.py::test_no_orm_query_construction_outside_persistence`
+  statically verifies via AST that zero `select()`, `insert()`, `update()`, or `delete()`
+  ORM query building occurs outside `app/persistence/`.
+- State transitions and concurrency:
+  - `ApprovalRepository.decide`: atomic conditional update (`WHERE status='pending' RETURNING *`),
+    resolving double-clicks and concurrent decisions directly at the database.
+  - `CustomerRepository.update_optimistic`: atomic optimistic concurrency update checking
+    `version == expected_version` and incrementing version; returns `None` on stale write.
+  - `TraceEventRepository.append`: transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`)
+    allocating monotonic gapless `seq` values per run.
+- Integration tests (`tests/test_repositories.py`): 16 tests covering protocol conformance,
+  CRUD and query behaviors, missing record semantics, orphan detection, explicit commit,
+  rollback on error, rollback on uncommitted exit, session cleanup, database constraint
+  violations, and concurrent gapless trace event sequence allocation.
+
+**Test suite: 366 passed, 1 skipped** (`cd backend && uv run pytest`, with
+`DATABASE_URL` pointed at a reachable Postgres — 17 of the 366 are new: 16 in
+`test_repositories.py`, 1 in `test_structure.py`). `ruff check .`,
+`ruff format --check .` and `mypy app` (strict) are all clean; `alembic check` clean.
+
+Next task: **DB-006** (Constraint tests against real Postgres for every safety-relevant index) — SONNET, depends on DB-001..004.
+
+A leftover from this session: the same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is still running for whoever picks up DB-006 next; remove with `docker rm -f opspilot-pg-dev` once no longer needed.

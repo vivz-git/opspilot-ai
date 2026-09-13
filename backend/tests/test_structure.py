@@ -138,3 +138,39 @@ def test_the_leaf_modules_stay_leaves() -> None:
             if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app.")
         }
         assert internal <= allowed, f"{leaf} gained a dependency on {internal - allowed}"
+
+
+def test_no_orm_query_construction_outside_persistence() -> None:
+    """§12, DB-005 — no `select()` or equivalent ORM query construction outside
+    `app/persistence/`. Services and other layers must depend exclusively on
+    repository protocols, not build queries or execute raw ORM sessions."""
+    persistence_dir = APP / "persistence"
+    forbidden_symbols = {"select", "insert", "update", "delete"}
+    offenders: dict[str, list[str]] = {}
+
+    for path in python_files(APP):
+        if persistence_dir in path.parents or path == persistence_dir:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: set[str] = set()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.startswith("sqlalchemy") or node.module == "sqlalchemy":
+                    for alias in node.names:
+                        if alias.name in forbidden_symbols:
+                            found.add(f"import {alias.name} from {node.module}")
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_symbols:
+                    if isinstance(node.func.value, ast.Name) and node.func.value.id in (
+                        "sa",
+                        "sqlalchemy",
+                    ):
+                        found.add(f"{node.func.value.id}.{node.func.attr}()")
+                elif isinstance(node.func, ast.Name) and node.func.id in forbidden_symbols:
+                    found.add(f"{node.func.id}() call")
+
+        if found:
+            offenders[str(path.relative_to(APP.parent))] = sorted(found)
+
+    assert not offenders, f"ORM query construction forbidden outside app/persistence: {offenders}"
