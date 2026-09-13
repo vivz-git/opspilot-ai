@@ -33,7 +33,7 @@ finished while the properties the product claims are unimplemented.
 
 | ID | Task | Deps | Model | Acceptance criteria |
 |---|---|---|---|---|
-| FOUND-001 | FastAPI app factory: settings wiring, structlog JSON logging, `/healthz`, `/readyz`, CORS from config, `validate_runtime()` at startup | — | SONNET | `docker compose up db api` serves `/healthz` 200; `/readyz` returns 503 with `integration_unavailable` when the DB is down or migrations are behind; startup logs `settings.safe_dump()` with no secret present |
+| FOUND-001 | FastAPI app factory: settings wiring, structlog JSON logging, `/healthz`, `/readyz`, CORS from config, `validate_runtime()` at startup | — | SONNET | **done** — `app/main.py`, `app/logging_config.py`, `app/api/health.py`, `tests/test_health.py`. `/readyz`'s Alembic-head check is written generically (`expected_head` from `discover_alembic_head`) and returns `None` until FOUND-003 adds `alembic.ini`; until then it enforces DB reachability only, as designed |
 | FOUND-002 | Dependency lockfile and reproducible install (`uv` or `pip-tools`); CI installs from the lock | FOUND-001 | SONNET | `make check` reproduces CI exactly; lockfile committed; CI install uses it |
 | FOUND-003 | Alembic init with the three schemas (`opspilot`, `mock_crm`, and `langgraph` left to its saver) | FOUND-001 | SONNET | `alembic upgrade head` on an empty database creates both owned schemas; `downgrade base` is clean; a second `upgrade` is a no-op |
 | FOUND-004 | `Clock`, `IdGenerator` and `SeededRandom` protocols with real and fake implementations, injected everywhere | FOUND-001 | SONNET | No module calls `datetime.now`, `uuid4` or module-level `random` directly (structural test); fakes make time and ids deterministic |

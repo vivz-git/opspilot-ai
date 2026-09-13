@@ -1,6 +1,7 @@
 # Progress
 
-Repository state as of the architecture session, 2026-09-12.
+Repository state as of 2026-09-13 (FOUND-001 session). Architecture session
+was 2026-09-12.
 **The repository is the source of truth.** If this file and `git log` disagree,
 `git log` wins — and this file is wrong and should be fixed.
 
@@ -12,11 +13,13 @@ Repository state as of the architecture session, 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: not started.** Begin at `docs/handoff.md`.
+**Phase 1 — implementation: started.** FOUND-001 (the FastAPI app factory) is
+done. Continue at `docs/handoff.md` §3 with FOUND-002.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
+foundation     ██░░░░░░░░░░░░░░░░░░  FOUND-001 done; 002..005 outstanding
 persistence    ░░░░░░░░░░░░░░░░░░░░  DB-001..007
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
@@ -69,7 +72,20 @@ evaluation     ░░░░░░░░░░░░░░░░░░░░  EVA
 | `app/agent/state.py` | 21 state channels, reducers, `ApprovalState.grants` | `test_state.py` — reducer semantics, the args-hash gate, lifecycle |
 | `app/config.py` | One `Settings`, `SecretStr`, `safe_dump`, `validate_runtime` fuses | `test_config.py` — planner degradation, all four production fuses, budget bounds |
 
-**Test suite: 214 passed, 1 skipped** (`cd backend && pytest`)
+### Code — FOUND-001, the FastAPI app factory
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/main.py` | `create_app()` factory: wires `Settings`, calls `validate_runtime()`, configures structlog, adds CORS from config, creates the async DB engine, includes the health router, disposes the engine on shutdown | `test_health.py::TestHealthEndpoints`, `::TestCorsFromConfiguration`, `::TestStartupLogging` |
+| `app/logging_config.py` | structlog configured to emit one JSON object per line to stdout (§14.6) | `test_health.py::TestStartupLogging` — asserts a structured `startup` event and no secret in the output |
+| `app/api/health.py` | `/healthz` (liveness) and `/readyz` (DB reachability, plus Alembic head once FOUND-003 exists); `check_readiness` is a pure function over an injected engine so it's unit-testable with no Postgres | `test_health.py::TestCheckReadiness`, `::TestDiscoverAlembicHead` |
+
+`/readyz`'s migration-head comparison is written generically now
+(`discover_alembic_head` returns `None` until `alembic.ini` exists) so it
+needs no further change when FOUND-003 lands — it will start enforcing the
+head automatically.
+
+**Test suite: 228 passed, 1 skipped** (`cd backend && pytest`)
 One intentional skip: the mock-package network-import check activates when
 TOOL-001 creates `app/integrations/mock/`.
 
@@ -149,3 +165,24 @@ No credential was fabricated or stubbed to work around any of these.
 Each commit is one architectural deliverable, inspected and secret-scanned
 before committing. Run `git log --stat` for the detail; commit bodies record
 what was decided and why, not merely what changed.
+
+---
+
+## Implementation session — 2026-09-13
+
+**FOUND-001 done.** The FastAPI app factory: `create_app()` wires `Settings`
+(with fail-fast `validate_runtime()`), structlog JSON logging, CORS from
+config, an async SQLAlchemy engine, and the `/healthz`/`/readyz` routes. See
+the FOUND-001 row in the table above and its entry in `docs/tasks.md`.
+
+Local dev note: this machine has no Python 3.12 install (only 3.10 and 3.14
+were available), so a `.venv` was created with 3.14 to install and run the
+suite — `pyproject.toml`'s `requires-python = ">=3.12"` is satisfied, and
+nothing 3.14-specific was used. The venv is untracked (`.gitignore` already
+covers `.venv/`); FOUND-002's lockfile task should pin the real target
+version in CI.
+
+Commit: `feat(api): add the FastAPI app factory with health and readiness endpoints`.
+
+Next task: **FOUND-002** (dependency lockfile) or **FOUND-003** (Alembic
+init) — both depend only on FOUND-001 and are independent of each other.
