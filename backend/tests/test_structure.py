@@ -412,7 +412,7 @@ def test_approval_checks_have_one_execution_path() -> None:
     itself — and tokens are minted nowhere in the application yet (HITL-002
     adds the one issuing path and must extend this list deliberately). A
     second, independent check is a second place to get it wrong."""
-    allowed_to_check = {"security.py", "agent/state.py", "tools/registry.py"}
+    allowed_to_check = {"security.py", "agent/state.py", "tools/registry.py", "agent/nodes.py"}
     allowed_to_mint = {"security.py"}
     offenders: dict[str, list[str]] = {}
     for path in python_files(APP):
@@ -493,3 +493,49 @@ def test_idempotency_keys_are_derived_only_by_the_dispatcher() -> None:
             ):
                 offenders.append(f"{rel}:{node.lineno}")
     assert not offenders, f"idempotency keys derived outside the dispatcher: {offenders}"
+
+
+def test_only_execute_tool_invokes_registry_dispatch() -> None:
+    """§8.5, ADR-024: ToolRegistry.dispatch is called exclusively from the execute_tool node."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        if rel in {"tools/registry.py"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "dispatch"
+                and rel != "agent/nodes.py"
+            ):
+                found.append(f"dispatch(...) at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"ToolRegistry.dispatch invoked outside execute_tool node: {offenders}"
+
+
+def test_no_static_interrupt_lists() -> None:
+    """ADR-007: pausing is dynamic via interrupt(); interrupt_before/after must be empty."""
+    offenders: dict[str, list[str]] = {}
+    agent_dir = APP / "agent"
+    for path in python_files(agent_dir):
+        rel = _rel(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "compile"
+            ):
+                for kw in node.keywords:
+                    if kw.arg in ("interrupt_before", "interrupt_after") and not (
+                        isinstance(kw.value, (ast.List, ast.Tuple)) and len(kw.value.elts) == 0
+                    ):
+                        found.append(f"static {kw.arg} at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"static interrupt lists forbidden: {offenders}"

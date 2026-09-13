@@ -22,7 +22,7 @@ contract spine ████████████████████  com
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
-agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
+agent graph    ████░░░░░░░░░░░░░░░░  AGENT-001, AGENT-002 done; 003..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
@@ -1050,6 +1050,23 @@ into `ToolRegistry` by default.
 `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check`
 are all clean.
 
-Next task: **TOOL-004** (`$ref` resolver: dotted keys and numeric indices only,
-`ReferenceResolutionError` on miss) — SONNET.
+## AGENT-002 — LangGraph execution graph assembly and conditional edges — 2026-09-13
+
+**Done.** Production LangGraph execution graph assembled with all nine nodes and exact static/conditional edges from architecture §6.1. Compiled with `AsyncPostgresSaver` and `MemorySaver`. Dynamic `interrupt()` in `request_approval` with `interrupt_before=[]`, `interrupt_after=[]` (ADR-007).
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/agent/nodes.py` | Complete `NodeHandlers` class implementing all 9 nodes (`understand`, `plan`, `decide`, `request_approval`, `execute_tool`, `verify`, `recover`, `complete`, `fail`), pluggable boundaries for future tasks, 6 conditional router functions (`route_after_understand`, `route_after_plan`, `route_after_decide`, `route_after_execute`, `route_after_verify`, `route_after_recover`), `create_initial_state` factory, and strict gate re-assertion (barrier 2) before `ToolRegistry.dispatch()` | `tests/test_agent_graph.py` |
+| `app/agent/graph.py` | `create_agent_graph` factory building `StateGraph[AgentState]`, wiring all static edges (`START -> understand`, `request_approval -> decide`, `complete -> END`, `fail -> END`) and conditional edges matching §6.1, compiling with checkpointer and empty static interrupt lists | `tests/test_agent_graph.py` |
+| `tests/test_agent_graph.py` | Comprehensive test suite covering graph topology (all 9 nodes, all static/conditional edges, no unreachable edges), all routing branches across all 6 decision points, dynamic `interrupt()` / HITL pause-and-resume via `Command(resume=...)`, rejection terminal states (`REJECTED` vs `FAILED`), real Postgres checkpointer sync persistence, and tool safety | `tests/test_agent_graph.py` |
+| `tests/test_structure.py` | Added AST invariants: only `execute_tool` invokes `ToolRegistry.dispatch()`, and static interrupt lists (`interrupt_before`/`interrupt_after`) are forbidden across the agent graph (ADR-007) | `tests/test_structure.py` |
+
+**Test suite: 658 passed, 0 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 29 new tests in `test_agent_graph.py`,
+2 new structural checks in `test_structure.py`).
+`ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check`
+are all clean.
+
+Next task: **AGENT-003** (`understand` node: `NormalizedTask`, out-of-scope rejection) — SONNET.
+
 
