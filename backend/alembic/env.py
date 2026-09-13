@@ -54,6 +54,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_schemas=True,
     )
 
     with context.begin_transaction():
@@ -61,7 +62,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(connection=connection, target_metadata=target_metadata, include_schemas=True)
 
     with context.begin_transaction():
         context.run_migrations()
@@ -77,6 +78,31 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        # Force a `search_path` that never includes `opspilot`, even though
+        # the connecting role is itself named `opspilot` (see
+        # `docker-compose.yml` / `.env.example`). Postgres's default
+        # `search_path` is `"$user", public`, so a role named `opspilot`
+        # makes `opspilot` the connection's *ambient default* schema — the
+        # exact same name as our real schema. Every ORM table declares
+        # `schema="opspilot"` explicitly (`app.persistence.base.Base`), but
+        # unqualified reflection of the ambient-default schema reports
+        # `referred_schema: None` for objects that are actually in
+        # `opspilot`, which reads as a different identity than the
+        # metadata's explicit `"opspilot"` — so `--autogenerate`/`alembic
+        # check` reported every foreign key as simultaneously removed (as
+        # `schema=None`) and re-added (as `schema='opspilot'`), even with
+        # `include_schemas=True` (which is still required — it is what
+        # makes Alembic reflect and compare `opspilot` and `mock_crm` at
+        # all, rather than only the connection's default schema). Pinning
+        # `search_path` to `public` — a schema with no ORM tables — removes
+        # the ambiguity: no schema can now be mistaken for "the default",
+        # so `opspilot` is always reflected and compared under its own
+        # name. This is a reflection-time fix only: every migration already
+        # fully qualifies its DDL with `schema=SCHEMA`, and every ORM query
+        # is schema-qualified through `Base.metadata`, so nothing here
+        # relies on `search_path` for correctness at runtime — only
+        # Alembic's autogenerate comparator does.
+        connect_args={"server_settings": {"search_path": "public"}},
     )
 
     async with connectable.connect() as connection:
