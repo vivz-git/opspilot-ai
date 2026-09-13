@@ -21,7 +21,7 @@ architecture   ████████████████████  com
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
-tools          ███████░░░░░░░░░░░░░  TOOL-001, 002 done; TOOL-003..006 outstanding
+tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
@@ -1024,6 +1024,32 @@ scripted implementations over the real ports.
 +20 including the canaries). `ruff check .`, `ruff format --check .`,
 `mypy app` (strict) and `alembic check` are all clean.
 
-Next task: **TOOL-003** (the nine tool implementations over ports, each
-honouring its declared failure modes, bound into `ToolRegistry` under
-`app/tools/impl/`) — SONNET, depends on TOOL-002.
+Next task: **TOOL-003** (done below).
+
+## TOOL-003 — the nine tool implementations over ports — 2026-09-13
+
+**Done.** All nine concrete tool implementations under `app/tools/impl/` bound
+into `ToolRegistry` by default.
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/tools/impl/search_leads.py` | `search_leads`: queries `LeadPort.search`, maps filters and returns pagination summaries; empty match returns `leads: []`, `total_matched: 0` | `tests/test_tool_impl.py::TestSearchLeadsTool` |
+| `app/tools/impl/get_lead.py` | `get_lead`: queries `LeadPort.get`, returns `LeadDetail` or raises `NotFoundError` | `tests/test_tool_impl.py::TestGetLeadTool` |
+| `app/tools/impl/research_company.py` | `research_company`: queries `CompanyPort.profile`, verifies confidence and summary invariants; raises `OutputValidationError` on invalid profile or `NotFoundError` | `tests/test_tool_impl.py::TestResearchCompanyTool` |
+| `app/tools/impl/score_lead.py` | `score_lead`: pure deterministic rule engine (§8.4, ADR-009) evaluating company fit, engagement, signal strength and data quality; returns `ScoreBand` (`hot`/`warm`/`cold`) and `factors` breakdown summing to `score` (±1) | `tests/test_tool_impl.py::TestScoreLeadTool` |
+| `app/tools/impl/draft_outreach.py` | `draft_outreach`: queries `ContentPort.draft` across direct/warm/formal tones; enforces placeholder (`{{`, `TODO`, `[NAME]`) and length guards with `OutputValidationError` | `tests/test_tool_impl.py::TestDraftOutreachTool` |
+| `app/tools/impl/save_draft.py` | `save_draft`: verifies `content_hash == sha256(subject||body)` (rejects mismatch with `PolicyViolation`), persists draft via `DraftPort.save` | `tests/test_tool_impl.py::TestSaveDraftTool` |
+| `app/tools/impl/send_email_mock.py` | `send_email_mock`: outbound gated action requiring approval token; passes derived idempotency key and token to `MailPort.send`; adapter rejects recipient mismatch with `PolicyViolation` | `tests/test_tool_impl.py::TestSendEmailMockTool` |
+| `app/tools/impl/get_customer.py` | `get_customer`: queries `CustomerPort.get` by id or email; raises `NotFoundError` on missing record | `tests/test_tool_impl.py::TestGetCustomerTool` |
+| `app/tools/impl/update_customer.py` | `update_customer`: customer-write gated action requiring approval token; reads pre-update state for undo diff, invokes `CustomerPort.update` under optimistic concurrency; raises `StaleWriteError` on version conflict | `tests/test_tool_impl.py::TestUpdateCustomerTool` |
+| `app/tools/impl/__init__.py` | `TOOL_IMPLEMENTATIONS` bundle and `default_implementations()` factory exposing all 9 tools | `tests/test_tool_impl.py::TestRegistryCompleteness` |
+| `app/tools/registry.py` | `ToolRegistry.__init__` defaults `implementations=None` to `default_implementations()` while preserving custom injection support | `tests/test_tool_impl.py`, `tests/test_tool_dispatch.py` |
+
+**Test suite: 627 passed, 0 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 28 new tests in `test_tool_impl.py`).
+`ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check`
+are all clean.
+
+Next task: **TOOL-004** (`$ref` resolver: dotted keys and numeric indices only,
+`ReferenceResolutionError` on miss) — SONNET.
+

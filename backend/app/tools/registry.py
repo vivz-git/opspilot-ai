@@ -100,6 +100,7 @@ __all__ = [
     "ToolRegistry",
     "ToolTimeoutError",
     "UnknownToolError",
+    "default_implementations",
 ]
 
 _log = structlog.get_logger("opspilot.tools.dispatch")
@@ -237,6 +238,13 @@ class _Attempt:
         return self.contract.name
 
 
+def default_implementations() -> dict[ToolName, ToolImplementation]:
+    """Return the default concrete tool implementations (§8.4, TOOL-003)."""
+    from app.tools.impl import TOOL_IMPLEMENTATIONS
+
+    return dict(TOOL_IMPLEMENTATIONS)
+
+
 class ToolRegistry:
     """Contracts, implementations and the one `dispatch` (§8.5)."""
 
@@ -246,11 +254,13 @@ class ToolRegistry:
         adapters: Adapters,
         uow_factory: UnitOfWorkFactory,
         clock: Clock,
-        implementations: Mapping[ToolName, ToolImplementation],
+        implementations: Mapping[ToolName, ToolImplementation] | None = None,
         adapter_name: str = "mock",
         contracts: Mapping[ToolName, ToolContract] = REGISTRY,
         trace_payload_max_bytes: int = 16_384,
     ) -> None:
+        if implementations is None:
+            implementations = default_implementations()
         problems: list[str] = []
         for name, contract in contracts.items():
             if contract.name is not name:
