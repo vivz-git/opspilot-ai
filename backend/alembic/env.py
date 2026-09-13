@@ -25,6 +25,7 @@ config.set_main_option("sqlalchemy.url", get_settings().database_url.get_secret_
 # `Base.metadata` before Alembic reads it — otherwise `--autogenerate` would
 # see an empty schema. Every migration is still written by hand (§12.1); this
 # only makes autogenerate diffs available as a check, not a generator.
+from app.persistence import mock_crm as _mock_crm  # noqa: E402,F401
 from app.persistence import models as _models  # noqa: E402,F401
 from app.persistence.base import Base as _Base  # noqa: E402
 

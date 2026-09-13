@@ -11,6 +11,7 @@ from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
 
 OPSPILOT_SCHEMA = "opspilot"
+MOCK_CRM_SCHEMA = "mock_crm"
 
 #: Deterministic constraint names so a hand-written migration and a future
 #: `--autogenerate` diff agree on what a constraint is called.

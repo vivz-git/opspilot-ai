@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..003 are
-done. Continue at `docs/handoff.md` §3 with DB-004.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..004 are
+done. Continue at `docs/handoff.md` §3 with DB-005.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ████████████░░░░░░░░  DB-001, 002, 003 done; 004..007 outstanding
+persistence    ████████████████░░░░  DB-001..004 done; 005..007 outstanding
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -602,11 +602,76 @@ second upgrade head is a true no-op, downgrade to `21765d8fa136` cleanly
 drops only the DB-003 tables and FK, re-upgrade reproduces an identical
 schema, and `alembic check` is clean throughout.
 
-Next task: **DB-004** (`mock_crm` models: `companies`, `leads`, `customers`
-with `version`, `outreach_drafts`, `email_outbox` with
-`UNIQUE(idempotency_key)`) — SONNET, depends only on FOUND-003, independent
-of DB-003.
+## DB-004 — `mock_crm` persistence models — 2026-09-13
 
-The same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is
-still running for whoever picks up DB-004 next; remove with
-`docker rm -f opspilot-pg-dev` once no longer needed.
+**Done.** `app/persistence/mock_crm.py` (simulated system-of-record models in the
+`mock_crm` schema: `Company`, `Lead`, `Customer`, `OutreachDraft`, `EmailOutbox`,
+cleanly separated from control plane persistence models per ADR-011 and §12.1),
+`app/persistence/base.py` (`MOCK_CRM_SCHEMA = "mock_crm"`), and
+`alembic/versions/e35beebb06d0_add_mock_crm_persistence_tables.py` (`Revises:
+62fe5fff7640`). Every column, nullability, default, foreign key, unique
+constraint, index and status enum in §12.9 is implemented.
+
+Column details match the architecture literally:
+- `companies`: `company_id` PK, `name`, `domain UNIQUE`, `industry`,
+  `employee_count`, `revenue_band`, `hq_location`, `funding_stage`,
+  `tech_stack jsonb`, `signals jsonb`, `created_at`, `updated_at`.
+- `leads`: `lead_id` PK, `company_id` FK -> `mock_crm.companies.company_id`,
+  `full_name`, `title`, `email`, `status` (`CHECK` constrained text enum:
+  `new/working/qualified/disqualified`, default `new`), `source`, `owner`,
+  `phone`, `timezone`, `tags text[]`, `notes`, `last_contacted_at`,
+  `created_at`, `updated_at`.
+- `customers`: `customer_id` PK, `account_name`, `primary_contact`,
+  `email UNIQUE`, `phone`, `status` (`CHECK` constrained text enum:
+  `prospect/active/churned`, default `prospect`), `plan`, `mrr numeric(12, 2)`,
+  `owner`, `notes`, **`version int not null default 1`**, `created_at`,
+  `updated_at`. The `version` column is the concurrency token `update_customer`
+  requires (§8.5, §12.9) and is ready for optimistic concurrency handling.
+- `outreach_drafts`: `draft_id` PK, `lead_id` FK -> `mock_crm.leads.lead_id`,
+  `channel` (default `'email'`), `subject`, `body`, `content_hash`,
+  `status` (`CHECK` constrained text enum: `saved/sent/archived`, default `saved`),
+  `version int not null default 1`, `metadata jsonb`, `created_at`, `updated_at`.
+- `email_outbox`: `outbox_id` PK, `message_id UNIQUE`, `draft_id` FK ->
+  `mock_crm.outreach_drafts.draft_id`, `to_email`, `subject`, `body`,
+  `status` (`CHECK` constrained text enum: `sent/failed`, default `sent`),
+  `provider` (default `'mock'`), **`idempotency_key UNIQUE`**, `run_id`,
+  `approval_id`, `created_at`, `sent_at`.
+  `idempotency_key UNIQUE` is enforced directly at the PostgreSQL database level
+  so a retried send is physically incapable of creating duplicate message records.
+  `run_id` and `approval_id` ensure every send is traceable to its human approval.
+
+**Verified against a real `postgres:16-alpine` container** (`opspilot-pg-dev`,
+port 55432):
+- `alembic upgrade head` creates all 5 tables in `mock_crm` with all columns,
+  defaults, FKs, unique constraints, and indexes.
+- A second `upgrade head` is a true no-op.
+- `alembic downgrade 62fe5fff7640` cleanly drops all 5 `mock_crm` tables and
+  leaves control-plane tables and schemas untouched.
+- Downgrade-then-reupgrade reproduces an identical schema.
+- `alembic check` reports zero drift ("No new upgrade operations detected").
+- All migration behaviors encoded as `tests/test_migrations.py::TestMockCrmTablesMigration` (4 tests).
+
+`tests/test_mock_crm_models.py` (30 new tests, `@pytest.mark.integration`, skips
+cleanly without database):
+- Creation of each model (minimal and fully populated).
+- Foreign key enforcement: invalid `company_id` on `leads`, invalid `lead_id`
+  on `outreach_drafts`, and invalid `draft_id` on `email_outbox` are all rejected
+  by PostgreSQL `IntegrityError`.
+- Duplicate rejection on all unique fields: `companies.domain`, `customers.email`,
+  `email_outbox.message_id`, and `email_outbox.idempotency_key`.
+- `customers.version` defaults to 1 and can be incremented for optimistic concurrency.
+- Relationship navigation verified across all related models.
+- All 4 status enum `CHECK` constraints reject out-of-vocabulary values at the database.
+- Cascade and restrict behavior: deleting a company with leads, a lead with drafts,
+  or a draft with outbox messages is restricted and rejected with `IntegrityError`.
+- All named indexes and constraints verified directly against `pg_indexes` and `pg_constraint`.
+
+**Test suite: 349 passed, 1 skipped** (`cd backend && uv run pytest`, with
+`DATABASE_URL` pointed at a reachable Postgres — 34 of the 349 are new: 30 in
+`test_mock_crm_models.py`, 4 in `test_migrations.py`; without a database, those
+34 skip instead, matching established pattern). `ruff check .`,
+`ruff format --check .` and `mypy app` (strict) are all clean.
+
+Next task: **DB-005** (Async repositories per aggregate; no ORM session leaks outside them) — SONNET, depends on DB-001..004.
+
+A leftover from this session: the same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is still running for whoever picks up DB-005 next; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
