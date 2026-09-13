@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..005 are
-done. Continue at `docs/handoff.md` §3 with DB-006.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..006 are
+done. Continue at `docs/handoff.md` §3 with DB-007.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ████████████████████  DB-001..005 done; 006..007 outstanding
+persistence    ████████████████████  DB-001..006 done; 007 outstanding
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -721,4 +721,52 @@ schema) per §12, DB-005:
 
 Next task: **DB-006** (Constraint tests against real Postgres for every safety-relevant index) — SONNET, depends on DB-001..004.
 
-A leftover from this session: the same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is still running for whoever picks up DB-006 next; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
+## DB-006 — Database constraint / invariant verification — 2026-09-13
+
+**Done.** Implemented database-level constraint and invariant verification suite against real PostgreSQL (`tests/test_database_invariants.py`, 34 tests), proving that all safety-critical invariants are enforced by PostgreSQL itself — not merely by Python or ORM pre-checks per DB-006 acceptance criteria:
+
+1. **Safety-Critical Unique Constraints & Genuinely Concurrent Races**:
+   - `uq_approvals_run_id_step_id_pending` (partial unique index on `opspilot.approvals` WHERE `status = 'pending'`):
+     - Verified existence in `pg_indexes`.
+     - Positive case: allows multiple non-pending approvals for same `(run_id, step_id)`.
+     - Negative case: rejects second pending approval with PostgreSQL `IntegrityError`.
+     - Concurrency race: 10 competing transactions, 1 successful commit, 9 rejected with `IntegrityError`, final DB count: 1 pending approval.
+   - `uq_email_outbox_idempotency_key` (unique constraint on `mock_crm.email_outbox`):
+     - Verified existence in `pg_indexes`.
+     - Concurrency race: 10 competing transactions, 1 successful commit, 9 rejected with `IntegrityError`, final DB count: 1 row.
+   - `uq_trace_events_run_id_seq` (unique constraint on `opspilot.trace_events`):
+     - Verified existence in `pg_indexes`.
+     - Raw concurrency race: 10 competing transactions attempting duplicate `seq=1`, 1 successful commit, 9 rejected with `IntegrityError`, final DB count: 1 row.
+     - Coordinated sequence allocator race: 20 competing transactions under `pg_advisory_xact_lock`, 20 successful commits, 0 rejected operations, final DB state: gapless monotonic sequence `[1, ..., 20]`.
+   - `uq_agent_runs_idempotency_key` (unique constraint on `opspilot.agent_runs`):
+     - Verified existence in `pg_indexes`.
+     - Concurrency race: 10 competing transactions, 1 successful commit, 9 rejected with `IntegrityError`, final DB count: 1 row.
+   - `uq_execution_steps_run_step_revision` & `uq_tool_calls_execution_step_id_attempt`:
+     - Verified existence in `pg_indexes`.
+     - Tool call attempt race: 10 competing transactions inserting `attempt=1`, 1 successful commit, 9 rejected with `IntegrityError`, final DB count: 1 row.
+   - `uq_evaluation_results_evaluation_run_id_case_id`:
+     - Verified existence in `pg_indexes`.
+     - Concurrency race: 10 competing transactions, 1 successful commit, 9 rejected with `IntegrityError`, final DB count: 1 row.
+   - Mock CRM Uniqueness:
+     - `uq_companies_domain`: 5 competing transactions, 1 successful commit, 4 rejected with `IntegrityError`.
+     - `uq_customers_email`: 5 competing transactions, 1 successful commit, 4 rejected with `IntegrityError`.
+
+2. **Customer Optimistic Concurrency**:
+   - Default `version` is 1 on insert.
+   - Concurrency race: 10 competing transactions issuing conditional `UPDATE mock_crm.customers ... WHERE version = 1`, exactly 1 transaction updates (1 row affected), 9 transactions receive 0 rows affected (lost-update prevented), final database state: `version = 2`.
+
+3. **Referential Integrity (Cascade & Restrict)**:
+   - Cascade delete: direct raw SQL `DELETE FROM opspilot.agent_runs` automatically cascades and deletes all child `execution_steps`, `tool_calls`, `approvals`, and `trace_events`.
+   - Restrict / No Action: raw SQL `DELETE` is blocked by PostgreSQL `IntegrityError` when attempting to delete companies with leads, leads with drafts, drafts with outbox entries, or agent runs referenced by evaluation results.
+
+4. **PostgreSQL Enum CHECK Constraints**:
+   - Parametrized raw SQL test asserting database rejection across all 13 enum columns (`agent_runs.status`, `execution_steps.status`, `execution_steps.verification_status`, `tool_calls.status`, `approvals.status`, `approvals.risk`, `trace_events.kind`, `trace_events.severity`, `evaluation_runs.status`, `leads.status`, `customers.status`, `outreach_drafts.status`, `email_outbox.status`).
+
+**Test suite: 400 passed, 1 skipped** (`cd backend && uv run pytest -v`, with
+`DATABASE_URL` pointed at PostgreSQL container — all 34 new invariant tests in
+`test_database_invariants.py` pass). `ruff check .`, `ruff format --check .` and
+`mypy app` (strict) are 100% clean; `alembic check` reports zero drift.
+
+Next task: **DB-007** (LangGraph Postgres checkpointer wiring, lease heartbeat, and the startup reconciler for orphaned runs) — OPUS, depends on DB-001, AGENT-002.
+
+A leftover from this session: the throwaway Postgres container (`opspilot-pg-dev`, port 55432) remains running; remove with `docker rm -f opspilot-pg-dev` once no longer needed.
