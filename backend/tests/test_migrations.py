@@ -186,3 +186,66 @@ class TestTraceEventsMigration:
         command.upgrade(config, "head")
         assert "trace_events" in _table_names("opspilot")
         assert _current_revision() == _script_head(config)
+
+
+def _foreign_key_names(schema: str, table: str) -> set[str]:
+    with _sync_engine().connect() as conn:
+        inspector = sa.inspect(conn)
+        return {
+            name
+            for fk in inspector.get_foreign_keys(table, schema=schema)
+            if (name := fk["name"]) is not None
+        }
+
+
+class TestEvaluationTablesMigration:
+    """DB-003 — `evaluation_runs`, `evaluation_results` (§12.8), plus the
+    deferred `agent_runs.evaluation_run_id` FK that DB-001 left off because
+    `evaluation_runs` did not exist yet. Must build on DB-002's head and be
+    reversible without touching the tables it revises."""
+
+    _PRIOR_TABLES = frozenset({"agent_runs", "execution_steps", "tool_calls", "approvals"})
+    _DB003_TABLES = frozenset({"evaluation_runs", "evaluation_results"})
+
+    def test_upgrade_head_creates_both_evaluation_tables(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        assert _table_names("opspilot") >= self._DB003_TABLES
+
+    def test_upgrade_head_adds_the_deferred_agent_runs_foreign_key(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        assert "fk_agent_runs_evaluation_run_id_evaluation_runs" in _foreign_key_names(
+            "opspilot", "agent_runs"
+        )
+
+    def test_downgrade_to_the_previous_revision_drops_only_the_new_tables_and_fk(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, "21765d8fa136")
+        tables = _table_names("opspilot")
+        assert not (self._DB003_TABLES & tables)
+        assert tables >= self._PRIOR_TABLES  # earlier revisions' tables are untouched
+        assert "trace_events" in tables  # DB-002's table is untouched
+        assert "fk_agent_runs_evaluation_run_id_evaluation_runs" not in _foreign_key_names(
+            "opspilot", "agent_runs"
+        )
+        command.upgrade(config, "head")  # leave the database migrated
+
+    def test_a_second_upgrade_head_is_a_true_no_op(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        before = _current_revision()
+        command.upgrade(config, "head")
+        assert _current_revision() == before
+
+    def test_downgrade_then_reupgrade_reproduces_the_same_schema(self) -> None:
+        config = _alembic_config()
+        command.upgrade(config, "head")
+        command.downgrade(config, "21765d8fa136")
+        command.upgrade(config, "head")
+        assert _table_names("opspilot") >= self._DB003_TABLES
+        assert "fk_agent_runs_evaluation_run_id_evaluation_runs" in _foreign_key_names(
+            "opspilot", "agent_runs"
+        )
+        assert _current_revision() == _script_head(config)

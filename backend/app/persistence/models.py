@@ -1,5 +1,6 @@
 """Control-plane ORM models: `agent_runs`, `execution_steps`, `tool_calls`,
-`approvals` (§12.3-12.6, DB-001) and `trace_events` (§12.7, DB-002).
+`approvals` (§12.3-12.6, DB-001), `trace_events` (§12.7, DB-002) and
+`evaluation_runs`/`evaluation_results` (§12.8, DB-003).
 
 Column types follow §12.10 (ADR-014) literally: a column typed `enum` in the
 architecture becomes a real database-enforced enum (`Enum(..., native_enum=
@@ -34,6 +35,9 @@ from app.tools.contracts import RiskLevel, ToolName
 __all__ = [
     "AgentRun",
     "ApprovalRow",
+    "EvaluationResult",
+    "EvaluationRun",
+    "EvaluationRunStatus",
     "ExecutionStep",
     "ToolCallRow",
     "ToolCallStatus",
@@ -103,6 +107,15 @@ class TraceEventSeverity(StrEnum):
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
+
+
+class EvaluationRunStatus(StrEnum):
+    """§12.8 — one suite execution's lifecycle. Distinct from `RunStatus`,
+    which is the *agent* run each case drives, not the suite itself."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 def _enum_values(enum_cls: type[StrEnum]) -> list[str]:
@@ -200,12 +213,12 @@ class AgentRun(Base):
         _timestamptz(), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now()
     )
     duration_ms: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
-    #: FK to `evaluation_runs` is added by DB-003, which is the migration
-    #: that actually creates that table (DB-003 depends on DB-001, not the
-    #: reverse — the column exists now so the run schema does not change
-    #: shape twice).
+    #: Set when the run was produced by the eval suite (§12.3). No
+    #: `ondelete` — like `parent_run_id` above, deleting the referenced
+    #: `evaluation_runs` row must not cascade into deleting real execution
+    #: history; the database blocks it instead (DB-003).
     evaluation_run_id: Mapped[uuid.UUID | None] = mapped_column(
-        sa.Uuid(as_uuid=True), nullable=True
+        sa.Uuid(as_uuid=True), ForeignKey("opspilot.evaluation_runs.id"), nullable=True
     )
     eval_case_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     metadata_: Mapped[dict[str, Any]] = mapped_column(
@@ -449,3 +462,91 @@ class TraceEvent(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
+
+
+class EvaluationRun(Base):
+    """§12.8 — one row per suite execution (DB-003).
+
+    `git_sha`, `prompt_version` and `seed` are the minimum needed to
+    attribute a metrics regression to a specific change (§12.8); without
+    them the numbers in `metrics` have no cause. All three stay nullable —
+    like `agent_runs.model_id`/`prompt_version`/`seed` — since a suite run
+    from an unclean tree or without a pinned prompt still needs to be
+    recorded, just with an honest gap rather than a fabricated value.
+    """
+
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        Index("ix_evaluation_runs_suite_started_at", "suite", sa.text("started_at DESC")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    suite: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    status: Mapped[EvaluationRunStatus] = mapped_column(
+        _enum_column(EvaluationRunStatus, "evaluation_run_status"),
+        nullable=False,
+        server_default=sa.text("'running'"),
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        _timestamptz(), nullable=False, server_default=sa.func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(_timestamptz(), nullable=True)
+    git_sha: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    #: Plain text by design (§12.10), same as `agent_runs.planner_kind`.
+    planner_kind: Mapped[PlannerKind] = mapped_column(sa.Text, nullable=False)
+    model_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    seed: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    case_count: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("0"))
+    passed: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("0"))
+    failed: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("0"))
+    #: The §15.4 metric snapshot for this suite execution.
+    metrics: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+
+
+class EvaluationResult(Base):
+    """§12.8 — one row per case (DB-003).
+
+    `run_id` links to the **real** `agent_runs` row the case executed, so
+    every evaluation result is backed by a full, inspectable trace rather
+    than a synthetic summary. No `ondelete` on `run_id`: unlike
+    `execution_steps`/`tool_calls`/`approvals`/`trace_events` (which are
+    genuinely owned by their run and must vanish with it), an evaluation
+    result is evaluation *history about* a run — deleting the run must not
+    silently erase that a case passed or failed, so the database blocks the
+    delete instead of cascading it.
+    """
+
+    __tablename__ = "evaluation_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluation_run_id", "case_id", name="uq_evaluation_results_evaluation_run_id_case_id"
+        ),
+        Index("ix_evaluation_results_case_id_passed", "case_id", "passed"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    evaluation_run_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        ForeignKey("opspilot.evaluation_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    case_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid(as_uuid=True), ForeignKey("opspilot.agent_runs.id"), nullable=False
+    )
+    passed: Mapped[bool] = mapped_column(sa.Boolean, nullable=False)
+    assertions: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    duration_ms: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    retry_count: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default=sa.text("0")
+    )
+    tool_calls_count: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default=sa.text("0")
+    )
+    approval_outcome: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)

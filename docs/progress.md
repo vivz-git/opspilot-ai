@@ -13,14 +13,14 @@ was 2026-09-12.
 are recorded with their costs, the backlog is prioritized, and the contract
 spine is implemented and tested.
 
-**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..002 are
-done. Continue at `docs/handoff.md` §3 with DB-003.
+**Phase 1 — implementation: started.** FOUND-001..004 and DB-001..003 are
+done. Continue at `docs/handoff.md` §3 with DB-004.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
-persistence    ████████░░░░░░░░░░░░  DB-001, 002 done; 003..007 outstanding
+persistence    ████████████░░░░░░░░  DB-001, 002, 003 done; 004..007 outstanding
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
@@ -474,4 +474,93 @@ depending only on FOUND-003.
 
 The same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is
 still running for whoever picks up the next task; remove with
+`docker rm -f opspilot-pg-dev` once no longer needed.
+
+## DB-003 — `evaluation_runs`/`evaluation_results`, and the deferred `agent_runs` FK — 2026-09-13
+
+**Done.** `app/persistence/models.py` gains `EvaluationRun`, `EvaluationResult`
+and `EvaluationRunStatus` (`running/completed/failed` — §12.8). Migration
+`62fe5fff7640` (`Revises: 21765d8fa136`) creates both tables by hand,
+self-contained like the prior migrations — enum values spelled out as
+literals rather than imported. Every column, nullability, default and index
+in §12.8 is implemented literally: `unique(evaluation_run_id, case_id)` and
+`(case_id, passed)` on `evaluation_results`, `(suite, started_at desc)` on
+`evaluation_runs`. `git_sha`, `prompt_version` and `seed` are persisted on
+`evaluation_runs` exactly as specified — nullable, like the equivalent
+reproducibility fields already on `agent_runs` (`model_id`/`prompt_version`/
+`seed`), since a suite run without a pinned prompt or a clean git tree still
+needs to be recorded rather than rejected.
+
+**The deferred FK.** DB-001's migration (`c6d1db7aa718`) deliberately left
+`agent_runs.evaluation_run_id` without a foreign key, since `evaluation_runs`
+didn't exist yet (DB-003 depends on DB-001, not the reverse). This revision
+adds it (`fk_agent_runs_evaluation_run_id_evaluation_runs`) via
+`op.create_foreign_key` against the now-existing table, on top of the column
+and its index DB-001 already created — no change to `c6d1db7aa718` itself.
+
+**Deletion semantics — one deliberate design decision beyond what §12.8
+spells out per-column.** §12.8 states `evaluation_results.evaluation_run_id`
+is `ON DELETE CASCADE` explicitly; it does not state a deletion rule for
+`evaluation_results.run_id` (→ `agent_runs`) or `agent_runs.evaluation_run_id`
+(→ `evaluation_runs`). Both were given the database's default (`NO ACTION`,
+i.e. the delete is rejected while a referencing row exists), not `CASCADE`,
+for the same reason `parent_run_id` and `approvals.superseded_by` are
+unspecified rather than cascading: these are *sideways* references to a row
+the referencing table does not own — an `evaluation_results` row is
+evaluation history *about* a real `agent_runs` row, and an `agent_runs` row
+that happens to have been produced by the eval suite is still real execution
+history, not part of the `evaluation_runs` aggregate. Cascading either would
+silently destroy history that a plain "delete this one row" was never meant
+to touch; blocking the delete is the safer default and matches every other
+unspecified FK in the schema. This is a design decision that fills a gap the
+architecture leaves open, not a deviation from anything it states — recorded
+here per DOC-003's spirit (an ADR would be for reversing something the
+architecture actually decided).
+
+**Verified against a real `postgres:16-alpine` container**
+(`opspilot-pg-dev`, port 55432): `alembic upgrade head` creates both tables
+and the deferred FK; a second `upgrade head` is a true no-op; `alembic
+downgrade 21765d8fa136` drops exactly the two new tables and the new FK,
+leaving DB-002's `trace_events` and DB-001's four control-plane tables
+untouched; a downgrade → upgrade cycle reproduces an identical schema. All
+four behaviours are now `tests/test_migrations.py::TestEvaluationTablesMigration`
+(5 tests), following the established pattern.
+
+`tests/test_evaluation_models.py` (21 tests, `@pytest.mark.integration`,
+skips cleanly with no reachable database) covers: creation of both models
+(minimal and fully populated, including explicit assertions that `git_sha`,
+`prompt_version` and `seed` persist and round-trip); required fields and
+defaults (`status` defaults to `running`, counters default to `0`, `metrics`/
+`assertions` default to `{}`/`[]`); the invalid-enum-value `CHECK` rejection
+on `evaluation_runs.status`; the evaluation-run-to-results relationship,
+including the `ON DELETE CASCADE` verified live (delete the run, the result
+row is gone); the evaluation-result-to-real-agent-run relationship, including
+both FK-miss rejections (unknown `run_id`, unknown `evaluation_run_id`) and
+the `NO ACTION` restriction verified live in both directions (deleting an
+`agent_runs` row referenced by a result, and deleting an `evaluation_runs`
+row referenced by an agent run, both raise `IntegrityError`); the deferred
+`agent_runs.evaluation_run_id` FK end to end (valid reference accepted,
+unknown id rejected, restrict-on-delete verified); the `uq_evaluation_results
+_evaluation_run_id_case_id` uniqueness constraint, including the positive
+case (the same `case_id` is allowed across two different evaluation runs);
+and every named index and the deferred FK's existence read directly from
+`pg_indexes`/`pg_constraint`.
+
+**Test suite: 314 passed, 1 skipped** (`cd backend && uv run pytest`, with
+`DATABASE_URL` pointed at a reachable Postgres — 26 of the 314 are new: 21 in
+`test_evaluation_models.py`, 5 in `test_migrations.py`; without a database,
+those 26 skip instead, matching the established pattern). `ruff check .` and
+`ruff format --check .` are clean; `mypy app` (strict) is clean. `alembic
+check` reports the same cosmetic false-positive FK schema diffs noted in
+DB-001 (this machine's `opspilot` Postgres role colliding with the
+`opspilot` schema name during reflection) — not a real drift, confirmed the
+same way DB-001 confirmed it.
+
+Next task: **DB-004** (`mock_crm` models: `companies`, `leads`, `customers`
+with `version`, `outreach_drafts`, `email_outbox` with
+`UNIQUE(idempotency_key)`) — SONNET, depends only on FOUND-003, independent
+of DB-003.
+
+The same throwaway Postgres container (`opspilot-pg-dev`, port 55432) is
+still running for whoever picks up DB-004 next; remove with
 `docker rm -f opspilot-pg-dev` once no longer needed.
