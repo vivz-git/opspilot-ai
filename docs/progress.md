@@ -19,7 +19,7 @@ done. Continue at `docs/handoff.md` §3 with FOUND-002.
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
-foundation     ██░░░░░░░░░░░░░░░░░░  FOUND-001 done; 002..005 outstanding
+foundation     ████░░░░░░░░░░░░░░░░  FOUND-001, 004 done; 002/003/005 outstanding
 persistence    ░░░░░░░░░░░░░░░░░░░░  DB-001..007
 tools          ░░░░░░░░░░░░░░░░░░░░  TOOL-001..006
 agent graph    ██░░░░░░░░░░░░░░░░░░  AGENT-001 done; 002..009 outstanding
@@ -85,7 +85,19 @@ evaluation     ░░░░░░░░░░░░░░░░░░░░  EVA
 needs no further change when FOUND-003 lands — it will start enforcing the
 head automatically.
 
-**Test suite: 228 passed, 1 skipped** (`cd backend && pytest`)
+### Code — FOUND-004, injected time/identity/randomness
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/runtime.py` | `Clock`/`IdGenerator`/`SeededRandom` protocols; `SystemClock`/`UuidIdGenerator`/`DeterministicRandom` (real) and `FixedClock`/`SequentialIdGenerator` (fake) | `test_runtime.py` |
+
+Nothing calls these yet — there is no consumer before AGENT-002+, TOOL-003 or
+DB-001's timestamp columns — so this task is deliberately just the primitive
+plus the structural guarantee
+(`test_structure.py::test_only_runtime_generates_time_ids_and_randomness`)
+that nothing bypasses it later.
+
+**Test suite: 242 passed, 1 skipped** (`cd backend && pytest`)
 One intentional skip: the mock-package network-import check activates when
 TOOL-001 creates `app/integrations/mock/`.
 
@@ -184,5 +196,19 @@ version in CI.
 
 Commit: `feat(api): add the FastAPI app factory with health and readiness endpoints`.
 
-Next task: **FOUND-002** (dependency lockfile) or **FOUND-003** (Alembic
-init) — both depend only on FOUND-001 and are independent of each other.
+**FOUND-004 done**, immediately after, as an unambiguously independent
+SONNET task depending only on FOUND-001: `Clock`/`IdGenerator`/`SeededRandom`
+protocols in `app/runtime.py`, with the structural test that nothing bypasses
+them. See its row in `docs/tasks.md` for the `SeededRandom` design note (one
+implementation, not a real/fake pair).
+
+Commit: `feat(agent): add injected Clock, IdGenerator and SeededRandom primitives`.
+
+Next task: **FOUND-003** (Alembic init with the three schemas) is the one
+that actually unblocks the critical path (`DB-001` depends on it), but its
+acceptance criteria (`alembic upgrade head` / `downgrade base` against a real
+database) needs a live Postgres to verify — this machine's Docker Desktop
+daemon was not running when this session ended, so FOUND-003 was left for a
+session where it can be checked, rather than merged unverified.
+**FOUND-002** (dependency lockfile) is the other unblocked option and needs
+no database, so it is the safer pick if Postgres still isn't available.

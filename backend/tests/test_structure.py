@@ -93,6 +93,40 @@ def test_no_dynamic_execution_of_model_output() -> None:
     assert not offenders, f"dynamic execution is forbidden: {offenders}"
 
 
+def test_only_runtime_generates_time_ids_and_randomness() -> None:
+    """§1.4, §18.2 — `app/runtime.py` is the only sanctioned source of wall
+    time, ids and randomness. A stray `datetime.now()`, `uuid4()` or
+    `random.random()` elsewhere breaks determinism invisibly: the whole point
+    of `Clock`/`IdGenerator`/`SeededRandom` is that every run can be replayed
+    against a frozen clock, a fixed id sequence and a fixed seed (FOUND-004).
+    """
+    exempt = {APP / "runtime.py"}
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        if path in exempt:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("now", "utcnow")
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "datetime"
+                ):
+                    found.add("datetime.now")
+                if (isinstance(node.func, ast.Attribute) and node.func.attr == "uuid4") or (
+                    isinstance(node.func, ast.Name) and node.func.id == "uuid4"
+                ):
+                    found.add("uuid4")
+        if "random" in imported_modules(path):
+            found.add("import random")
+        if found:
+            offenders[str(path.relative_to(APP.parent))] = sorted(found)
+    assert not offenders, f"bypassed injected time/id/randomness (use app.runtime): {offenders}"
+
+
 def test_the_leaf_modules_stay_leaves() -> None:
     """errors.py and security.py must remain importable from any layer, so
     they may not depend on higher layers."""
