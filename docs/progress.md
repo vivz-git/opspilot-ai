@@ -22,7 +22,7 @@ contract spine ████████████████████  com
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
-agent graph    ████████░░░░░░░░░░░░  AGENT-001..005 done; 006..009 outstanding
+agent graph    ████████████████░░░░  AGENT-001..008 done; AGENT-009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
@@ -1282,5 +1282,26 @@ Implemented the production `recover` node mechanics, retry counting, exponential
 
 **Test suite: 1131 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL container on port 55432 — 34 new in `tests/test_recover.py`, 2 new in `tests/test_runtime.py`, the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 62 source files), and `alembic check` are all clean.
 
-Next task: **AGENT-008** (`complete` and `fail` nodes plus `Responder`; terminal status computation including `partial` and `unconfirmed`).
+## AGENT-008 — `complete` and `fail` nodes plus `Responder`; terminal status computation including `partial` and `unconfirmed` — 2026-09-14
+
+Implemented the production terminal response layer for OpsPilot AI across `complete` and `fail` nodes exactly per §7, §10.6, §11.4, ADR-001, and Invariants P1–P7.
+
+| File | Role | Tests |
+|---|---|---|
+| `backend/app/agent/nodes.py` | Implementation of `synthesize_complete_response`, `synthesize_fail_response`, `format_failure_explanation`, `is_required_step_rejected`, `sanitize_text`, `NodeHandlers.complete`, and `NodeHandlers.fail`. Categorizes steps into `done`, `not_done`, `unconfirmed`, and `pending`. Enforces Invariant P5 (`UNCONFIRMED` / `FAILED` verification results never fold into `done`). Handles required step rejections (`RunStatus.REJECTED`, `status_reason="approval_rejected"`), partial completions (`partial=True` when optional steps skipped), unconfirmed outcomes, and successful completions (`RunStatus.COMPLETED`). In `fail`, preserves machine-readable `status_reason`, maps human-readable explanations safely, scrubs credentials via regex sanitization, and flags `partial=False`. | `tests/test_responder.py`, `tests/test_agent_graph.py` |
+| `backend/tests/test_responder.py` | 40 comprehensive unit, security, safety, integration, and structural tests: rejection outcome and partitioning, normal completion outcome and summaries, partial completion when optional steps are skipped, Invariant P5 enforcement for unconfirmed mutations, failure status preservation, human-readable explanations, credential redacting (Bearer tokens, API keys, passwords, secrets), graph execution over `MemorySaver` to terminal states, and AST checks verifying zero tool dispatch, zero mock adapter imports, zero ORM operations, and zero unconstrained LLM calls. | `tests/test_responder.py` |
+
+**Terminal Response Semantics Verified.**
+1. **Rejection Outcome**: If any required step was rejected (`StepStatus.REJECTED` or `ApprovalDecisionKind.REJECT`), `complete` transitions the run to `RunStatus.REJECTED` with `status_reason="approval_rejected"`, names rejected and incomplete steps in `not_done`, and preserves already completed steps in `done`.
+2. **Normal Completion**: When all steps complete without errors or rejections, `complete` transitions to `RunStatus.COMPLETED` with a clean summary, populates `done`, and keeps `partial=False`.
+3. **Partial Completion**: When optional steps are skipped (`StepStatus.SKIPPED`), `complete` transitions to `RunStatus.COMPLETED` with `partial=True`, summarizing completed vs skipped steps.
+4. **Invariant P5 (Unconfirmed Mutations)**: Any step whose verification result is `UNCONFIRMED` or `FAILED` is strictly placed into `unconfirmed` and never reported as `done`.
+5. **Deterministic Failure Response**: `fail` transitions to `RunStatus.FAILED`, strictly preserves the machine-readable `status_reason` without overwriting with generic text, maps safe explanations into `FinalResponse.summary`, and scrubs credentials.
+6. **Architectural Isolation**: AST checks verify that the response layer never dispatches tools, never queries the ORM, and never executes unconstrained LLM calls.
+
+**Deliberately not done.** No budget enforcement sweeper or cooperative cancellation (AGENT-009); no HITL endpoints or UI.
+
+**Test suite: 1171 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL container on port 55432 — 40 new in `tests/test_responder.py`, the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 62 source files), and `alembic check` are all clean.
+
+Next task: **AGENT-009** (Budget enforcement and cooperative cancellation at node boundaries).
 

@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 import structlog
 from langgraph.types import interrupt
@@ -61,7 +62,13 @@ from app.errors import (
 from app.persistence.protocols import UnitOfWorkFactory
 from app.runtime import Clock, IdGenerator, SeededRandom, SystemClock, UuidIdGenerator
 from app.security import ApprovalToken, canonical_args_hash
-from app.tools.contracts import REGISTRY, ToolContract, ToolName, VerificationMode
+from app.tools.contracts import (
+    REGISTRY,
+    SideEffect,
+    ToolContract,
+    ToolName,
+    VerificationMode,
+)
 from app.tools.registry import ApprovalRequiredError, ToolRegistry
 
 __all__ = [
@@ -70,6 +77,11 @@ __all__ = [
     "STATUS_REASON_INVALID_PLAN",
     "STATUS_REASON_PLANNER_ERROR",
     "create_initial_state",
+    "format_failure_explanation",
+    "is_required_step_rejected",
+    "sanitize_text",
+    "synthesize_complete_response",
+    "synthesize_fail_response",
 ]
 
 _log = structlog.get_logger("opspilot.agent.nodes")
@@ -139,6 +151,12 @@ class NodeHandlers:
         plan_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
         verify_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
         recover_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
+        complete_handler: (
+            Callable[[AgentState], Awaitable[dict[str, Any]] | dict[str, Any]] | None
+        ) = None,
+        fail_handler: (
+            Callable[[AgentState], Awaitable[dict[str, Any]] | dict[str, Any]] | None
+        ) = None,
         retry_base_delay_ms: int = 250,
         retry_max_delay_ms: int = 8_000,
         seeded_random: SeededRandom | None = None,
@@ -156,6 +174,8 @@ class NodeHandlers:
         self._plan_handler = plan_handler
         self._verify_handler = verify_handler
         self._recover_handler = recover_handler
+        self._complete_handler = complete_handler
+        self._fail_handler = fail_handler
         self._retry_base_delay_ms = retry_base_delay_ms
         self._retry_max_delay_ms = retry_max_delay_ms
         self._seeded_random = seeded_random
@@ -875,51 +895,341 @@ class NodeHandlers:
     # 8. complete
     # ---------------------------------------------------------------------------
     async def complete(self, state: AgentState) -> dict[str, Any]:
-        approval_state = state.get("approval_state")
-        plan = state.get("plan")
-        any_rejected = False
-        if approval_state:
-            for step_id, dec in approval_state.decisions.items():
-                if dec.decision == ApprovalDecisionKind.REJECT:
-                    step = plan.step(step_id) if plan else None
-                    if not step or not step.optional:
-                        any_rejected = True
-                        break
-
-        if any_rejected:
-            return {
-                "status": RunStatus.REJECTED,
-                "status_reason": "approval_rejected",
-                "final_response": FinalResponse(
-                    summary="Run was rejected by operator",
-                    not_done=["outreach_sent"],
-                ),
-            }
-
-        partial = False
-        if plan:
-            for s in plan.steps:
-                if s.status == StepStatus.SKIPPED and s.optional:
-                    partial = True
-
-        return {
-            "status": RunStatus.COMPLETED,
-            "status_reason": None,
-            "final_response": FinalResponse(
-                summary="All planned operations completed successfully",
-                partial=partial,
-            ),
-        }
+        if self._complete_handler is not None:
+            res = self._complete_handler(state)
+            if isinstance(res, Awaitable):
+                return await res
+            return res
+        return synthesize_complete_response(state)
 
     # ---------------------------------------------------------------------------
     # 9. fail
     # ---------------------------------------------------------------------------
     async def fail(self, state: AgentState) -> dict[str, Any]:
-        reason = state.get("status_reason")
-        if not reason:
-            errors = state.get("errors", [])
-            reason = str(errors[-1].error_class.value) if errors else "unspecified_failure"
+        if self._fail_handler is not None:
+            res = self._fail_handler(state)
+            if isinstance(res, Awaitable):
+                return await res
+            return res
+        return synthesize_fail_response(state)
+
+
+# ---------------------------------------------------------------------------
+# Terminal Response Layer Helpers (§7, §10.6, §11.4)
+# ---------------------------------------------------------------------------
+_SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.]+"),
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[A-Za-z0-9_\-\.]+"),
+    re.compile(r"(?i)(password\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)(secret\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)(token\s*[:=]\s*)[A-Za-z0-9_\-\.]+"),
+)
+
+REASON_EXPLANATIONS: Final[dict[str, str]] = {
+    "approval_rejected": "A required execution step was rejected by the operator",
+    "budget_exhausted": "The maximum allowed step count was exceeded",
+    "deadline_exceeded": "The execution deadline elapsed before completion",
+    "retry_budget_exhausted": "The maximum retry attempts for a failing step were exhausted",
+    "replan_budget_exhausted": "The maximum plan revision attempts were exhausted",
+    "unresolvable_plan": "Next step dependencies could not be resolved and replans were exhausted",
+    "invalid_plan": "The planner produced an invalid plan that could not be repaired",
+    "planner_error": "The planning subsystem encountered an error",
+    "out_of_scope": "The user request was determined to be out of scope",
+    "terminal_error_policy_violation": "A policy violation terminated execution",
+    "terminal_error_internal": "An unrecoverable internal error occurred",
+    "verification_failed": "Verification check failed for a mutating action; effect is unconfirmed",
+    "operator_cancelled": "The run was cancelled by an operator",
+    "stale_error": "Recovery received a stale error not matching the current step",
+    "missing_error": "Recovery invoked without an error recorded",
+    "missing_current_step": "Recovery invoked without a current step",
+    "terminal_run": "Run is already in a terminal state",
+}
+
+
+def sanitize_text(text: str) -> str:
+    """Scrub sensitive credentials, tokens, or headers from operator-facing text."""
+    sanitized = text
+    for pattern in _SECRET_PATTERNS:
+        sanitized = pattern.sub(r"\1[REDACTED]", sanitized)
+    return sanitized
+
+
+def format_failure_explanation(reason: str, errors: list[AgentError] | None = None) -> str:
+    """Produce a safe, concise explanation for a machine-readable failure reason."""
+    base_explanation = REASON_EXPLANATIONS.get(reason, f"Failure code: {reason}")
+    if errors:
+        last_error = errors[-1]
+        msg = sanitize_text(last_error.message.split("\n")[0].strip())
+        if msg and msg not in base_explanation:
+            return f"{base_explanation} ({last_error.error_class.value}: {msg})"
+    return base_explanation
+
+
+def is_required_step_rejected(
+    plan: Plan | None,
+    approval_state: ApprovalState | None,
+) -> tuple[bool, list[str]]:
+    """Determine whether any required step was rejected, returning the rejected step IDs."""
+    app_state = approval_state or ApprovalState()
+    rejected_ids: list[str] = []
+
+    if plan is not None and plan.steps:
+        for s in plan.steps:
+            if not s.optional and (
+                s.status == StepStatus.REJECTED or app_state.rejected(s.step_id)
+            ):
+                rejected_ids.append(s.step_id)
+    elif app_state.decisions:
+        for step_id, dec in app_state.decisions.items():
+            if dec.decision == ApprovalDecisionKind.REJECT:
+                rejected_ids.append(step_id)
+
+    return (len(rejected_ids) > 0, rejected_ids)
+
+
+def _is_unconfirmed(
+    step_id: str,
+    verification_result: dict[str, VerificationResult],
+) -> bool:
+    """Invariant P5: An unverified effect is reported as unconfirmed and never as done."""
+    ver = verification_result.get(step_id)
+    return ver is not None and ver.status in (
+        VerificationStatus.UNCONFIRMED,
+        VerificationStatus.FAILED,
+    )
+
+
+def _is_outbound_tool(tool_name: ToolName | None) -> bool:
+    """Check if tool has outbound side effects (e.g., sending emails)."""
+    if tool_name is None:
+        return False
+    if tool_name == ToolName.SEND_EMAIL_MOCK:
+        return True
+    contract = REGISTRY.get(tool_name)
+    return contract is not None and contract.side_effect == SideEffect.OUTBOUND
+
+
+def _categorize_steps(
+    plan: Plan | None,
+    tool_results: dict[str, ToolResult],
+    verification_result: dict[str, VerificationResult],
+    approval_state: ApprovalState | None,
+    errors: list[AgentError] | None = None,
+    failing_step_id: str | None = None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    done: list[str] = []
+    not_done: list[str] = []
+    unconfirmed: list[str] = []
+    pending: list[str] = []
+
+    if plan is None or not plan.steps:
+        return done, not_done, unconfirmed, pending
+
+    app_state = approval_state or ApprovalState()
+    error_step_ids = {e.step_id for e in (errors or []) if e.step_id is not None}
+    if failing_step_id:
+        error_step_ids.add(failing_step_id)
+
+    for step in plan.steps:
+        sid = step.step_id
+
+        # 1. Unconfirmed check (Invariant P5: never fold into done)
+        if _is_unconfirmed(sid, verification_result):
+            unconfirmed.append(sid)
+            continue
+
+        # 2. Succeeded check
+        if step.status == StepStatus.SUCCEEDED or (
+            sid in tool_results and step.status != StepStatus.FAILED and sid not in error_step_ids
+        ):
+            done.append(sid)
+            continue
+
+        # 3. Explicit not-done statuses
+        if (
+            step.status in (StepStatus.REJECTED, StepStatus.FAILED, StepStatus.SKIPPED)
+            or app_state.rejected(sid)
+            or sid in error_step_ids
+        ):
+            not_done.append(sid)
+            continue
+
+        # 4. Planned but unrun
+        pending.append(sid)
+
+    return done, not_done, unconfirmed, pending
+
+
+def synthesize_complete_response(state: AgentState) -> dict[str, Any]:
+    """Synthesize terminal response for the `complete` node (§7)."""
+    plan = state.get("plan")
+    approval_state = state.get("approval_state")
+    tool_results = state.get("tool_results") or {}
+    verification_result = state.get("verification_result") or {}
+    errors = state.get("errors") or []
+
+    has_rejection, rejected_ids = is_required_step_rejected(plan, approval_state)
+
+    done, not_done, unconfirmed, pending = _categorize_steps(
+        plan=plan,
+        tool_results=tool_results,
+        verification_result=verification_result,
+        approval_state=approval_state,
+        errors=errors,
+    )
+
+    # CASE 1 — REQUIRED APPROVAL REJECTED
+    if has_rejection:
+        for rid in rejected_ids:
+            if rid not in not_done and rid not in unconfirmed:
+                not_done.append(rid)
+            if rid in pending:
+                pending.remove(rid)
+
+        summary_parts = [
+            f"Execution stopped: required step approval rejected by operator "
+            f"({', '.join(rejected_ids)})."
+        ]
+        if done:
+            summary_parts.append(f"Completed before rejection: {', '.join(done)}.")
+        if not_done:
+            summary_parts.append(f"Not done: {', '.join(not_done)}.")
+        if unconfirmed:
+            summary_parts.append(f"Unconfirmed: {', '.join(unconfirmed)}.")
+        if pending:
+            summary_parts.append(f"Unrun: {', '.join(pending)}.")
+
         return {
-            "status": RunStatus.FAILED,
-            "status_reason": reason,
+            "status": RunStatus.REJECTED,
+            "status_reason": "approval_rejected",
+            "final_response": FinalResponse(
+                summary=" ".join(summary_parts),
+                done=done,
+                not_done=not_done,
+                unconfirmed=unconfirmed,
+                pending=pending,
+                partial=False,
+            ),
         }
+
+    # CASE 3 — PARTIAL COMPLETION (Optional steps skipped)
+    skipped_optional = [
+        s.step_id
+        for s in (plan.steps if plan else [])
+        if s.optional and s.status == StepStatus.SKIPPED
+    ]
+    partial = len(skipped_optional) > 0
+
+    summary_parts = []
+    if partial:
+        summary_parts.append(
+            f"Run completed with partial execution: {len(done)} step(s) completed "
+            f"({', '.join(done)}), {len(skipped_optional)} optional step(s) skipped "
+            f"({', '.join(skipped_optional)})."
+        )
+    elif unconfirmed:
+        summary_parts.append(
+            f"Run completed with {len(done)} step(s) completed ({', '.join(done)}), "
+            f"but effect(s) for {', '.join(unconfirmed)} could not be confirmed."
+        )
+    else:
+        summary_parts.append(
+            f"All planned operations completed successfully: {len(done)} step(s) completed"
+            + (f" ({', '.join(done)})." if done else ".")
+        )
+
+    if unconfirmed:
+        outbound_unconfirmed = [
+            uid
+            for uid in unconfirmed
+            if plan and plan.step(uid) and _is_outbound_tool(plan.step(uid).tool)  # type: ignore[union-attr]
+        ]
+        if outbound_unconfirmed:
+            summary_parts.append(
+                f"Outbound effect for step(s) {', '.join(outbound_unconfirmed)} is unconfirmed "
+                f"— check the outbox before retrying."
+            )
+        else:
+            summary_parts.append(f"Unconfirmed step(s): {', '.join(unconfirmed)}.")
+
+    if not_done and not partial:
+        summary_parts.append(f"Not done: {', '.join(not_done)}.")
+    if pending:
+        summary_parts.append(f"Pending: {', '.join(pending)}.")
+
+    return {
+        "status": RunStatus.COMPLETED,
+        "status_reason": None,
+        "final_response": FinalResponse(
+            summary=" ".join(summary_parts),
+            done=done,
+            not_done=not_done,
+            unconfirmed=unconfirmed,
+            pending=pending,
+            partial=partial,
+        ),
+    }
+
+
+def synthesize_fail_response(state: AgentState) -> dict[str, Any]:
+    """Synthesize terminal response for the `fail` node (§7, §10.6)."""
+    existing_reason = state.get("status_reason")
+    errors = state.get("errors") or []
+    plan = state.get("plan")
+    approval_state = state.get("approval_state")
+    tool_results = state.get("tool_results") or {}
+    verification_result = state.get("verification_result") or {}
+    current_step_id = state.get("current_step_id")
+
+    if existing_reason and existing_reason != "keep":
+        reason = existing_reason
+    elif errors:
+        last_err = errors[-1]
+        reason = str(last_err.error_class.value)
+    else:
+        reason = "unspecified_failure"
+
+    done, not_done, unconfirmed, pending = _categorize_steps(
+        plan=plan,
+        tool_results=tool_results,
+        verification_result=verification_result,
+        approval_state=approval_state,
+        errors=errors,
+        failing_step_id=current_step_id,
+    )
+
+    explanation = format_failure_explanation(reason, errors)
+    summary_parts = [f"Run failed ({reason}): {explanation}."]
+
+    if done:
+        summary_parts.append(f"Completed before failure: {', '.join(done)}.")
+    if not_done:
+        summary_parts.append(f"Not done: {', '.join(not_done)}.")
+    if unconfirmed:
+        outbound_unconfirmed = [
+            uid
+            for uid in unconfirmed
+            if plan and plan.step(uid) and _is_outbound_tool(plan.step(uid).tool)  # type: ignore[union-attr]
+        ]
+        if outbound_unconfirmed:
+            summary_parts.append(
+                f"Outbound effect for step(s) {', '.join(outbound_unconfirmed)} is unconfirmed "
+                f"— check the outbox before retrying."
+            )
+        else:
+            summary_parts.append(f"Unconfirmed step(s): {', '.join(unconfirmed)}.")
+    if pending:
+        summary_parts.append(f"Unrun: {', '.join(pending)}.")
+
+    return {
+        "status": RunStatus.FAILED,
+        "status_reason": reason,
+        "final_response": FinalResponse(
+            summary=" ".join(summary_parts),
+            done=done,
+            not_done=not_done,
+            unconfirmed=unconfirmed,
+            pending=pending,
+            partial=False,
+        ),
+    }
