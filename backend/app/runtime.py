@@ -104,3 +104,28 @@ class DeterministicRandom:
 
     def randint(self, a: int, b: int) -> int:
         return self._random.randint(a, b)
+
+
+class CancellationSource(Protocol):
+    """Protocol for checking whether a run has been cooperatively cancelled (§13.2)."""
+
+    def is_cancelled(self, run_id: str) -> bool: ...
+
+
+class InMemoryCancellationSource:
+    """In-memory cancellation source for cooperative cancellation signals."""
+
+    def __init__(self) -> None:
+        self._cancelled_runs: set[str] = set()
+
+    def cancel(self, run_id: str) -> None:
+        self._cancelled_runs.add(str(run_id))
+
+    def is_cancelled(self, run_id: str) -> bool:
+        return str(run_id) in self._cancelled_runs
+
+    def clear(self, run_id: str | None = None) -> None:
+        if run_id is None:
+            self._cancelled_runs.clear()
+        else:
+            self._cancelled_runs.discard(str(run_id))

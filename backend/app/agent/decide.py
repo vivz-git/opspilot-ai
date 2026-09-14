@@ -275,7 +275,11 @@ def evaluate_decision(
 
     # Lifecycle guard (§5.4): a terminal run has no outgoing transition.
     status = state.get("status")
-    if status is not None and status in TERMINAL_RUN_STATUSES:
+    status_reason = state.get("status_reason")
+    if (status is not None and status in TERMINAL_RUN_STATUSES) or status_reason in (
+        "cancelled",
+        "operator_cancelled",
+    ):
         return Decision(
             route=(
                 DecisionRoute.COMPLETE
@@ -285,7 +289,7 @@ def evaluate_decision(
             rule=DecisionRule.LIFECYCLE_GUARD,
             current_step_id=state.get("current_step_id"),
             plan=None,
-            status_reason=state.get("status_reason") or str(status),
+            status_reason=status_reason or str(status),
         )
 
     # Bounded re-evaluation: one pass per fan-out step, plus the final pass.

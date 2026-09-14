@@ -60,7 +60,14 @@ from app.errors import (
     recovery_action,
 )
 from app.persistence.protocols import UnitOfWorkFactory
-from app.runtime import Clock, IdGenerator, SeededRandom, SystemClock, UuidIdGenerator
+from app.runtime import (
+    CancellationSource,
+    Clock,
+    IdGenerator,
+    SeededRandom,
+    SystemClock,
+    UuidIdGenerator,
+)
 from app.security import ApprovalToken, canonical_args_hash
 from app.tools.contracts import (
     REGISTRY,
@@ -161,6 +168,9 @@ class NodeHandlers:
         retry_max_delay_ms: int = 8_000,
         seeded_random: SeededRandom | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        cancellation_source: (
+            CancellationSource | Callable[[str], bool | Awaitable[bool]] | None
+        ) = None,
     ) -> None:
         self._registry = registry
         self._uow_factory = uow_factory
@@ -180,6 +190,7 @@ class NodeHandlers:
         self._retry_max_delay_ms = retry_max_delay_ms
         self._seeded_random = seeded_random
         self._sleep_fn = sleep
+        self._cancellation_source = cancellation_source
 
     # ---------------------------------------------------------------------------
     # Internal helpers
@@ -207,12 +218,73 @@ class NodeHandlers:
             return self._arg_resolver(state, step)
         return resolve_step_args(state, step)
 
+    async def _is_cancelled(self, state: AgentState) -> bool:
+        """Cooperative cancellation check at node entry boundaries (§13.2)."""
+        current_status = state.get("status")
+        # Invariant: Terminal completion or rejection cannot be converted to failed/cancelled
+        if current_status in (RunStatus.COMPLETED, RunStatus.REJECTED, RunStatus.EXPIRED):
+            return False
+        if current_status == RunStatus.FAILED and state.get("status_reason") != "cancelled":
+            return False
+
+        if current_status == RunStatus.CANCELLED or state.get("status_reason") in (
+            "cancelled",
+            "operator_cancelled",
+        ):
+            return True
+
+        run_id = state.get("run_id")
+        if self._cancellation_source is not None and run_id is not None:
+            source = self._cancellation_source
+            run_id_str = str(run_id)
+            if hasattr(source, "is_cancelled"):
+                res = source.is_cancelled(run_id_str)
+            else:
+                res = source(run_id_str)
+            if isinstance(res, Awaitable):
+                return bool(await res)
+            return bool(res)
+
+        return False
+
+    def _is_cancelled_sync(self, state: AgentState) -> bool:
+        """Synchronous cancellation check for routing decisions (§13.2)."""
+        current_status = state.get("status")
+        if current_status in (RunStatus.COMPLETED, RunStatus.REJECTED, RunStatus.EXPIRED):
+            return False
+        if current_status == RunStatus.FAILED and state.get("status_reason") != "cancelled":
+            return False
+
+        if current_status == RunStatus.CANCELLED or state.get("status_reason") in (
+            "cancelled",
+            "operator_cancelled",
+        ):
+            return True
+
+        run_id = state.get("run_id")
+        if self._cancellation_source is not None and run_id is not None:
+            source = self._cancellation_source
+            run_id_str = str(run_id)
+            if hasattr(source, "is_cancelled"):
+                res = source.is_cancelled(run_id_str)
+            else:
+                res = source(run_id_str)
+            if not isinstance(res, Awaitable):
+                return bool(res)
+
+        return False
+
     # ---------------------------------------------------------------------------
     # 1. understand
     # ---------------------------------------------------------------------------
     async def understand(self, state: AgentState) -> dict[str, Any]:
         if self._understand_handler is not None:
             return await self._understand_handler(state)
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         task = state.get("normalized_task")
         if task is None:
             user_req = state.get("user_request", "")
@@ -224,6 +296,11 @@ class NodeHandlers:
         }
 
     def route_after_understand(self, state: AgentState) -> str:
+        if (
+            state.get("status") in TERMINAL_RUN_STATUSES
+            or state.get("status_reason") == "cancelled"
+        ):
+            return "fail"
         task = state.get("normalized_task")
         if task is not None and task.in_scope:
             return "plan"
@@ -244,6 +321,11 @@ class NodeHandlers:
         """
         if self._plan_handler is not None:
             return await self._plan_handler(state)
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         task = state.get("normalized_task")
         existing = state.get("plan")
         metadata = state.get("metadata") or RunMetadata()
@@ -316,6 +398,11 @@ class NodeHandlers:
         return delta
 
     def route_after_plan(self, state: AgentState) -> str:
+        if (
+            state.get("status") in TERMINAL_RUN_STATUSES
+            or state.get("status_reason") == "cancelled"
+        ):
+            return "fail"
         budgets = state.get("metadata", RunMetadata()).budgets
         replan_count = state.get("replan_count", 0)
         if replan_count > budgets.max_replans:
@@ -331,8 +418,15 @@ class NodeHandlers:
     def _evaluate_decision(self, state: AgentState) -> Decision:
         """One evaluation of §6.2, shared by the node and its conditional edge
         so the two cannot disagree (`app.agent.decide`)."""
+        effective_state = state
+        if self._is_cancelled_sync(state):
+            effective_state = {
+                **state,
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         return evaluate_decision(
-            state,
+            effective_state,
             now=self._clock.now(),
             contract_for=self._get_contract,
             resolve_args=self._resolve_step_args,
@@ -351,6 +445,11 @@ class NodeHandlers:
     # 4. request_approval
     # ---------------------------------------------------------------------------
     async def request_approval(self, state: AgentState) -> dict[str, Any]:
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         current_step_id = state.get("current_step_id")
         plan = state.get("plan")
         step = plan.step(current_step_id) if plan and current_step_id else None
@@ -380,6 +479,11 @@ class NodeHandlers:
         )
 
         # Resumed execution continues below
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         decision_obj: ApprovalDecision
         if isinstance(interrupted_val, ApprovalDecision):
             decision_obj = interrupted_val
@@ -429,6 +533,11 @@ class NodeHandlers:
     # 5. execute_tool
     # ---------------------------------------------------------------------------
     async def execute_tool(self, state: AgentState) -> dict[str, Any]:
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         current_step_id = state.get("current_step_id")
         plan = state.get("plan")
         step = plan.step(current_step_id) if plan and current_step_id else None
@@ -646,6 +755,11 @@ class NodeHandlers:
             }
 
     def route_after_execute(self, state: AgentState) -> str:
+        if (
+            state.get("status") in TERMINAL_RUN_STATUSES
+            or state.get("status_reason") == "cancelled"
+        ):
+            return "decide"
         current_step_id = state.get("current_step_id")
         errors = state.get("errors", [])
         tool_calls = state.get("tool_calls", [])
@@ -672,6 +786,11 @@ class NodeHandlers:
     async def verify(self, state: AgentState) -> dict[str, Any]:
         if self._verify_handler is not None:
             return await self._verify_handler(state)
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": "cancelled",
+            }
         current_step_id = state.get("current_step_id") or "unknown"
         res = VerificationResult(
             step_id=current_step_id,
@@ -681,6 +800,12 @@ class NodeHandlers:
         return {"verification_result": {current_step_id: res}}
 
     def route_after_verify(self, state: AgentState) -> str:
+        if (
+            state.get("status") in TERMINAL_RUN_STATUSES
+            or state.get("status_reason") == "cancelled"
+            or self._is_cancelled_sync(state)
+        ):
+            return "decide"
         current_step_id = state.get("current_step_id")
         results = state.get("verification_result", {})
         if current_step_id in results:
@@ -698,6 +823,14 @@ class NodeHandlers:
 
         # 1. Terminal / cancelled run check (§5.4 lifecycle guard)
         run_status = state.get("status")
+        if run_status in (RunStatus.COMPLETED, RunStatus.REJECTED, RunStatus.EXPIRED):
+            return {"status_reason": state.get("status_reason") or "terminal_run"}
+
+        if await self._is_cancelled(state):
+            return {
+                "status": RunStatus.FAILED,
+                "status_reason": state.get("status_reason") or "cancelled",
+            }
         if run_status in TERMINAL_RUN_STATUSES:
             return {"status_reason": state.get("status_reason") or "terminal_run"}
 
@@ -836,7 +969,11 @@ class NodeHandlers:
         return {"status_reason": fail_reason}
 
     def route_after_recover(self, state: AgentState) -> str:
-        if state.get("status") in TERMINAL_RUN_STATUSES:
+        if (
+            state.get("status") in TERMINAL_RUN_STATUSES
+            or state.get("status_reason") == "cancelled"
+            or self._is_cancelled_sync(state)
+        ):
             return "fail"
 
         status_reason = state.get("status_reason")
@@ -900,6 +1037,10 @@ class NodeHandlers:
             if isinstance(res, Awaitable):
                 return await res
             return res
+        if await self._is_cancelled(state):
+            return synthesize_fail_response(
+                {**state, "status": RunStatus.FAILED, "status_reason": "cancelled"}
+            )
         return synthesize_complete_response(state)
 
     # ---------------------------------------------------------------------------
@@ -939,6 +1080,7 @@ REASON_EXPLANATIONS: Final[dict[str, str]] = {
     "terminal_error_internal": "An unrecoverable internal error occurred",
     "verification_failed": "Verification check failed for a mutating action; effect is unconfirmed",
     "operator_cancelled": "The run was cancelled by an operator",
+    "cancelled": "The run was cancelled by an operator",
     "stale_error": "Recovery received a stale error not matching the current step",
     "missing_error": "Recovery invoked without an error recorded",
     "missing_current_step": "Recovery invoked without a current step",

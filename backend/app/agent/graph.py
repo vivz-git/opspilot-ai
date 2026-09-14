@@ -19,7 +19,7 @@ from app.agent.normalizer import TaskNormalizer
 from app.agent.planner import Planner
 from app.agent.state import AgentState, PlanStep
 from app.persistence.protocols import UnitOfWorkFactory
-from app.runtime import Clock, IdGenerator, SeededRandom
+from app.runtime import CancellationSource, Clock, IdGenerator, SeededRandom
 from app.tools.registry import ToolRegistry
 
 __all__ = [
@@ -42,6 +42,9 @@ def create_agent_graph(
     retry_max_delay_ms: int = 8_000,
     seeded_random: SeededRandom | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    cancellation_source: (
+        CancellationSource | Callable[[str], bool | Awaitable[bool]] | None
+    ) = None,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
     """Assemble and compile the production LangGraph agent graph (§6.1)."""
     handlers = node_handlers or NodeHandlers(
@@ -56,6 +59,7 @@ def create_agent_graph(
         retry_max_delay_ms=retry_max_delay_ms,
         seeded_random=seeded_random,
         sleep=sleep,
+        cancellation_source=cancellation_source,
     )
 
     builder: StateGraph[AgentState] = StateGraph(AgentState)

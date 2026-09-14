@@ -22,7 +22,7 @@ contract spine ████████████████████  com
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
-agent graph    ████████████████░░░░  AGENT-001..008 done; AGENT-009 outstanding
+agent graph    ████████████████████  AGENT-001..009 complete
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
@@ -1303,5 +1303,30 @@ Implemented the production terminal response layer for OpsPilot AI across `compl
 
 **Test suite: 1171 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL container on port 55432 — 40 new in `tests/test_responder.py`, the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 62 source files), and `alembic check` are all clean.
 
-Next task: **AGENT-009** (Budget enforcement and cooperative cancellation at node boundaries).
+## AGENT-009 — Cooperative cancellation and budget termination at node boundaries — 2026-09-14
+
+Implemented production cooperative cancellation for OpsPilot AI across all graph node-entry boundaries exactly per §13.2, ADR-001, ADR-006, and Invariants P1–P7.
+
+| File | Role | Tests |
+|---|---|---|
+| `backend/app/runtime.py` | Added `CancellationSource` protocol (`is_cancelled(run_id) -> bool | Awaitable[bool]`) and production thread-safe `InMemoryCancellationSource` with atomic set tracking and synchronous/async query support. | `tests/test_cancellation.py` |
+| `backend/app/agent/decide.py` | Updated `evaluate_decision` (§6.2, ADR-006) Lifecycle Guard to check `status_reason in ("cancelled", "operator_cancelled")` or `status == RunStatus.CANCELLED` ahead of rule 1 (budgets), routing cleanly to `DecisionRoute.FAIL` with `rule=DecisionRule.LIFECYCLE_GUARD`. Preserves the 7-rule router sequence and pure evaluation contract without conditional branching AST drift. | `tests/test_cancellation.py`, `tests/test_decide.py` |
+| `backend/app/agent/nodes.py` | Added `cancellation_source` injection to `NodeHandlers`. Added node-entry boundary checks `_is_cancelled` (async) and `_is_cancelled_sync` across `understand`, `plan`, `request_approval` (entry and post-`interrupt`), `execute_tool`, `verify`, `recover`, and `complete`. Added sync cancellation checks to conditional routers `route_after_understand`, `route_after_plan`, `route_after_execute`, `route_after_verify`, and `route_after_recover`. Added `"cancelled"` and `"operator_cancelled"` reason mapping to `REASON_EXPLANATIONS`. | `tests/test_cancellation.py`, `tests/test_agent_graph.py` |
+| `backend/app/agent/graph.py` | Forwarding `cancellation_source` in `create_agent_graph` to `NodeHandlers`. Preserved 9-node graph topology and no static interrupt lists. | `tests/test_cancellation.py` |
+| `backend/tests/test_cancellation.py` | 24 comprehensive unit, safety, concurrency, checkpointing, and structural AST tests covering all cancellation mechanics. | `tests/test_cancellation.py` |
+
+**Cancellation Semantics Verified.**
+1. **Cooperative Node-Entry Check**: Cancellation is observed at entry boundaries for all meaningful nodes (`understand`, `plan`, `decide`, `request_approval`, `execute_tool`, `verify`, `recover`, `complete`). Resilient routers route directly to `fail -> END`.
+2. **Critical Tool In-Flight Safety**: A tool already dispatched into execution is **never** interrupted mid-flight. No `task.cancel()`, thread interruption, or process termination is used against active tools. The active tool finishes normally, its output/call telemetry is recorded in state, and cancellation is observed at the subsequent node boundary (`decide` / `route_after_execute`).
+3. **Clean Terminal Failure**: Honors `RunStatus.FAILED` with `status_reason="cancelled"`, synthesizing a structured `FinalResponse` detailing completed and unrun steps.
+4. **Approval Safety & Pause/Resume Durability**: If cancellation is pending before `request_approval`, no pause occurs; if cancelled while paused awaiting approval, resuming via `Command(resume=...)` exits cleanly to `fail(cancelled)` without dispatching the tool, without prompting the operator, and without converting cancellation into an approval rejection (`RunStatus.REJECTED` remains distinct).
+5. **Precedence Over Recovery & Budgets**: Cancellation strictly suppresses retries, plan revisions, and optional-step skips in `recover` without erasing prior error history. Cancellation reason takes precedence over step/replan/deadline budget exhaustion.
+6. **Terminal Invariant Protection**: Completed (`RunStatus.COMPLETED`) and rejected (`RunStatus.REJECTED`) runs can never be converted to cancelled or failed.
+7. **Concurrency & Idempotency**: Repeated or concurrent cancellation requests against the same run ID are safe and idempotent.
+
+**Deliberately not done.** No HITL API/UI endpoints (HITL-001..005); no verifier frameworks (VERIFY-001..003); no public API routes (API-001..007).
+
+**Test suite: 1195 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL container on port 55432 — 24 new in `tests/test_cancellation.py`, the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 62 source files), and `alembic check` are all clean.
+
+AGENT-009 is the final agent core node task. All 9 core agent nodes (`understand`, `plan`, `decide`, `request_approval`, `execute_tool`, `verify`, `recover`, `complete`, `fail`) and their lifecycle, routing, and safety mechanisms are complete and verified.
 
