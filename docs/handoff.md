@@ -17,7 +17,7 @@ cat docs/tasks.md             # 2. what is next, with acceptance criteria
 cat docs/decisions.md         # 3. what is already decided, and why
 git status                    # 4. is the tree clean?
 git log --oneline -15         # 5. what actually landed
-cd backend && uv run pytest   # 6. still green? expect 599 passed, 0 skipped (with DATABASE_URL at a reachable Postgres)
+cd backend && uv run pytest   # 6. still green? expect 1095 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
 grep -rn "TODO\|FIXME" backend/app 2>/dev/null   # 7. any unfinished edges
 ```
 
@@ -38,19 +38,40 @@ foundation (app factory, lockfile, Alembic, injected clock/ids/randomness),
 the whole persistence layer — every control-plane and `mock_crm` table, the
 async repositories, constraint tests against real Postgres, and DB-007's
 LangGraph checkpointer, run leases, heartbeat and crash-recovery reconciler —
-the integration ports and mock adapters with the seed dataset (TOOL-001), and
-the single tool dispatch choke point `ToolRegistry.dispatch` (TOOL-002,
-ADR-024). 599 tests pass. `docs/progress.md` has the per-task record.
+the integration ports and mock adapters with the seed dataset (TOOL-001), the
+single tool dispatch choke point `ToolRegistry.dispatch` (TOOL-002, ADR-024),
+the nine tool implementations (TOOL-003), the LangGraph graph with all nine
+nodes (AGENT-002), deterministic understanding (AGENT-003), the `decide`
+router and fan-out expansion (AGENT-004), `$ref` resolution in `execute_tool`
+(AGENT-005) and the planner layer — `RulePlanner`, `LLMPlanner` over Groq,
+the plan validator and one-shot repair (AGENT-006, ADR-025). 1095 tests pass
+(plus one opt-in live-provider smoke test). `docs/progress.md` has the
+per-task record.
 
-Not yet implemented: the nine tool implementations, the graph and its nodes,
-HITL, verification, the API, the dashboard and the evaluation runner.
+Not yet implemented: `recover` backoff mechanics, the responder and terminal
+status computation, cancellation, HITL persistence and endpoints, the
+verifiers, the API, the dashboard and the evaluation runner.
 
 ## 3. Start here
 
-**Next task: `TOOL-003`** — the nine tool implementations over ports under
-`app/tools/impl/`, each honouring its declared failure modes, bound into
-`ToolRegistry` by the composition root. Model class: SONNET. Depends on
-TOOL-002 (done).
+**Next task: `AGENT-007`** — the `recover` node wired to `recovery_action`,
+with backoff via the injected clock. Model class: SONNET. Everything up to
+AGENT-006 is done: `docs/progress.md` has the per-task record.
+
+The planner (AGENT-006) is in `app/agent/planner/`: `Planner` protocol,
+`RulePlanner`, `LLMPlanner` over `GroqStructuredClient`, `validate_plan`, and
+the revision helpers the `plan` node uses. Compose it with
+`app.agent.planner.factory.build_planner(settings)` and inject it into
+`NodeHandlers(planner=...)` / `create_agent_graph(planner=...)`. Two things the
+recover work should know: `route_after_execute` keys on the *latest attempt*
+of the current step (a successful retry or re-execution after a replan no
+longer routes to `recover` because an older error is at the tail of
+`errors`), and the `plan` node treats `status_reason` in
+{`replan_required`, `replannable_fault`} as the revision request — keep
+writing one of those when routing to `plan`.
+
+Historical notes from the first implementation sessions (still accurate;
+kept because they describe shapes later tasks must match):
 
 An implementation is `async def name(args: <InputModel>, ctx: ToolContext) ->
 <OutputModel>`; it reaches its port only as `ctx.port` (narrow it with
@@ -180,7 +201,7 @@ it.
 
 | Action | Needed for | Blocking? |
 |---|---|---|
-| Obtain an `ANTHROPIC_API_KEY` from <https://console.anthropic.com/settings/keys> and put it in `.env` | `OPSPILOT_PLANNER=llm`; LLM-written plans and outreach copy | **No.** With no key, `auto` uses the deterministic rule planner and the template content generator. All nine tools, approvals, verification, the evaluation suite and the dashboard work unchanged. |
+| Obtain a `GROQ_API_KEY` from <https://console.groq.com/keys> and put it in `.env` (`GROQ_MODEL=openai/gpt-oss-120b`, ADR-025) | `OPSPILOT_PLANNER=llm`; LLM-written plans and outreach copy | **No.** With no key, `auto` uses the deterministic rule planner and the template content generator. All nine tools, approvals, verification, the evaluation suite and the dashboard work unchanged. |
 | Choose and add a license file | Reuse and contribution clarity on a public repository | No, but decide early |
 | Provide a deployment target and credentials | Anything beyond local Docker | No. Local `docker compose` is the supported environment, and `OPSPILOT_ENV=production` deliberately refuses to start without authentication (ADR-017). |
 | Grant the Claude GitHub App access to `vivz-git/opspilot-ai` | Pushing this branch to the remote | **Yes, for pushing only.** The architecture session's ten commits exist locally on `claude/great-euler-ql1wxj`; `git push` returned 403 because the app is not installed for the repository. An org admin can install it at <https://github.com/apps/claude/installations/select_target>, or reconnect GitHub from claude.ai settings. Re-run `git push -u origin claude/great-euler-ql1wxj` afterwards — nothing needs rebuilding. |

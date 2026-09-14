@@ -27,17 +27,17 @@ class TestPlannerSelection:
         assert s.effective_planner is PlannerKind.RULES
 
     def test_auto_uses_the_llm_when_a_key_is_present(self) -> None:
-        s = settings(OPSPILOT_PLANNER=PlannerMode.AUTO, ANTHROPIC_API_KEY=KEY)
+        s = settings(OPSPILOT_PLANNER=PlannerMode.AUTO, GROQ_API_KEY=KEY)
         assert s.effective_planner is PlannerKind.LLM
 
     def test_rules_ignores_a_present_key(self) -> None:
-        s = settings(OPSPILOT_PLANNER=PlannerMode.RULES, ANTHROPIC_API_KEY=KEY)
+        s = settings(OPSPILOT_PLANNER=PlannerMode.RULES, GROQ_API_KEY=KEY)
         assert s.effective_planner is PlannerKind.RULES
 
     def test_explicit_llm_without_a_key_fails_fast(self) -> None:
         """Explicit request fails; automatic selection degrades. That
         distinction is the whole point of having three modes."""
-        with pytest.raises(ConfigurationError, match="ANTHROPIC_API_KEY"):
+        with pytest.raises(ConfigurationError, match="GROQ_API_KEY"):
             settings(OPSPILOT_PLANNER=PlannerMode.LLM).validate_runtime()
 
 
@@ -110,24 +110,24 @@ class TestStartupFuses:
 
 class TestSecretHandling:
     def test_secrets_are_not_in_the_loggable_dump(self) -> None:
-        dump = settings(ANTHROPIC_API_KEY=KEY).safe_dump()
-        assert "anthropic_api_key" not in dump
+        dump = settings(GROQ_API_KEY=KEY).safe_dump()
+        assert "groq_api_key" not in dump
         assert "database_url" not in dump
         assert "postgres_password" not in dump
         assert KEY not in str(dump)
 
     def test_safe_dump_still_reports_which_secrets_are_configured(self) -> None:
-        dump = settings(ANTHROPIC_API_KEY=KEY).safe_dump()
-        assert "anthropic_api_key" in dump["secrets_configured"]
+        dump = settings(GROQ_API_KEY=KEY).safe_dump()
+        assert "groq_api_key" in dump["secrets_configured"]
 
     def test_secrets_are_hidden_in_repr(self) -> None:
-        s = settings(ANTHROPIC_API_KEY=KEY, POSTGRES_PASSWORD="hunter2")  # noqa: S106
+        s = settings(GROQ_API_KEY=KEY, POSTGRES_PASSWORD="hunter2")  # noqa: S106
         assert KEY not in repr(s)
         assert "hunter2" not in repr(s)
 
     def test_secret_fields_are_secretstr(self) -> None:
-        s = settings(ANTHROPIC_API_KEY=KEY)
-        assert isinstance(s.anthropic_api_key, SecretStr)
+        s = settings(GROQ_API_KEY=KEY)
+        assert isinstance(s.groq_api_key, SecretStr)
         assert isinstance(s.database_url, SecretStr)
 
 

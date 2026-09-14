@@ -34,8 +34,10 @@ _DENYLIST: Final[re.Pattern[str]] = re.compile(
     r"api_key|token|secret|password|authorization|credential", re.IGNORECASE
 )
 
-#: §14.5 rule 2 — Anthropic-style keys and bearer tokens, wherever they appear.
+#: §14.5 rule 2 — provider-style API keys (Groq `gsk_…`, Anthropic `sk-ant-…`)
+#: and bearer tokens, wherever they appear.
 _VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"gsk_[A-Za-z0-9_\-]{8,}"),
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"),
 )

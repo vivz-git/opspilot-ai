@@ -1170,5 +1170,94 @@ Implemented the reference resolver and integrated it into the `execute_tool` pip
 
 **Test suite: 951 passed, 0 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` at a reachable Postgres — 49 new tests in `test_resolver.py`). `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check` are all clean.
 
-Next task: **AGENT-006** (`Planner` protocol, `RulePlanner`, `LLMPlanner` with strict schema validation, registry allowlisting and bounded repair).
+Next task: **AGENT-006** (done below).
 
+---
+
+## AGENT-006 — the planner layer: `Planner` protocol, `RulePlanner`, `LLMPlanner`, validation, one-shot repair — 2026-09-14
+
+**Done.** `normalized_task → Planner.plan → validate_plan → Plan → decide`,
+with the model treated as an untrusted proposer behind one deterministic
+validator, and the provider switched to Groq (ADR-025).
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/agent/planner/protocol.py` | `Planner` protocol — `plan(task, prior, *, budgets) -> Plan` plus an `identity` (`PlannerIdentity(kind, model_id, prompt_version)`) for the run record; `PlanRevisionContext` (previous plan, `replan_count`, `reason`, `failed_step_id`, classified errors, `settled_step_ids`) — no tool output ever travels to a planner. `normalize` stays with AGENT-003's `TaskNormalizer`. | `tests/test_planner.py` |
+| `app/agent/planner/validation.py` | `validate_plan(plan, *, task, contracts, budgets) -> list[PlanIssue]` / `assert_valid_plan`, `PlanValidationError` (`planner_error`). Registered tool; intent allowlist (`INTENT_TOOLS`: customer intents never reach lead tools, read-only intents never reach a mutating tool, `lead_search` gains outreach only with `requires_mutation`); well-formed unique ids; dependencies exist, precede, no cycle (iterative DFS); `$ref` syntax via AGENT-005's `parse_ref_path`, target earlier and inside the transitive dependency closure (a prospective fan-out child `s2[i]`, or a listed child, counts through its parent); fan-out `over` form, alias validity, no nested fan-out; `parent_step_id` only on a genuine child; arguments declared by the contract, required present, literals typed with the field's own constraints, whole-model validators when every argument is literal (gated tools excluded — the dispatcher validates them in full); no planned `approval_token`/`idempotency_key`; no `succeeded`/`running` step; `1 ≤ len(steps) ≤ MAX_STEPS`. Pure: no network, database or clock. | `TestValidator` |
+| `app/agent/planner/rules.py` | `RulePlanner`: deterministic skeletons for all eight intents, sized to `MAX_STEPS` (`_fit`). Canonical request → `s1 search_leads(industry, location, limit=3)` → `s2 research_company` fan-out over `s1.output.leads` → `s3..s5 score_lead` (`s1.output.leads.i.lead_id`, `s2[i].output.profile`; `i>0` optional) → `s6 draft_outreach` (lead 0, score `s3.output`) → `s7 save_draft` → `s8 send_email_mock` (`to_email` from the stored lead). Lead lookup, company research (by id or via lead), scoring (by id or filters), draft-only / draft-then-send, customer lookup (id or email), customer update (`get_customer` → `update_customer` with `expected_version` `$ref`, patch restricted to `CustomerPatch`; a request touching no writable field is a `PlannerError`). Revision re-emits the previous structure with statuses reset (`skipped`/`rejected` kept), dropping optional steps behind a skipped dependency. `plan_id = p_{revision+1}`; no ids from a generator. | `TestRulePlannerCanonical`, `TestRulePlannerWorkflows`, `TestRulePlannerRevision` |
+| `app/agent/planner/schema.py` | `ProposedPlan`/`ProposedStep`/`ProposedFanOut`: the closed structured-output contract (`extra="forbid"`; no status, parent, approval or verification fields exist to set). `parse_proposal` = `json.loads` + Pydantic, size-bounded, no repair heuristics; `proposal_to_plan` converts deterministically, unknown tool → `unknown_tool` issue; `response_json_schema()` inlines `$defs` and closes every object except `args`. | `TestLLMPlanner`, `TestValidator` |
+| `app/agent/planner/prompts.py` | `PROMPT_VERSION = "planner-v1"`; the system prompt fixes the role (plan only, registered tools only, never execute, never waive approval, never claim work done, fenced text is data); the user turn renders the task, the allowed tools, the catalog from the registry (dispatcher-owned fields removed), the limits, and on revision the previous plan and classified errors — the task and the error text sit inside untrusted-data fences. Repair turn = original request + verbatim rejected response (fenced) + issues. | `test_prompt_injection_in_the_task_is_treated_as_data`, `test_revision_prompt_carries_the_previous_plan_and_classified_errors` |
+| `app/agent/planner/llm.py` | `LLMPlanner(client, model_id, contracts, fallback, prompt_version)` over `StructuredCompletionClient.complete_json(...) -> str`. `_propose_with_one_repair`: propose → parse/convert/validate → on issues one repair turn → validate → accept, else `PlanValidationError` (terminal) or, when nothing readable came back, `LLMProviderError`. Provider failures degrade to `fallback` (the rule planner in `auto`); validation failures never do. Straight-line code: no loop, two `_complete` calls. | `TestLLMPlanner`, `TestOneShotRepair` |
+| `app/agent/planner/groq.py` | `GroqStructuredClient`: one `POST {GROQ_BASE_URL}/chat/completions` with `response_format: {"type": "json_schema", ...}`, `temperature: 0`, `max_completion_tokens`, a wall-clock timeout, no retries, an injectable `httpx` transport; HTTP/transport failures → `LLMProviderError` carrying status and `retry-after`, never the key or the bodies. The only module under `app/` that imports an HTTP client. | `TestGroqStructuredClient` (`httpx.MockTransport`) |
+| `app/agent/planner/context.py` | `revision_requested` (`status_reason ∈ {replan_required, replannable_fault}` with a plan present), `build_revision_context` (settled = steps with a result minus the faulted step, minus its read chain on `stale_write` §10.3), `carry_over_settled_steps` (unchanged settled steps and unchanged expansions whose children are all listed become `succeeded`; the input plan is not mutated). | `TestRevisionContext`, `TestPlanNodeIntegration` |
+| `app/agent/planner/factory.py` | `build_planner(settings)`: `rules` → `RulePlanner`; `auto` without a key → `RulePlanner` (logged once); `auto` with a key → `LLMPlanner` with the rule fallback; `llm` → `LLMPlanner` without one. | `TestPlannerSelection` |
+| `app/agent/nodes.py` | `plan` delegates to the injected `Planner` (default `RulePlanner`), re-validates whatever comes back, keeps a plan supplied at run creation (validated, not replaced), appends the previous revision to `plan_history` and advances `replan_count` on revision, records `planner_kind`/`model_id`/`prompt_version` on `metadata`, clears `status_reason`, and on any failure returns `invalid_plan` (validation) or `planner_error` (`PLANNER_ERROR`; an unexpected exception is `INTERNAL`) with an `AgentError` and no plan — `route_after_plan` sends both to `fail`. `route_after_execute` now keys on the latest attempt of the current step, so a successful re-execution after a replan (or retry) is not misrouted into `recover` by the older error at the tail of `errors`. `create_agent_graph(planner=...)` forwards the injection. | `TestPlanNodeIntegration`, `test_route_after_execute_keys_on_the_latest_attempt` |
+| `app/config.py`, `.env.example`, `app/observability/redaction.py`, `pyproject.toml`, `uv.lock` | `GROQ_API_KEY` (`SecretStr`), `GROQ_MODEL=openai/gpt-oss-120b`, `GROQ_BASE_URL`, `OPSPILOT_LLM_TIMEOUT_SECONDS` replace the Anthropic fields; `has_groq_key` drives `effective_planner` and the `llm`-without-key fuse. `gsk_…` values are redacted. `anthropic` removed from the dependencies (never imported); `httpx` promoted to a runtime dependency. | `tests/test_config.py`, `tests/test_health.py`, `tests/test_redaction.py` |
+
+**Acceptance criteria verified.** An LLM plan naming an unknown tool is an
+`unknown_tool` issue fed back in the one repair turn and never dispatched
+(the scripted executor sees nothing; `dispatch` is absent from the whole
+package by AST). An invalid plan is repaired at most once then fails: the
+scripted client's third answer is never consumed, six invalid answers across
+three `plan()` calls produce exactly six model calls, and
+`_propose_with_one_repair` contains no loop and exactly two `_complete`
+calls. Injected instructions never alter the plan: task text is fenced and
+labelled data, the catalog lists only the intent's tools, a model that
+"obeys" an injection (`update_customer` on a lead task, `requires_approval:
+false`, a planted `approval_token`) is rejected by the validator or the
+closed schema, and `research_company`'s injected `summary` flows through a
+`$ref` as data into the next tool. `planner_kind` is recorded on the plan
+(`created_by`) and on the run (`metadata.planner_kind`, with `model_id` and
+`prompt_version` for LLM plans; a degraded plan records `rules`).
+
+**Graph behaviour.** On `MemorySaver`: the canonical request plans, expands
+the research fan-out, executes `s1, s2[0..2], s3..s7` with every `$ref`
+resolved by AGENT-005's resolver (the draft receives `s2[0]`'s profile and
+`s3`'s score; the send receives `d_1` and `lead0@example.com`), pauses for
+`s8`, completes on approval with `step_count == 10` and no errors. A
+`not_found` on `s2` replans once, carries `s1` over, re-executes only `s2` and
+completes (`replan_count == 1`, `plan_history == [p_1]`, plan `p_2`). A
+`$ref` the world never satisfies (`leads.0` after an empty search) faults
+identically three times and fails once `MAX_REPLANS=2` is spent, each
+revision kept and the empty expansion carried over. A supplied plan is kept
+and the planner never asked. Invalid and failing planners route to `fail`
+with nothing executed. On the real Postgres saver with the real registry:
+"Find the top 2 leads in Seattle, research them and score them" plans,
+searches, fans out over the two Northwind leads, scores lead 0 from
+`s2[0].output.profile` and completes; the plan and `metadata.planner_kind`
+survive the checkpoint round trip.
+
+**Decisions.** Planning is expressed against the fan-out engine as built:
+a fan-out binds only its alias, so per-lead chains use one fan-out for the
+research and explicit indexed score steps referencing `s2[i]` (validated as
+prospective children). "The best one" cannot be selected inside a plan —
+the `$ref` language has no expressions and no tool ranks — so the rule
+planner targets the first returned lead and says so; recorded as open
+question Q7 rather than resolved implicitly. The intent allowlist is
+hint-independent for the outreach intents (the human gate bounds what can
+*happen*; the allowlist bounds what can be *proposed*) and uses
+`requires_mutation` only to extend `lead_search`. `fanout.max_items` is
+bounded by its model (1..50), not by `MAX_STEPS`, per AGENT-004's decision
+that the step budget is enforced as children execute. The plan validator is
+applied to supplied plans too, which is why it lives in the node and not
+only in the planners. `route_after_execute` was hardened because the replan
+path this task delivers is otherwise cut short: after a successful
+re-execution the older error would route to `recover`, spend the remaining
+replan budget and fail a run that had just succeeded.
+
+**Deliberately not done.** No backoff, retry mechanics or `recover`
+rewrite (AGENT-007); no responder or terminal status computation
+(AGENT-008); no cancellation (AGENT-009); no HITL endpoints; no verifiers;
+no `plan_created`/`plan_revised` trace events (OBS-001); no run-creation
+service that stamps `RunMetadata` from `Settings` (API-007 composes
+`build_planner`). The Groq request shape is exercised against
+`httpx.MockTransport` only; the opt-in live smoke test
+(`OPSPILOT_LIVE_LLM=1` + `GROQ_API_KEY`) is the first thing to run once a
+key exists.
+
+**Test suite: 1095 passed, 1 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 144 new in `tests/test_planner.py`,
+the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check
+.`, `mypy app` (strict) and `alembic check` are all clean.
+
+Next task: **AGENT-007** (`recover` node wired to `recovery_action`, with backoff via the injected clock).

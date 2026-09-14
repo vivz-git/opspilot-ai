@@ -64,7 +64,7 @@ make seed                     # load the mock CRM   (available after TOOL-001)
 make up-full                  # adds the dashboard  (available after FE-001)
 ```
 
-**No `ANTHROPIC_API_KEY` is required.** Leave it blank and the agent uses the
+**No `GROQ_API_KEY` is required.** Leave it blank and the agent uses the
 deterministic rule planner (`OPSPILOT_PLANNER=auto`). Set it to get
 LLM-generated plans and outreach copy. Nothing else changes.
 
@@ -111,7 +111,7 @@ independently verified.
 ## Stack
 
 **Backend** Python 3.12 · FastAPI · LangGraph (Postgres checkpointer) ·
-Pydantic v2 · SQLAlchemy 2 async · Anthropic API
+Pydantic v2 · SQLAlchemy 2 async · Groq API (`openai/gpt-oss-120b`)
 **Frontend** Next.js 15 · TypeScript · Tailwind · shadcn/ui
 **Data** PostgreSQL 16 — three schemas: control plane, LangGraph runtime,
 simulated system of record

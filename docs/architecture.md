@@ -135,7 +135,7 @@ justification for most of the decisions in this document.
 │                  └───────┘  └─ request_approval  └─ recover ──→ fail      │
 │                                                                           │
 │   collaborators (injected, never imported ad hoc):                        │
-│     Planner   rules | llm ──────────────────→ Anthropic API               │
+│     Planner   rules | llm ──────────────────→ Groq API (gpt-oss-120b)     │
 │     ToolRegistry ── typed contracts ── policy (approval/verify/mutating)  │
 │     TraceRecorder ─ append-only events                                    │
 │     Checkpointer ── LangGraph Postgres saver (durable pause/resume)       │
@@ -322,7 +322,7 @@ The agent is five layers, and dependencies point downward only.
 
 Two consequences worth stating as rules:
 
-- **Only the reasoning layer may call Anthropic.** A node that both reasons and
+- **Only the reasoning layer may call the LLM provider.** A node that both reasons and
   orchestrates cannot be unit-tested without a network, so it will not be
   tested. Nodes take a `Planner` protocol; tests inject a scripted one.
 - **Nodes are thin.** A node reads state, calls **one** collaborator, and returns
@@ -349,9 +349,14 @@ backend/app/
     impl/                     tool implementations over ports                (TOOL-003)
   agent/
     state.py         [built]  AgentState, its models and its reducers
-    graph.py                  graph assembly and conditional edges           (AGENT-002)
-    nodes/                    one module per node                            (AGENT-003+)
-    planner/                  RulePlanner | LLMPlanner behind one Protocol   (AGENT-006)
+    graph.py         [built]  graph assembly and conditional edges           (AGENT-002)
+    nodes.py         [built]  the nine node handlers and conditional routers (AGENT-002+)
+    normalizer.py    [built]  TaskNormalizer protocol + RuleTaskNormalizer   (AGENT-003)
+    decide.py        [built]  the safety router; fanout.py the expansion     (AGENT-004)
+    resolver.py      [built]  `$ref` resolution against the artifact store   (AGENT-005)
+    planner/         [built]  RulePlanner | LLMPlanner behind one Protocol   (AGENT-006)
+      validation.py  [built]  the deterministic plan validator (registry allowlist)
+      groq.py        [built]  the only provider transport: Groq, OpenAI-compatible
     verifiers/                invariant and readback verifiers               (VERIFY-001)
   integrations/
     ports.py         [built]  Protocols; mutating methods require a token    (TOOL-001)
@@ -379,11 +384,15 @@ class Planner(Protocol):
 | Implementation | When | Why it exists |
 |---|---|---|
 | `RulePlanner` | `OPSPILOT_PLANNER=rules`, or `auto` with no API key | Deterministic. Makes evaluation meaningful, CI keyless, and local development free. Pattern-matches intent and emits the canonical plan skeleton. |
-| `LLMPlanner` | `OPSPILOT_PLANNER=llm`, or `auto` with a key | Real generality. Calls Anthropic with the tool catalog and a strict output schema. |
+| `LLMPlanner` | `OPSPILOT_PLANNER=llm`, or `auto` with a key | Real generality. Calls the LLM provider — Groq's OpenAI-compatible API, model `openai/gpt-oss-120b` (ADR-025) — with the tool catalog and a strict JSON-schema structured output. |
 
 `auto` is the default because a contributor who has not obtained an API key must
 still be able to run the entire system end to end. This is a requirement, not a
-convenience: the evaluation suite (§15) depends on it.
+convenience: the evaluation suite (§15) depends on it. In `auto` mode the LLM
+planner also carries the rule planner as an in-run fallback: a provider failure
+(unreachable, throttled, or no readable plan after the one repair) is a
+`PLANNER_ERROR` that degrades to a rule plan for that revision (§10.1); a plan
+that is *invalid* after the repair is terminal in every mode.
 
 **The LLM is untrusted structurally.** Its output is parsed into `Plan` by
 Pydantic and then validated against the registry: unknown tool → rejected;
@@ -391,6 +400,23 @@ arguments failing the tool's input schema → rejected; step count over budget �
 rejected. A rejected plan is one bounded repair attempt (the validation error is
 fed back), then terminal failure. The LLM therefore cannot invent a capability,
 only select among declared ones (§16.3).
+
+The validator (`app/agent/planner/validation.py`) is one deterministic function
+applied to every plan the `plan` node accepts, whichever planner produced it —
+or a plan supplied at run creation. It checks: every tool is registered and
+allowed for the task's intent (customer intents never reach lead tools, read-only
+intents never reach a mutating tool); step ids are well-formed and unique;
+dependencies exist, precede the step and form no cycle; every `$ref` parses,
+names an earlier step (or a prospective child `s2[i]` of an earlier fan-out) that
+is among the step's transitive dependencies; fan-outs iterate an earlier step's
+`output` with a distinct alias; arguments are declared by the contract, required
+ones are present, literal ones type-check against the input model (whole-model
+validators run when every argument is literal); no step plans `approval_token`
+or `idempotency_key`; no step is `succeeded`/`running` (a plan describes work to
+do); and `len(steps) ≤ MAX_STEPS`. Approval and verification are not plan fields
+at all — they are contract facts — so a model cannot waive them: the structured
+output schema is closed (`extra="forbid"`), and a response carrying
+`requires_approval`, `status` or any other undeclared key is schema-invalid.
 
 ### 4.3 Plan representation
 
@@ -911,7 +937,7 @@ field from a planner or an adapter is an error, not a silent pass-through.
   the tool is nondeterministic**, unlike every other tool)
 - **Verification** INVARIANT as above, plus `content_hash` matches `body`
 - **Note on layering** This is the one tool that reaches the reasoning layer. It
-  does so through `ContentPort`, whose two implementations are an Anthropic
+  does so through `ContentPort`, whose two implementations are an LLM-backed
   generator and a deterministic template generator. The tool itself contains no
   prompt and no API client, so the "only the reasoning layer calls the LLM" rule
   (§4.1) holds.
@@ -1894,7 +1920,7 @@ Applied in the recorder, before anything is persisted or logged:
 
 1. **Key denylist** — any key matching `api_key|token|secret|password|
    authorization|credential` (case-insensitive, recursive) → `"[redacted]"`.
-2. **Value patterns** — Anthropic-style keys and bearer tokens → `"[redacted]"`.
+2. **Value patterns** — provider-style API keys (`gsk_…`, `sk-ant-…`) and bearer tokens → `"[redacted]"`.
 3. **Truncation** — payloads over `OPSPILOT_TRACE_PAYLOAD_MAX_BYTES` (16 KiB)
    are truncated with `{"_truncated": true, "_original_bytes": n}` so the
    timeline shows that data was elided rather than absent.
@@ -2203,14 +2229,14 @@ This repository is public. Therefore:
 `backend/app/config.py` exposes a single `Settings` (pydantic-settings) built
 from environment variables with `.env` support. **No other module reads
 `os.environ`.** This is enforced by a test that greps the package (§18.6), not
-by convention, because a stray `os.getenv("ANTHROPIC_API_KEY")` is exactly the
+by convention, because a stray `os.getenv("GROQ_API_KEY")` is exactly the
 kind of thing that ends up in a log line.
 
 Precedence: process environment → `.env` → declared defaults.
 
 ### 17.2 Secret handling
 
-- Secret-typed fields (`ANTHROPIC_API_KEY`, `POSTGRES_PASSWORD`, the password
+- Secret-typed fields (`GROQ_API_KEY`, `POSTGRES_PASSWORD`, the password
   inside `DATABASE_URL`) are `SecretStr`; their `repr` is `**********`.
 - `Settings` has a `safe_dump()` for logging that omits every secret field, and
   the startup banner logs only that.
@@ -2227,7 +2253,7 @@ start on:
 
 | Condition | Reason |
 |---|---|
-| `OPSPILOT_PLANNER=llm` with no `ANTHROPIC_API_KEY` | Explicitly requesting the LLM planner without a key is a misconfiguration, not something to silently degrade |
+| `OPSPILOT_PLANNER=llm` with no `GROQ_API_KEY` | Explicitly requesting the LLM planner without a key is a misconfiguration, not something to silently degrade |
 | `OPSPILOT_INTEGRATIONS=real` | No real adapter exists; refusing beats a half-wired external call (§19.4) |
 | `OPSPILOT_ENV=production` and no auth mode | §16.6 fuse |
 | `OPSPILOT_ENV=production` and a placeholder password inside `DATABASE_URL` | §16.6 fuse. It checks the URL the app actually connects with — compose composes `POSTGRES_PASSWORD` into it, so one check covers both deployment shapes |
@@ -2257,7 +2283,7 @@ complete list of manual actions, also in `docs/handoff.md`:
 
 | Blocker | Needed for | Without it |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | `OPSPILOT_PLANNER=llm`, LLM-generated drafts and prose | Everything still runs: rule planner, template drafts, all 9 tools, approvals, verification, evals, dashboard. **No feature is unreachable except LLM-quality text.** |
+| `GROQ_API_KEY` | `OPSPILOT_PLANNER=llm`, LLM-generated plans, drafts and prose | Everything still runs: rule planner, template drafts, all 9 tools, approvals, verification, evals, dashboard. **No feature is unreachable except LLM-quality text.** |
 | A deployment target | Hosting beyond local Docker | Not required; local `docker compose` is the supported environment |
 | A real CRM / ESP account | Future real integrations | Not required and not wired (§19) |
 

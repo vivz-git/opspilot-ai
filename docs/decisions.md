@@ -65,7 +65,7 @@ verification.
 evaluation meaningless and makes the system unrunnable without a paid key.
 
 **Decision.** One `Planner` protocol, two implementations. `OPSPILOT_PLANNER=auto`
-(default) uses the LLM when `ANTHROPIC_API_KEY` is present and the rule planner
+(default) uses the LLM when the provider key (`GROQ_API_KEY`, ADR-025) is present and the rule planner
 otherwise; `llm` and `rules` force the choice. `planner_kind` is recorded on
 every run.
 
@@ -581,6 +581,41 @@ retry recorded as a failure.
 
 ---
 
+## ADR-025
+### The LLM provider is Groq (`openai/gpt-oss-120b`) behind a one-method client
+
+**Context.** ADR-002 needs a real model for `OPSPILOT_PLANNER=llm`. The
+architecture was drafted against Anthropic; no runtime integration was ever
+built, and the project's intended runtime provider is Groq, whose
+OpenAI-compatible API offers JSON-schema structured outputs for
+`openai/gpt-oss-120b`.
+
+**Decision.** Groq is the provider, `openai/gpt-oss-120b` the model, configured
+as `GROQ_API_KEY` / `GROQ_MODEL` / `GROQ_BASE_URL` on `Settings` (the only
+environment reader). The planner never sees the provider: `LLMPlanner` takes a
+`StructuredCompletionClient` with one method, `complete_json(system, user,
+schema_name, schema) -> str`, and `app/agent/planner/groq.py` is the only
+module in the application that imports an HTTP client or talks to a model.
+The request asks for `response_format: json_schema` against the closed
+`ProposedPlan` schema at temperature 0, with a wall-clock timeout, no retries and
+no logging of bodies; the key lives in one header and never in an exception,
+log line or trace (a `gsk_…` value pattern was added to §14.5 redaction).
+
+**Consequences.** Swapping provider or model is a settings change plus, at most,
+one new transport module implementing the same protocol; nothing in planning,
+validation or the graph changes. The `anthropic` package left the dependency
+set (it was never imported); `httpx`, already present, is the transport. Tests
+drive the planner through a scripted client and the transport through
+`httpx.MockTransport`; the live provider is exercised only by an opt-in smoke
+test (`OPSPILOT_LIVE_LLM=1`), so the gate stays keyless and deterministic.
+
+**Alternatives rejected.** The vendor SDKs (`groq`, `openai`): a second retry
+policy and a much larger surface for one POST. Anthropic as the runtime
+provider: not the project's intended provider, and structured JSON-schema
+output is what makes "a plan or a rejection" cheap to enforce.
+
+---
+
 ## Open questions
 
 Recorded rather than guessed. None blocks the current backlog.
@@ -593,3 +628,4 @@ Recorded rather than guessed. None blocks the current backlog.
 | Q4 | Should the LLM planner be allowed to propose a tool sequence the rule planner cannot express, and how is that evaluated? | ADR-002, EVAL | Allowed at runtime; evaluated only in the non-gating LLM suite. |
 | Q5 | What is the retention policy for `mock_crm.email_outbox`? | DB-004, OBS-004 | Unbounded for now; it is fixture-scale data. |
 | Q6 | Should approvals be assignable to a specific operator (queue ownership)? | HITL, ADR-017 | No. Needs identity first. |
+| Q7 | How does a plan target "the best one" when the `$ref` language has no expressions (ADR-003) and no tool selects or ranks? | AGENT-006, ADR-003, EVAL `lead_ranking` | The rule planner scores every lead but drafts and sends to the first returned lead, and says so in the step's rationale. Selecting by score needs either a deterministic selection tool (`select_lead`, ranking `score_lead` outputs) or a mid-run plan continuation; either is an ADR, not a planner tweak. |

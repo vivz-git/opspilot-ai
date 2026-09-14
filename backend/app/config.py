@@ -2,7 +2,7 @@
 
 `Settings` is the only place in the application that reads the environment.
 `tests/test_structure.py` asserts that no other module touches `os.environ`,
-because a stray `os.getenv("ANTHROPIC_API_KEY")` is exactly the kind of thing
+because a stray `os.getenv("GROQ_API_KEY")` is exactly the kind of thing
 that ends up in a log line.
 """
 
@@ -50,10 +50,15 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore", case_sensitive=False
     )
 
-    # --- Anthropic -------------------------------------------------------
-    anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(default="claude-sonnet-5", validation_alias="ANTHROPIC_MODEL")
-    anthropic_base_url: str | None = Field(default=None, validation_alias="ANTHROPIC_BASE_URL")
+    # --- LLM provider: Groq, OpenAI-compatible API (§4.2, ADR-025) ------
+    groq_api_key: SecretStr | None = Field(default=None, validation_alias="GROQ_API_KEY")
+    groq_model: str = Field(default="openai/gpt-oss-120b", validation_alias="GROQ_MODEL")
+    groq_base_url: str = Field(
+        default="https://api.groq.com/openai/v1", validation_alias="GROQ_BASE_URL"
+    )
+    llm_timeout_seconds: float = Field(
+        default=60.0, gt=0, le=600, validation_alias="OPSPILOT_LLM_TIMEOUT_SECONDS"
+    )
 
     # --- Agent behaviour -------------------------------------------------
     planner: PlannerMode = Field(default=PlannerMode.AUTO, validation_alias="OPSPILOT_PLANNER")
@@ -121,8 +126,8 @@ class Settings(BaseSettings):
 
     # --- Derived ---------------------------------------------------------
     @property
-    def has_anthropic_key(self) -> bool:
-        return bool(self.anthropic_api_key and self.anthropic_api_key.get_secret_value())
+    def has_groq_key(self) -> bool:
+        return bool(self.groq_api_key and self.groq_api_key.get_secret_value())
 
     @property
     def effective_planner(self) -> PlannerKind:
@@ -132,7 +137,7 @@ class Settings(BaseSettings):
             return PlannerKind.RULES
         if self.planner is PlannerMode.LLM:
             return PlannerKind.LLM
-        return PlannerKind.LLM if self.has_anthropic_key else PlannerKind.RULES
+        return PlannerKind.LLM if self.has_groq_key else PlannerKind.RULES
 
     @property
     def database_password(self) -> str | None:
@@ -188,9 +193,9 @@ class Settings(BaseSettings):
         """
         problems: list[str] = []
 
-        if self.planner is PlannerMode.LLM and not self.has_anthropic_key:
+        if self.planner is PlannerMode.LLM and not self.has_groq_key:
             problems.append(
-                "OPSPILOT_PLANNER=llm requires ANTHROPIC_API_KEY "
+                "OPSPILOT_PLANNER=llm requires GROQ_API_KEY "
                 "(use 'auto' to degrade to the rule planner instead)"
             )
 

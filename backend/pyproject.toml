@@ -25,7 +25,7 @@ dependencies = [
   # --- Agent runtime ---
   "langgraph>=0.2.50",
   "langgraph-checkpoint-postgres>=2.0",   # durable pause/resume for HITL
-  "anthropic>=0.40",
+  "httpx>=0.27",                   # Groq (OpenAI-compatible) planner transport, §4.2
   # --- Persistence ---
   "sqlalchemy[asyncio]>=2.0",
   "alembic>=1.14",

@@ -159,8 +159,8 @@ class TestStartupLogging:
     def test_startup_logs_safe_settings_with_no_secret(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        secret = "sk-ant-test-not-a-real-credential"  # noqa: S105 - test fixture, not a real key
-        app = create_app(settings=settings(ANTHROPIC_API_KEY=secret))
+        secret = "gsk_test_not_a_real_credential_value"  # noqa: S105 - test fixture, not a real key
+        app = create_app(settings=settings(GROQ_API_KEY=secret))
         with TestClient(app):
             pass
         out = capsys.readouterr().out
@@ -177,7 +177,7 @@ class TestStartupLogging:
         startup_events = [e for e in events if e.get("event") == "startup"]
         assert startup_events, f"expected a structured startup log line, got: {out!r}"
         payload = startup_events[0]
-        assert "anthropic_api_key" not in payload
+        assert "groq_api_key" not in payload
         assert "database_url" not in payload
         assert "postgres_password" not in payload
 

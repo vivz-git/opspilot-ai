@@ -16,6 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.agent.nodes import NodeHandlers
 from app.agent.normalizer import TaskNormalizer
+from app.agent.planner import Planner
 from app.agent.state import AgentState, PlanStep
 from app.persistence.protocols import UnitOfWorkFactory
 from app.runtime import Clock, IdGenerator
@@ -34,6 +35,7 @@ def create_agent_graph(
     clock: Clock | None = None,
     id_gen: IdGenerator | None = None,
     normalizer: TaskNormalizer | None = None,
+    planner: Planner | None = None,
     arg_resolver: Callable[[AgentState, PlanStep], dict[str, Any]] | None = None,
     node_handlers: NodeHandlers | None = None,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
@@ -44,6 +46,7 @@ def create_agent_graph(
         clock=clock,
         id_gen=id_gen,
         normalizer=normalizer,
+        planner=planner,
         arg_resolver=arg_resolver,
     )
 

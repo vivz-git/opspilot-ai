@@ -16,6 +16,15 @@ from langgraph.types import interrupt
 
 from app.agent.decide import Decision, evaluate_decision
 from app.agent.normalizer import RuleTaskNormalizer, TaskNormalizer
+from app.agent.planner import (
+    Planner,
+    PlanValidationError,
+    RulePlanner,
+    build_revision_context,
+    carry_over_settled_steps,
+    revision_requested,
+    validate_plan,
+)
 from app.agent.resolver import resolve_step_args
 from app.agent.state import (
     AgentError,
@@ -37,6 +46,7 @@ from app.agent.state import (
 from app.errors import (
     ErrorClass,
     InputValidationError,
+    PlannerError,
     PolicyViolation,
     RecoveryAction,
     recovery_action,
@@ -49,10 +59,21 @@ from app.tools.registry import ApprovalRequiredError, ToolRegistry
 
 __all__ = [
     "NodeHandlers",
+    "PLANNING_FAILURE_REASONS",
+    "STATUS_REASON_INVALID_PLAN",
+    "STATUS_REASON_PLANNER_ERROR",
     "create_initial_state",
 ]
 
 _log = structlog.get_logger("opspilot.agent.nodes")
+
+#: `plan` could not produce an acceptable plan: it failed deterministic
+#: validation (after the planner's one bounded repair), or the planner itself
+#: failed. Both route to `fail` (§7 `plan`: "fails invalid after one bounded
+#: repair attempt").
+STATUS_REASON_INVALID_PLAN = "invalid_plan"
+STATUS_REASON_PLANNER_ERROR = "planner_error"
+PLANNING_FAILURE_REASONS = frozenset({STATUS_REASON_INVALID_PLAN, STATUS_REASON_PLANNER_ERROR})
 
 
 def create_initial_state(
@@ -104,6 +125,7 @@ class NodeHandlers:
         clock: Clock | None = None,
         id_gen: IdGenerator | None = None,
         normalizer: TaskNormalizer | None = None,
+        planner: Planner | None = None,
         token_issuer: Callable[[str, str, dict[str, Any]], ApprovalToken | None] | None = None,
         arg_resolver: Callable[[AgentState, PlanStep], dict[str, Any]] | None = None,
         understand_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
@@ -116,6 +138,7 @@ class NodeHandlers:
         self._clock = clock or SystemClock()
         self._id_gen = id_gen or UuidIdGenerator()
         self._normalizer = normalizer or RuleTaskNormalizer()
+        self._planner: Planner = planner or RulePlanner()
         self._token_issuer = token_issuer
         self._arg_resolver = arg_resolver
         self._understand_handler = understand_handler
@@ -165,22 +188,87 @@ class NodeHandlers:
     # 2. plan
     # ---------------------------------------------------------------------------
     async def plan(self, state: AgentState) -> dict[str, Any]:
+        """Delegate to the injected `Planner`, then validate deterministically (§7).
+
+        Three entries, one contract: no plan yet → plan the task; a plan plus
+        a revision request from `decide`/`recover` → revise it (the previous
+        revision is kept in `plan_history`, `replan_count` advances); a plan
+        with no revision request → it was supplied at run creation and is
+        validated, not replaced. No tool runs here, and no plan is fabricated:
+        a planner failure is recorded and routed to `fail`.
+        """
         if self._plan_handler is not None:
             return await self._plan_handler(state)
-        existing_plan = state.get("plan")
-        if existing_plan is not None:
-            replan_count = state.get("replan_count", 0) + 1
-            return {
-                "plan": existing_plan,
-                "plan_history": [existing_plan],
-                "replan_count": replan_count,
-            }
-        meta_extra = state.get("metadata", RunMetadata()).extra
-        if "plan" in meta_extra and isinstance(meta_extra["plan"], Plan):
-            return {"plan": meta_extra["plan"], "replan_count": 0}
-        plan_id = f"p_{self._id_gen.new_id()[:8]}"
-        new_plan = Plan(plan_id=plan_id, revision=0, steps=[])
-        return {"plan": new_plan, "replan_count": 0}
+        task = state.get("normalized_task")
+        existing = state.get("plan")
+        metadata = state.get("metadata") or RunMetadata()
+        budgets = metadata.budgets
+        revising = existing is not None and revision_requested(state)
+        prior = build_revision_context(state, existing) if revising and existing else None
+        try:
+            if task is None or not task.in_scope:
+                raise PlannerError("plan requires an in-scope normalized task")
+            if existing is not None and prior is None:
+                candidate = existing
+            else:
+                candidate = await self._planner.plan(task, prior, budgets=budgets)
+            issues = validate_plan(candidate, task=task, contracts=REGISTRY, budgets=budgets)
+            if issues:
+                raise PlanValidationError(issues)
+        except Exception as exc:  # every planner failure is classified below
+            return self._planning_failure(exc, existing, revising, state)
+
+        accepted = carry_over_settled_steps(candidate, prior) if prior is not None else candidate
+        identity = self._planner.identity
+        is_llm = accepted.created_by is identity.kind and identity.model_id is not None
+        delta: dict[str, Any] = {
+            "plan": accepted,
+            "status_reason": None,
+            "metadata": metadata.model_copy(
+                update={
+                    "planner_kind": accepted.created_by,
+                    "model_id": identity.model_id if is_llm else None,
+                    "prompt_version": (
+                        identity.prompt_version
+                        if is_llm and identity.prompt_version
+                        else metadata.prompt_version
+                    ),
+                }
+            ),
+        }
+        if revising and existing is not None:
+            delta["plan_history"] = [existing]
+            delta["replan_count"] = state.get("replan_count", 0) + 1
+        return delta
+
+    def _planning_failure(
+        self, exc: Exception, existing: Plan | None, revising: bool, state: AgentState
+    ) -> dict[str, Any]:
+        if isinstance(exc, PlanValidationError):
+            reason, error_class = STATUS_REASON_INVALID_PLAN, ErrorClass.PLANNER_ERROR
+        elif isinstance(exc, PlannerError):
+            reason, error_class = STATUS_REASON_PLANNER_ERROR, ErrorClass.PLANNER_ERROR
+        else:
+            reason, error_class = STATUS_REASON_PLANNER_ERROR, ErrorClass.INTERNAL
+        detail = dict(getattr(exc, "detail", {}) or {})
+        _log.warning("plan_failed", reason=reason, error_class=error_class.value, message=str(exc))
+        delta: dict[str, Any] = {
+            "status_reason": reason,
+            "errors": [
+                AgentError(
+                    step_id=None,
+                    error_class=error_class,
+                    message=str(exc),
+                    recovery=RecoveryAction.FAIL,
+                    detail=detail,
+                    occurred_at=self._clock.now(),
+                )
+            ],
+        }
+        if revising and existing is not None:
+            delta["plan_history"] = [existing]
+            delta["replan_count"] = state.get("replan_count", 0) + 1
+        return delta
 
     def route_after_plan(self, state: AgentState) -> str:
         budgets = state.get("metadata", RunMetadata()).budgets
@@ -188,7 +276,7 @@ class NodeHandlers:
         if replan_count > budgets.max_replans:
             return "fail"
         plan_obj = state.get("plan")
-        if plan_obj is None or state.get("status_reason") == "invalid_plan":
+        if plan_obj is None or state.get("status_reason") in PLANNING_FAILURE_REASONS:
             return "fail"
         return "decide"
 
@@ -510,7 +598,14 @@ class NodeHandlers:
     def route_after_execute(self, state: AgentState) -> str:
         current_step_id = state.get("current_step_id")
         errors = state.get("errors", [])
-        if errors and errors[-1].step_id == current_step_id:
+        tool_calls = state.get("tool_calls", [])
+        # The attempt just made decides the route. A step re-executed after a
+        # retry or a replan still has its earlier failure at the tail of
+        # `errors`; only when no newer successful attempt of the same step
+        # exists is that failure the current one.
+        last_attempt = next((c for c in reversed(tool_calls) if c.step_id == current_step_id), None)
+        succeeded_now = last_attempt is not None and last_attempt.status == "succeeded"
+        if errors and errors[-1].step_id == current_step_id and not succeeded_now:
             return "recover"
 
         plan = state.get("plan")
