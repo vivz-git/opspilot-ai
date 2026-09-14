@@ -22,7 +22,7 @@ contract spine ████████████████████  com
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
-agent graph    ████░░░░░░░░░░░░░░░░  AGENT-001, AGENT-002 done; 003..009 outstanding
+agent graph    ██████░░░░░░░░░░░░░░  AGENT-001..003 done; 004..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
@@ -1067,6 +1067,23 @@ are all clean.
 `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check`
 are all clean.
 
-Next task: **AGENT-003** (`understand` node: `NormalizedTask`, out-of-scope rejection) — SONNET.
+## AGENT-003 — production `understand` node and deterministic `RuleTaskNormalizer` — 2026-09-14
+
+**Done.** Deterministic task understanding engine and production `understand` node delegating to an injected `TaskNormalizer` protocol. Zero external I/O, pure and reproducible. Canonical request produces `industry='fintech'`, `location='London'`, `limit=3'`, `requires_mutation=True`, `in_scope=True`, and canonical intent `prospect_and_outreach`.
+
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/agent/normalizer.py` | `TaskNormalizer` protocol, `CanonicalIntent` taxonomy (`prospect_and_outreach`, `lead_search`, `lead_lookup`, `company_research`, `lead_scoring`, `draft_outreach`, `customer_lookup`, `customer_update`, `out_of_scope`), and pure deterministic `RuleTaskNormalizer`. Extracts industry, location, limit, lead/company/customer IDs, email, and customer patch fields. Evaluates `requires_mutation`. Treats prompt injections strictly as data. Rejects off-domain, destructive, admin, unsupported CRM operations, empty, and gibberish queries early with `in_scope=False`, `confidence=0.0`, and stable rejection notes. | `tests/test_understand.py` |
+| `app/agent/nodes.py` | Updated `NodeHandlers.__init__` to accept `normalizer: TaskNormalizer | None = None` (defaulting to `RuleTaskNormalizer()`). Implemented `understand` node to delegate normalization when `normalized_task` is absent, setting `status=RunStatus.RUNNING` and `status_reason="out_of_scope"` for out-of-scope requests to route cleanly via `route_after_understand` to `fail -> END`. | `tests/test_understand.py`, `tests/test_agent_graph.py` |
+| `app/agent/graph.py` | Added optional `normalizer: TaskNormalizer | None = None` parameter to `create_agent_graph` factory forwarding directly to `NodeHandlers`. | `tests/test_understand.py` |
+| `tests/test_understand.py` | 32 comprehensive tests covering the canonical request, entity extraction (industry, location, limit, UUIDs, IDs, emails, field updates), mutation detection, supported taxonomy, empty/whitespace/gibberish rejection, destructive/admin rejection, prompt-injection safety, determinism across repeated executions, graph routing (`in_scope -> plan`, `out_of_scope -> fail -> END` with `status_reason="out_of_scope"` and zero tool/plan calls), real PostgreSQL checkpointer persistence, and AST structural purity invariants (no port/mock/sql imports). | `tests/test_understand.py` |
+
+**Test suite: 690 passed, 0 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 32 new tests in `test_understand.py`).
+`ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check`
+are all clean.
+
+Next task: **AGENT-004** (`decide` router: the seven ordered rules plus fan-out expansion) — **OPUS 5**.
+
 
 

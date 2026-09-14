@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 from langgraph.types import interrupt
 
+from app.agent.normalizer import RuleTaskNormalizer, TaskNormalizer
 from app.agent.state import (
     AgentError,
     AgentState,
@@ -21,7 +22,6 @@ from app.agent.state import (
     ApprovalDecisionKind,
     ApprovalState,
     FinalResponse,
-    NormalizedTask,
     Plan,
     PlanStep,
     RunMetadata,
@@ -100,6 +100,7 @@ class NodeHandlers:
         uow_factory: UnitOfWorkFactory | None = None,
         clock: Clock | None = None,
         id_gen: IdGenerator | None = None,
+        normalizer: TaskNormalizer | None = None,
         token_issuer: Callable[[str, str, dict[str, Any]], ApprovalToken | None] | None = None,
         arg_resolver: Callable[[AgentState, PlanStep], dict[str, Any]] | None = None,
         understand_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
@@ -111,6 +112,7 @@ class NodeHandlers:
         self._uow_factory = uow_factory
         self._clock = clock or SystemClock()
         self._id_gen = id_gen or UuidIdGenerator()
+        self._normalizer = normalizer or RuleTaskNormalizer()
         self._token_issuer = token_issuer
         self._arg_resolver = arg_resolver
         self._understand_handler = understand_handler
@@ -191,11 +193,7 @@ class NodeHandlers:
         task = state.get("normalized_task")
         if task is None:
             user_req = state.get("user_request", "")
-            in_scope = (
-                "out of scope" not in user_req.lower()
-                and state.get("status_reason") != "out_of_scope"
-            )
-            task = NormalizedTask(intent=user_req, in_scope=in_scope)
+            task = await self._normalizer.normalize(user_req)
         return {
             "normalized_task": task,
             "status": RunStatus.RUNNING,

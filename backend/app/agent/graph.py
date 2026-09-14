@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.agent.nodes import NodeHandlers
+from app.agent.normalizer import TaskNormalizer
 from app.agent.state import AgentState
 from app.persistence.protocols import UnitOfWorkFactory
 from app.runtime import Clock, IdGenerator
@@ -31,6 +32,7 @@ def create_agent_graph(
     uow_factory: UnitOfWorkFactory | None = None,
     clock: Clock | None = None,
     id_gen: IdGenerator | None = None,
+    normalizer: TaskNormalizer | None = None,
     node_handlers: NodeHandlers | None = None,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
     """Assemble and compile the production LangGraph agent graph (§6.1)."""
@@ -39,6 +41,7 @@ def create_agent_graph(
         uow_factory=uow_factory,
         clock=clock,
         id_gen=id_gen,
+        normalizer=normalizer,
     )
 
     builder: StateGraph[AgentState] = StateGraph(AgentState)
