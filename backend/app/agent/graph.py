@@ -7,7 +7,7 @@ and enforces dynamic `interrupt()` in `request_approval` with empty static inter
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -19,7 +19,7 @@ from app.agent.normalizer import TaskNormalizer
 from app.agent.planner import Planner
 from app.agent.state import AgentState, PlanStep
 from app.persistence.protocols import UnitOfWorkFactory
-from app.runtime import Clock, IdGenerator
+from app.runtime import Clock, IdGenerator, SeededRandom
 from app.tools.registry import ToolRegistry
 
 __all__ = [
@@ -38,6 +38,10 @@ def create_agent_graph(
     planner: Planner | None = None,
     arg_resolver: Callable[[AgentState, PlanStep], dict[str, Any]] | None = None,
     node_handlers: NodeHandlers | None = None,
+    retry_base_delay_ms: int = 250,
+    retry_max_delay_ms: int = 8_000,
+    seeded_random: SeededRandom | None = None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
     """Assemble and compile the production LangGraph agent graph (§6.1)."""
     handlers = node_handlers or NodeHandlers(
@@ -48,6 +52,10 @@ def create_agent_graph(
         normalizer=normalizer,
         planner=planner,
         arg_resolver=arg_resolver,
+        retry_base_delay_ms=retry_base_delay_ms,
+        retry_max_delay_ms=retry_max_delay_ms,
+        seeded_random=seeded_random,
+        sleep=sleep,
     )
 
     builder: StateGraph[AgentState] = StateGraph(AgentState)

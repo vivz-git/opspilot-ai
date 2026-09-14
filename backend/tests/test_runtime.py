@@ -45,6 +45,20 @@ class TestClock:
         clock.set(later)
         assert clock.now() == later
 
+    @pytest.mark.asyncio
+    async def test_fixed_clock_sleep_advances_virtually(self) -> None:
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        clock = FixedClock(start)
+        await clock.sleep(1.5)
+        assert clock.now() == datetime(2026, 1, 1, 0, 0, 1, 500_000, tzinfo=UTC)
+        assert clock.slept_seconds == 1.5
+        assert clock.sleep_calls == [1.5]
+
+    @pytest.mark.asyncio
+    async def test_system_clock_sleep_can_be_awaited(self) -> None:
+        clock = SystemClock()
+        await clock.sleep(0.0001)
+
 
 class TestIdGenerator:
     def test_uuid_id_generator_produces_unique_ids(self) -> None:

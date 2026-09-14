@@ -14,6 +14,7 @@ the evaluation suite use the same class with different seeds.
 
 from __future__ import annotations
 
+import asyncio
 import random
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,7 @@ from typing import Protocol
 
 class Clock(Protocol):
     def now(self) -> datetime: ...
+    async def sleep(self, seconds: float) -> None: ...
 
 
 class IdGenerator(Protocol):
@@ -40,6 +42,9 @@ class SystemClock:
     def now(self) -> datetime:
         return datetime.now(UTC)
 
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
 
 class FixedClock:
     """Test double: time only moves when told to (§10.5's known trap —
@@ -47,6 +52,8 @@ class FixedClock:
 
     def __init__(self, start: datetime) -> None:
         self._now = start
+        self.slept_seconds: float = 0.0
+        self.sleep_calls: list[float] = []
 
     def now(self) -> datetime:
         return self._now
@@ -56,6 +63,11 @@ class FixedClock:
 
     def advance(self, *, seconds: float = 0, ms: int = 0) -> None:
         self._now += timedelta(seconds=seconds, milliseconds=ms)
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept_seconds += seconds
+        self.sleep_calls.append(seconds)
+        self.advance(seconds=seconds)
 
 
 class UuidIdGenerator:

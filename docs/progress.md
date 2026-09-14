@@ -1260,4 +1260,27 @@ key exists.
 the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check
 .`, `mypy app` (strict) and `alembic check` are all clean.
 
-Next task: **AGENT-007** (`recover` node wired to `recovery_action`, with backoff via the injected clock).
+## AGENT-007 — `recover` node wired to `recovery_action`, with backoff via the injected clock — 2026-09-14
+
+Implemented the production `recover` node mechanics, retry counting, exponential backoff calculation, virtual clock delays, and deterministic graph routing exactly per §10, ADR-001, and FOUND-004.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/runtime.py` | `Clock.sleep(seconds: float)` protocol addition, `SystemClock.sleep` (asyncio-backed), `FixedClock.sleep` (virtual advance without wall-clock wait, recording `slept_seconds` and `sleep_calls`) | `tests/test_runtime.py` |
+| `app/agent/nodes.py` | Full `NodeHandlers.recover` and `NodeHandlers.route_after_recover`: local error classification via `recovery_action` (§10.2), deterministic retry backoff with `backoff_delay_ms` (§10.4) honoring `retry_after_ms` / `retry_after` hints and optional `SeededRandom` jitter, virtual sleep via `_clock_sleep`, crash/resume retry idempotency guard, optional step skipping (`StepStatus.SKIPPED`, `status_reason='optional_step_skipped'`), bounded replan routing without double-counting `replan_count`, and terminal failure routing on budget exhaustion (`MAX_RETRIES`, `MAX_REPLANS`, `MAX_STEPS`, `deadline_at`) or unrecoverable error | `tests/test_recover.py`, `tests/test_agent_graph.py` |
+| `app/agent/graph.py` | `create_agent_graph` parameter forwarding: `retry_base_delay_ms=250`, `retry_max_delay_ms=8000`, `seeded_random`, and `sleep` injectable into `NodeHandlers` | `tests/test_recover.py` |
+| `tests/test_recover.py` | 34 comprehensive unit and graph integration tests: retry increments, attempt bounds (`1 + MAX_RETRIES`), exponential growth and max delay cap, server hints, seeded jitter, virtual clock delay, replan routing and budget exhaustion, optional step skipping vs required step failure, terminal failure, boundary conditions (`max_retries=0`, `max_replans=0`, deadline exceeded, stale error fail-closed), crash/resume idempotency, full LangGraph integration over `MemorySaver`, and AST checks for no tool dispatch, no mock adapters, and no ORM in `recover` | `tests/test_recover.py` |
+
+**Recovery semantics verified.**
+1. `RETRY`: retryable error classes route `recover -> execute_tool` while `retry_count[step] < MAX_RETRIES`. Retries increment `retry_count[step]` exactly once per failed attempt, evaluate exponential backoff `min(base * 2^(attempt-1), max)`, and advance the injected clock without wall-clock blocking. Permanently failing tools stop at exactly `1 + MAX_RETRIES` attempts.
+2. `REPLAN`: replannable errors route `recover -> plan` while `replan_count < MAX_REPLANS`. The error is preserved in state history for planner consumption; `recover` does not touch `replan_count` (the `plan` node increments on revision).
+3. `SKIP`: optional step failures route `recover -> decide` with `StepStatus.SKIPPED` and `status_reason='optional_step_skipped'`, leaving telemetry and prior attempts intact. Required step failures cannot skip and route to `plan` or `fail`.
+4. `FAIL`: non-recoverable error classes (`POLICY_VIOLATION`, `INTERNAL`), exhausted budgets, or already-terminal runs route `recover -> fail`. Terminal states cannot be resurrected.
+5. `Crash/Resume Idempotency`: re-entering `recover` after checkpoint persistence where `retry_count[step]` was already updated for the current attempt does not double-increment and does not double-sleep.
+
+**Deliberately not done.** No responder or terminal status computation (`complete`/`fail` response synthesis, AGENT-008); no cooperative cancellation or budget sweeper (AGENT-009); no HITL UI/API; no verifier ports.
+
+**Test suite: 1131 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL container on port 55432 — 34 new in `tests/test_recover.py`, 2 new in `tests/test_runtime.py`, the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 62 source files), and `alembic check` are all clean.
+
+Next task: **AGENT-008** (`complete` and `fail` nodes plus `Responder`; terminal status computation including `partial` and `unconfirmed`).
+

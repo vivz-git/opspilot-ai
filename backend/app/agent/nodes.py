@@ -6,6 +6,8 @@ Nodes never mutate `AgentState` in place; declared reducers own composition (§5
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -27,6 +29,7 @@ from app.agent.planner import (
 )
 from app.agent.resolver import resolve_step_args
 from app.agent.state import (
+    TERMINAL_RUN_STATUSES,
     AgentError,
     AgentState,
     ApprovalDecision,
@@ -44,15 +47,19 @@ from app.agent.state import (
     VerificationStatus,
 )
 from app.errors import (
+    REPLANNABLE,
+    TERMINAL_ERRORS,
     ErrorClass,
     InputValidationError,
     PlannerError,
     PolicyViolation,
     RecoveryAction,
+    backoff_delay_ms,
+    is_retryable,
     recovery_action,
 )
 from app.persistence.protocols import UnitOfWorkFactory
-from app.runtime import Clock, IdGenerator, SystemClock, UuidIdGenerator
+from app.runtime import Clock, IdGenerator, SeededRandom, SystemClock, UuidIdGenerator
 from app.security import ApprovalToken, canonical_args_hash
 from app.tools.contracts import REGISTRY, ToolContract, ToolName, VerificationMode
 from app.tools.registry import ApprovalRequiredError, ToolRegistry
@@ -132,6 +139,10 @@ class NodeHandlers:
         plan_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
         verify_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
         recover_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
+        retry_base_delay_ms: int = 250,
+        retry_max_delay_ms: int = 8_000,
+        seeded_random: SeededRandom | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._registry = registry
         self._uow_factory = uow_factory
@@ -145,10 +156,24 @@ class NodeHandlers:
         self._plan_handler = plan_handler
         self._verify_handler = verify_handler
         self._recover_handler = recover_handler
+        self._retry_base_delay_ms = retry_base_delay_ms
+        self._retry_max_delay_ms = retry_max_delay_ms
+        self._seeded_random = seeded_random
+        self._sleep_fn = sleep
 
     # ---------------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------------
+    async def _clock_sleep(self, seconds: float) -> None:
+        if self._sleep_fn is not None:
+            await self._sleep_fn(seconds)
+        elif hasattr(self._clock, "sleep"):
+            res = self._clock.sleep(seconds)
+            if asyncio.iscoroutine(res):
+                await res
+        elif hasattr(self._clock, "advance"):
+            self._clock.advance(seconds=seconds)
+
     def _get_contract(self, tool_name: ToolName) -> ToolContract | None:
         if self._registry is not None:
             try:
@@ -571,12 +596,17 @@ class NodeHandlers:
                 replans_remaining=max(0, budgets.max_replans - state.get("replan_count", 0)),
                 step_optional=step.optional,
             )
+            err_detail = dict(getattr(exc, "detail", {}) or {})
+            retry_hint = getattr(exc, "retry_after_ms", None)
+            if retry_hint is not None:
+                err_detail["retry_after_ms"] = retry_hint
             agent_err = AgentError(
                 step_id=current_step_id,
                 error_class=err_class,
                 message=str(exc),
                 attempt=attempt,
                 recovery=rec,
+                detail=err_detail,
                 occurred_at=self._clock.now(),
             )
             tool_call = ToolCall(
@@ -645,35 +675,110 @@ class NodeHandlers:
     async def recover(self, state: AgentState) -> dict[str, Any]:
         if self._recover_handler is not None:
             return await self._recover_handler(state)
+
+        # 1. Terminal / cancelled run check (§5.4 lifecycle guard)
+        run_status = state.get("status")
+        if run_status in TERMINAL_RUN_STATUSES:
+            return {"status_reason": state.get("status_reason") or "terminal_run"}
+
+        # 2. Identify current step
         current_step_id = state.get("current_step_id")
-        errors = state.get("errors", [])
-        latest_err = errors[-1] if errors else None
-        budgets = state.get("metadata", RunMetadata()).budgets
-        retries = state.get("retry_count", {})
-        current_retries = retries.get(current_step_id, 0) if current_step_id else 0
+        if not current_step_id:
+            return {"status_reason": "missing_current_step"}
 
         plan = state.get("plan")
         step = plan.step(current_step_id) if plan and current_step_id else None
+        if not step:
+            return {"status_reason": "step_not_found"}
 
-        err_class = latest_err.error_class if latest_err else ErrorClass.INTERNAL
-        action = (
-            latest_err.recovery
-            if latest_err and latest_err.recovery
-            else recovery_action(
-                err_class,
-                idempotent=False,
-                nondeterministic=False,
-                retries_remaining=max(0, budgets.max_retries - current_retries),
-                replans_remaining=max(0, budgets.max_replans - state.get("replan_count", 0)),
-                step_optional=step.optional if step else False,
-            )
+        # 3. Error inspection and validation
+        errors = state.get("errors", [])
+        latest_err = errors[-1] if errors else None
+        if not latest_err:
+            return {"status_reason": "missing_error"}
+
+        # Stale error check: latest error must match current step
+        if latest_err.step_id != current_step_id:
+            return {"status_reason": "stale_error"}
+
+        # 4. Budget evaluation
+        metadata = state.get("metadata") or RunMetadata()
+        budgets = metadata.budgets
+        step_count = state.get("step_count", 0)
+        deadline_at = state.get("deadline_at")
+
+        now = self._clock.now()
+        deadline_passed = deadline_at is not None and now >= deadline_at
+        step_budget_exhausted = step_count >= budgets.max_steps
+        budget_exhausted = deadline_passed or step_budget_exhausted
+
+        # 5. Contract and attempt state
+        contract = self._get_contract(step.tool)
+        idempotent = contract.idempotent if contract else False
+        nondeterministic = contract.nondeterministic if contract else False
+
+        retries = state.get("retry_count", {})
+        current_retries = retries.get(current_step_id, 0)
+        replan_count = state.get("replan_count", 0)
+
+        # Crash / resume idempotency: has this attempt already been accounted for?
+        retry_already_counted = (
+            latest_err.attempt is not None and current_retries >= latest_err.attempt
         )
 
-        if action == RecoveryAction.RETRY and current_step_id:
-            return {"retry_count": {current_step_id: current_retries + 1}}
-        if action == RecoveryAction.REPLAN:
-            return {"status_reason": "replannable_fault"}
-        if action == RecoveryAction.SKIP and step and step.optional and plan is not None:
+        retries_remaining = max(0, budgets.max_retries - current_retries)
+        replans_remaining = max(0, budgets.max_replans - replan_count)
+
+        # 6. Recovery action classification (§10.2)
+        action = recovery_action(
+            latest_err.error_class,
+            idempotent=idempotent,
+            nondeterministic=nondeterministic,
+            retries_remaining=retries_remaining,
+            replans_remaining=replans_remaining,
+            step_optional=step.optional,
+            budget_exhausted=budget_exhausted,
+        )
+
+        # 7. Execute recovery action
+        if action == RecoveryAction.RETRY:
+            if not retry_already_counted:
+                new_retries = current_retries + 1
+
+                # Server hint extraction from error detail
+                retry_after_ms = None
+                detail = latest_err.detail or {}
+                if "retry_after_ms" in detail and detail["retry_after_ms"] is not None:
+                    with contextlib.suppress(ValueError, TypeError):
+                        retry_after_ms = int(detail["retry_after_ms"])
+                elif "retry_after" in detail and detail["retry_after"] is not None:
+                    with contextlib.suppress(ValueError, TypeError):
+                        val = float(detail["retry_after"])
+                        retry_after_ms = int(val * 1000) if val < 1000 else int(val)
+
+                # Deterministic jitter via injected SeededRandom
+                jitter = 1.0
+                if self._seeded_random is not None:
+                    jitter = self._seeded_random.uniform(0.8, 1.2)
+
+                delay_ms = backoff_delay_ms(
+                    new_retries,
+                    base_ms=self._retry_base_delay_ms,
+                    max_ms=self._retry_max_delay_ms,
+                    jitter=jitter,
+                    retry_after_ms=retry_after_ms,
+                )
+                await self._clock_sleep(delay_ms / 1000.0)
+                return {
+                    "retry_count": {current_step_id: new_retries},
+                    "status_reason": f"retry_attempt_{new_retries}",
+                }
+            return {
+                "retry_count": {current_step_id: current_retries},
+                "status_reason": f"retry_attempt_{current_retries}",
+            }
+
+        if action == RecoveryAction.SKIP and step.optional and plan is not None:
             updated_steps = []
             for s in plan.steps:
                 if s.step_id == current_step_id:
@@ -684,22 +789,79 @@ class NodeHandlers:
                 "plan": plan.model_copy(update={"steps": updated_steps}),
                 "status_reason": "optional_step_skipped",
             }
-        return {"status_reason": "recovery_exhausted"}
+
+        if action == RecoveryAction.REPLAN:
+            return {
+                "status_reason": "replannable_fault",
+            }
+
+        # Terminal / Unrecoverable failure
+        if deadline_passed:
+            fail_reason = "deadline_exceeded"
+        elif step_budget_exhausted:
+            fail_reason = "budget_exhausted"
+        elif latest_err.error_class in TERMINAL_ERRORS:
+            fail_reason = f"terminal_error_{latest_err.error_class.value}"
+        elif retries_remaining == 0 and is_retryable(
+            latest_err.error_class, idempotent=idempotent, nondeterministic=nondeterministic
+        ):
+            fail_reason = "retry_budget_exhausted"
+        elif replans_remaining == 0 and latest_err.error_class in REPLANNABLE:
+            fail_reason = "replan_budget_exhausted"
+        elif not step.optional and latest_err.error_class == ErrorClass.NOT_FOUND:
+            fail_reason = "required_step_not_found"
+        else:
+            fail_reason = "recovery_exhausted"
+
+        return {"status_reason": fail_reason}
 
     def route_after_recover(self, state: AgentState) -> str:
+        if state.get("status") in TERMINAL_RUN_STATUSES:
+            return "fail"
+
+        status_reason = state.get("status_reason")
+        if status_reason == "optional_step_skipped":
+            return "decide"
+
         current_step_id = state.get("current_step_id")
+        plan = state.get("plan")
+        step = plan.step(current_step_id) if plan and current_step_id else None
+
         errors = state.get("errors", [])
         latest_err = errors[-1] if errors else None
-        budgets = state.get("metadata", RunMetadata()).budgets
+        if not latest_err or (current_step_id and latest_err.step_id != current_step_id):
+            return "fail"
+
+        budgets = (state.get("metadata") or RunMetadata()).budgets
         retries = state.get("retry_count", {})
         current_retries = retries.get(current_step_id, 0) if current_step_id else 0
         replan_count = state.get("replan_count", 0)
 
-        plan = state.get("plan")
-        step = plan.step(current_step_id) if plan and current_step_id else None
-        if step and step.optional and state.get("status_reason") == "optional_step_skipped":
-            return "decide"
+        if status_reason and status_reason.startswith(("retry_attempt_", "retry_scheduled_")):
+            if current_retries <= budgets.max_retries:
+                return "execute_tool"
+            return "fail"
 
+        if status_reason == "replannable_fault":
+            if replan_count < budgets.max_replans:
+                return "plan"
+            return "fail"
+
+        if status_reason in (
+            "recovery_exhausted",
+            "retry_budget_exhausted",
+            "replan_budget_exhausted",
+            "budget_exhausted",
+            "deadline_exceeded",
+            "stale_error",
+            "missing_error",
+            "missing_current_step",
+            "step_not_found",
+            "required_step_not_found",
+        ) or (status_reason and status_reason.startswith("terminal_error_")):
+            return "fail"
+
+        # Fallback / direct call check (matching existing tests in test_agent_graph.py)
         action = latest_err.recovery if latest_err and latest_err.recovery else RecoveryAction.FAIL
         if action == RecoveryAction.RETRY and current_retries <= budgets.max_retries:
             return "execute_tool"
