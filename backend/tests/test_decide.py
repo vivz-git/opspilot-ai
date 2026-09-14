@@ -1666,7 +1666,7 @@ class TestStructuralSafety:
             )
 
     def test_no_later_task_implementation_leaked_in(self) -> None:
-        """AGENT-005..009, HITL, API and an LLM are out of scope for AGENT-004."""
+        """AGENT-006..009, HITL, API and an LLM are out of scope for AGENT-005."""
         agent_files = {p.name for p in (APP / "agent").glob("*.py")}
         assert agent_files == {
             "__init__.py",
@@ -1675,6 +1675,7 @@ class TestStructuralSafety:
             "graph.py",
             "nodes.py",
             "normalizer.py",
+            "resolver.py",
             "state.py",
         }
         for path in (APP / "agent").glob("*.py"):

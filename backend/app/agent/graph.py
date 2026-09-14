@@ -7,6 +7,7 @@ and enforces dynamic `interrupt()` in `request_approval` with empty static inter
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -15,7 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.agent.nodes import NodeHandlers
 from app.agent.normalizer import TaskNormalizer
-from app.agent.state import AgentState
+from app.agent.state import AgentState, PlanStep
 from app.persistence.protocols import UnitOfWorkFactory
 from app.runtime import Clock, IdGenerator
 from app.tools.registry import ToolRegistry
@@ -33,6 +34,7 @@ def create_agent_graph(
     clock: Clock | None = None,
     id_gen: IdGenerator | None = None,
     normalizer: TaskNormalizer | None = None,
+    arg_resolver: Callable[[AgentState, PlanStep], dict[str, Any]] | None = None,
     node_handlers: NodeHandlers | None = None,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
     """Assemble and compile the production LangGraph agent graph (§6.1)."""
@@ -42,6 +44,7 @@ def create_agent_graph(
         clock=clock,
         id_gen=id_gen,
         normalizer=normalizer,
+        arg_resolver=arg_resolver,
     )
 
     builder: StateGraph[AgentState] = StateGraph(AgentState)

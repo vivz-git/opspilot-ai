@@ -22,7 +22,7 @@ contract spine ████████████████████  com
 foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
-agent graph    ██████░░░░░░░░░░░░░░  AGENT-001..003 done; 004..009 outstanding
+agent graph    ████████░░░░░░░░░░░░  AGENT-001..005 done; 006..009 outstanding
 hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
@@ -1148,4 +1148,27 @@ planner, responder, verifier or cancellation (AGENT-005..009).
 `test_fanout.py` 38). `ruff check .`, `ruff format --check .`, `mypy app`
 (strict) and `alembic check` are all clean.
 
-Next task: **AGENT-005** (`execute_tool` node: resolve → validate → re-assert gate → dispatch → validate → record) — **SONNET 5**.
+---
+
+### AGENT-005 — `execute_tool` argument reference resolution and execution pipeline
+
+Implemented the reference resolver and integrated it into the `execute_tool` pipeline while preserving all approval invariants.
+
+| File | What was built | Tests |
+|---|---|---|
+| `app/agent/resolver.py` | `parse_ref_path`, `resolve_ref_path`, `resolve_value`, `resolve_step_args`: deterministic path navigation (`<step>.<path>`, dot and bracket syntax e.g. `leads[0].id`), value deepcopy isolation, self-reference / circularity detection, and `ReferenceResolutionError` (class `REFERENCE_RESOLUTION`, recovery `REPLAN`) on missing step, unpopulated field, out-of-bounds list index or type error. Pure function over state/results, zero I/O, zero DB/network/LLM. | `tests/test_resolver.py` |
+| `app/tools/resolver.py` | Clean re-export surface satisfying the TOOL-004 interface specification without duplicated logic. | `tests/test_resolver.py` |
+| `app/agent/nodes.py` | Updated `execute_tool` to follow the architecture-mandated sequence: (1) resolve `$ref` arguments from `tool_results`, (2) validate resolved arguments against `contract.input_model`, (3) re-assert approval gate via `approval_state.grants(current_step_id, resolved_args)` using the canonical hash of final resolved arguments, (4) dispatch through `ToolRegistry.dispatch()`. | `tests/test_resolver.py` |
+| `app/agent/graph.py` | Added optional `arg_resolver` injection to `create_agent_graph`, forwarding to `NodeHandlers`. | `tests/test_agent_graph.py` |
+
+**Invariants verified.**
+1. In-memory approval evaluated strictly against canonical hash of final resolved arguments.
+2. Resolution failure fails closed: records `AgentError` with recovery `REPLAN` and halts execution before any tool dispatch.
+3. Source `ToolResult`s are never mutated in place.
+4. Fan-out expanded children (e.g. `s2[0]`, `s2[1]`) resolve references to parent/earlier step outputs cleanly.
+5. Structural AST invariants: resolver performs no I/O, no DB imports, and no approval minting outside `security.py`.
+
+**Test suite: 951 passed, 0 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` at a reachable Postgres — 49 new tests in `test_resolver.py`). `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check` are all clean.
+
+Next task: **AGENT-006** (`Planner` protocol, `RulePlanner`, `LLMPlanner` with strict schema validation, registry allowlisting and bounded repair).
+

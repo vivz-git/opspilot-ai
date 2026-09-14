@@ -16,6 +16,7 @@ from langgraph.types import interrupt
 
 from app.agent.decide import Decision, evaluate_decision
 from app.agent.normalizer import RuleTaskNormalizer, TaskNormalizer
+from app.agent.resolver import resolve_step_args
 from app.agent.state import (
     AgentError,
     AgentState,
@@ -35,6 +36,7 @@ from app.agent.state import (
 )
 from app.errors import (
     ErrorClass,
+    InputValidationError,
     PolicyViolation,
     RecoveryAction,
     recovery_action,
@@ -135,27 +137,7 @@ class NodeHandlers:
     def _resolve_step_args(self, state: AgentState, step: PlanStep) -> dict[str, Any]:
         if self._arg_resolver is not None:
             return self._arg_resolver(state, step)
-        # Default resolver: resolves dotted strings like 's1.output.lead_id'
-        tool_results = state.get("tool_results", {})
-        raw_args = dict(step.args)
-        resolved: dict[str, Any] = {}
-        for k, v in raw_args.items():
-            if isinstance(v, str) and ".output" in v:
-                parts = v.split(".")
-                step_ref = parts[0]
-                if step_ref in tool_results:
-                    curr: Any = tool_results[step_ref].output
-                    for p in parts[2:]:
-                        if isinstance(curr, dict) and p in curr:
-                            curr = curr[p]
-                        elif isinstance(curr, list) and p.isdigit():
-                            curr = curr[int(p)]
-                    resolved[k] = curr
-                else:
-                    resolved[k] = v
-            else:
-                resolved[k] = v
-        return resolved
+        return resolve_step_args(state, step)
 
     # ---------------------------------------------------------------------------
     # 1. understand
@@ -332,90 +314,124 @@ class NodeHandlers:
         step_count = state.get("step_count", 0) + 1
         current_retries = state.get("retry_count", {}).get(current_step_id, 0)
         attempt = current_retries + 1
-        resolved_args = self._resolve_step_args(state, step)
-        args_hash = canonical_args_hash(resolved_args)
         contract = self._get_contract(step.tool) or REGISTRY[step.tool]
         budgets = state.get("metadata", RunMetadata()).budgets
+        args_hash = canonical_args_hash(step.args)
 
-        # Gate Re-assertion (Barrier 2, §9.5, §16.2)
-        if contract.requires_approval:
-            approval_state = state.get("approval_state")
-            if approval_state is None or not approval_state.grants(current_step_id, resolved_args):
-                err = ApprovalRequiredError(
-                    f"Step {current_step_id} requires approval for tool {step.tool.value}",
-                    detail={"step_id": current_step_id, "tool": step.tool.value},
-                )
-                agent_err = AgentError(
-                    step_id=current_step_id,
-                    error_class=ErrorClass.POLICY_VIOLATION,
-                    message=str(err),
-                    attempt=attempt,
-                    recovery=RecoveryAction.FAIL,
-                    occurred_at=self._clock.now(),
-                )
-                tool_call = ToolCall(
-                    step_id=current_step_id,
-                    tool=step.tool,
-                    attempt=attempt,
-                    args_hash=args_hash,
-                    status="failed",
-                    error_class=ErrorClass.POLICY_VIOLATION,
-                    error_message=str(err),
-                    started_at=self._clock.now(),
-                )
-                return {
-                    "errors": [agent_err],
-                    "tool_calls": [tool_call],
-                    "step_count": step_count,
-                }
+        try:
+            # 1. Resolve $ref parameters from tool_results
+            resolved_args = self._resolve_step_args(state, step)
+            args_hash = canonical_args_hash(resolved_args)
 
-        # Issue or retrieve approval token if token issuer is provided
-        token: ApprovalToken | None = None
-        if contract.requires_approval and self._token_issuer is not None:
-            token = self._token_issuer(str(state["run_id"]), current_step_id, resolved_args)
+            # 2. Validate resolved arguments against the tool input model
+            try:
+                candidate = dict(resolved_args)
+                fields = contract.input_model.model_fields
+                if "idempotency_key" in fields and "idempotency_key" not in candidate:
+                    candidate["idempotency_key"] = "0" * 16
+                if "approval_token" in fields and "approval_token" not in candidate:
+                    dummy_token = object.__new__(ApprovalToken)
+                    object.__setattr__(dummy_token, "approval_id", "preview_token")
+                    object.__setattr__(
+                        dummy_token,
+                        "run_id",
+                        str(state.get("run_id", "00000000-0000-0000-0000-000000000000")),
+                    )
+                    object.__setattr__(dummy_token, "step_id", current_step_id)
+                    object.__setattr__(dummy_token, "args_hash", args_hash)
+                    candidate["approval_token"] = dummy_token
+                contract.input_model.model_validate(candidate)
+            except Exception as val_exc:
+                raise InputValidationError(
+                    f"Step {current_step_id} arguments invalid for tool "
+                    f"{step.tool.value}: {val_exc}",
+                    detail={
+                        "step_id": current_step_id,
+                        "tool": step.tool.value,
+                        "errors": str(val_exc),
+                    },
+                ) from val_exc
 
-        # The only tool execution path: ToolRegistry.dispatch (§8.5, ADR-024)
-        if self._registry is None:
-            no_reg_err = PolicyViolation("ToolRegistry not bound in node handlers")
-            return {
-                "errors": [
-                    AgentError(
+            # 3. Gate Re-assertion (Barrier 2, §9.5, §16.2)
+            if contract.requires_approval:
+                approval_state = state.get("approval_state")
+                if approval_state is None or not approval_state.grants(
+                    current_step_id, resolved_args
+                ):
+                    err = ApprovalRequiredError(
+                        f"Step {current_step_id} requires approval for tool {step.tool.value}",
+                        detail={"step_id": current_step_id, "tool": step.tool.value},
+                    )
+                    agent_err = AgentError(
                         step_id=current_step_id,
                         error_class=ErrorClass.POLICY_VIOLATION,
-                        message=str(no_reg_err),
+                        message=str(err),
                         attempt=attempt,
                         recovery=RecoveryAction.FAIL,
                         occurred_at=self._clock.now(),
                     )
-                ],
-                "step_count": step_count,
-            }
-
-        # Resolve execution_step_id if uow_factory is provided
-        execution_step_id = uuid.UUID(hex=self._id_gen.new_id())
-        if self._uow_factory is not None:
-            try:
-                run_uuid = uuid.UUID(str(state["run_id"]))
-                async with self._uow_factory() as uow:
-                    step_row = await uow.execution_steps.get_by_step_id(
-                        run_uuid, current_step_id, plan.revision if plan else 0
+                    tool_call = ToolCall(
+                        step_id=current_step_id,
+                        tool=step.tool,
+                        attempt=attempt,
+                        args_hash=args_hash,
+                        status="failed",
+                        error_class=ErrorClass.POLICY_VIOLATION,
+                        error_message=str(err),
+                        started_at=self._clock.now(),
                     )
-                    if step_row is None:
-                        step_row = await uow.execution_steps.create(
-                            run_id=run_uuid,
-                            step_id=current_step_id,
-                            plan_revision=plan.revision if plan else 0,
-                            seq=step_count,
-                            tool=step.tool,
-                            args=resolved_args,
-                            args_hash=args_hash,
-                        )
-                        await uow.commit()
-                    execution_step_id = step_row.id
-            except Exception as e:
-                _log.warning("execution_step_persistence_fallback", error=str(e))
+                    return {
+                        "errors": [agent_err],
+                        "tool_calls": [tool_call],
+                        "step_count": step_count,
+                    }
 
-        try:
+            # Issue or retrieve approval token if token issuer is provided
+            token: ApprovalToken | None = None
+            if contract.requires_approval and self._token_issuer is not None:
+                token = self._token_issuer(str(state["run_id"]), current_step_id, resolved_args)
+
+            # 4. The only tool execution path: ToolRegistry.dispatch (§8.5, ADR-024)
+            if self._registry is None:
+                no_reg_err = PolicyViolation("ToolRegistry not bound in node handlers")
+                return {
+                    "errors": [
+                        AgentError(
+                            step_id=current_step_id,
+                            error_class=ErrorClass.POLICY_VIOLATION,
+                            message=str(no_reg_err),
+                            attempt=attempt,
+                            recovery=RecoveryAction.FAIL,
+                            occurred_at=self._clock.now(),
+                        )
+                    ],
+                    "step_count": step_count,
+                }
+
+            # Resolve execution_step_id if uow_factory is provided
+            execution_step_id = uuid.UUID(hex=self._id_gen.new_id())
+            if self._uow_factory is not None:
+                try:
+                    run_uuid = uuid.UUID(str(state["run_id"]))
+                    async with self._uow_factory() as uow:
+                        step_row = await uow.execution_steps.get_by_step_id(
+                            run_uuid, current_step_id, plan.revision if plan else 0
+                        )
+                        if step_row is None:
+                            step_row = await uow.execution_steps.create(
+                                run_id=run_uuid,
+                                step_id=current_step_id,
+                                plan_revision=plan.revision if plan else 0,
+                                seq=step_count,
+                                tool=step.tool,
+                                args=resolved_args,
+                                args_hash=args_hash,
+                            )
+                            await uow.commit()
+                        execution_step_id = step_row.id
+                except Exception as e:
+                    _log.warning("execution_step_persistence_fallback", error=str(e))
+
             dispatch_result = await self._registry.dispatch(
                 run_id=uuid.UUID(str(state["run_id"])),
                 execution_step_id=execution_step_id,
