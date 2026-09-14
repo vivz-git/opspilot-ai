@@ -1083,7 +1083,69 @@ are all clean.
 `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check`
 are all clean.
 
-Next task: **AGENT-004** (`decide` router: the seven ordered rules plus fan-out expansion) — **OPUS 5**.
+Next task: **AGENT-004** (done below).
 
+## AGENT-004 — the `decide` router: seven ordered rules plus fan-out expansion — 2026-09-14
 
+**Done.** The safety router of §6.2 as one pure function, and the fan-out
+expansion engine of §4.5/ADR-006, wired into the existing graph topology
+without changing any other node.
 
+| Module | What it provides | Verified by |
+|---|---|---|
+| `app/agent/decide.py` | `evaluate_decision(state, *, now, contract_for, resolve_args) -> Decision`: the seven rules in a single ascending sequence — (1) `deadline_at` passed or `step_count ≥ MAX_STEPS` → `fail(budget_exhausted)`; (2) undecided pending approval → `request_approval`; (3) no runnable step → `complete`; (4) dependencies unsatisfied or fan-out unresolvable → `plan` while `replan_count < MAX_REPLANS`, else `fail(unresolvable_plan)`; (5) unexpanded fan-out → expand, re-evaluate from 1; (6) `requires_approval` and no grant for the arguments *as they will now be sent* → `request_approval`; (7) → `execute_tool`. A §5.4 lifecycle guard ahead of rule 1 routes an already-terminal run to its terminal node, never into execution or a pause. "No runnable step" includes a required step a human rejected (§9.6), so nothing after it executes. `Decision.state_delta()` writes only `current_step_id`, the expanded `plan` and `status_reason` (rules 6/7 clear a stale advisory reason; rules 2/3 leave it alone). Re-evaluation after expansion is bounded by the number of fan-out steps. | `tests/test_decide.py` |
+| `app/agent/fanout.py` | `plan_fanout_expansion` resolves `fanout.over` (`<step>.output[.key or index…]`, must land on a list), binds `{"$ref": "<as>[.path]"}` inside the parent's args to literals per item, truncates to `max_items` in list order and builds children `s2[0]`, `s2[1]`, … (same tool, copied `depends_on`/`optional`/`rationale`, `parent_step_id` set, `fanout=None`); `apply_expansion` places them immediately after the parent, marks the parent `succeeded` (its job — producing children — is done) and is idempotent: existing children are kept in canonical position, never duplicated. A dependency on an expanded parent is satisfied only once every child has succeeded. Any resolution or binding failure is `FanOutResolutionError`, a `ReferenceResolutionError` (`reference_resolution` — a planning fault, §4.4), so the whole expansion is all-or-nothing. No general `$ref` resolver: step references are left for `execute_tool` (AGENT-005). | `tests/test_fanout.py` |
+| `app/agent/nodes.py` | `decide` and `route_after_decide` both call `_evaluate_decision` (clock reading, `_get_contract`, `_resolve_step_args` injected), so the node's delta and the conditional edge can never disagree; the AGENT-002 placeholder rules and helpers are removed. No other node changed. | `tests/test_decide.py::TestDeterminismAndPurity`, `tests/test_agent_graph.py` |
+| `tests/test_structure.py` | `agent/decide.py` admitted to the set of modules allowed to ask `ApprovalState.grants` (it *is* the router barrier of §9.5). | `tests/test_structure.py` |
+
+**Acceptance criteria verified.** Each rule in isolation with every boundary
+(`deadline_at == now` is not passed; `step_count == MAX_STEPS` is; `replan_count
+== MAX_REPLANS` fails; `max_items` exact vs. one over). Ordering by a precedence
+ladder in which rules 1, 2, 4, 5 and 6 are simultaneously true and conditions
+are removed one at a time; the acceptance case — budget-exhausted **and**
+approval-requiring — fails and does not pause, for both `MAX_STEPS` and
+`deadline_at`. Expanded children count against `MAX_STEPS`: with `max_steps=3`
+the graph executes `s1`, `s2[0]`, `s2[1]` and fails `budget_exhausted` before
+`s2[2]`. On `MemorySaver`: a three-lead fan-out executes every child in order
+with bound arguments; each gated child pauses for its own approval and the
+two re-entries add no duplicate child; rejecting a required child ends the run
+`rejected` without executing the rest; an optional rejected child is skipped
+(`partial=True`); an unresolvable fan-out replans exactly `MAX_REPLANS` times
+(each revision kept) then fails `unresolvable_plan`; the same run twice is
+identical. On the real Postgres saver with the real registry and seeded mock
+CRM: `search_leads` → fan out `get_lead` over `s1.output.leads`, the children
+dispatch through `ToolRegistry.dispatch` with real lead ids and the expanded
+plan survives the checkpoint round trip. Structural: both router modules are
+synchronous, import nothing I/O-capable (no langgraph, sqlalchemy, httpx,
+anthropic, persistence, integrations, registry), call no `dispatch`/`send`/
+`update`/`save`, and `evaluate_decision` cites `DecisionRule` members in
+strictly ascending source order; `decide`/`route_after_decide` contain no
+branching of their own; no AGENT-005+ module or LLM import appeared under
+`app/agent/`.
+
+**Decisions.** The parent of an expansion stays in the plan (readability, and
+`step_id` stability for later `$ref`s and `depends_on`) and is marked
+`succeeded` rather than a new `StepStatus` value, because `execution_steps.
+status` carries a `CHECK` over the existing eight values and no migration is
+warranted. Over-limit lists are truncated to `max_items` in list order (the
+bound the architecture names); `MAX_STEPS` is enforced as children execute,
+via rule 1 on every pass, not by refusing the expansion. Rule 4 records its
+fault in `status_reason` (`replan_required`/`unresolvable_plan`) and does not
+append to `errors`, because `route_after_execute` keys on `errors[-1]` and a
+decide-time entry would misroute a later successful attempt of the same step
+into `recover`; AGENT-006's planner can carry the detail when it lands.
+
+**Deliberately not done.** No `fanout_expanded` trace event (OBS-001). No
+change to `request_approval`: a resume whose decision carries a stale
+`args_hash` would be re-routed by rule 6 to a new request, but the node's
+early return on an existing decision would short-circuit it — unreachable in
+the current graph (nothing changes arguments between the pause and the
+re-decide) and HITL-003's supersede path owns it. No general `$ref` resolver,
+planner, responder, verifier or cancellation (AGENT-005..009).
+
+**Test suite: 902 passed, 0 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` at a reachable Postgres — 212 new: `test_decide.py` 174,
+`test_fanout.py` 38). `ruff check .`, `ruff format --check .`, `mypy app`
+(strict) and `alembic check` are all clean.
+
+Next task: **AGENT-005** (`execute_tool` node: resolve → validate → re-assert gate → dispatch → validate → record) — **SONNET 5**.

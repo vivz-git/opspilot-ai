@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 from langgraph.types import interrupt
 
+from app.agent.decide import Decision, evaluate_decision
 from app.agent.normalizer import RuleTaskNormalizer, TaskNormalizer
 from app.agent.state import (
     AgentError,
@@ -156,34 +157,6 @@ class NodeHandlers:
                 resolved[k] = v
         return resolved
 
-    def _find_runnable_step(self, state: AgentState, plan: Plan | None) -> PlanStep | None:
-        if plan is None or not plan.steps:
-            return None
-        current_id = state.get("current_step_id")
-        if current_id is not None:
-            current_step = plan.step(current_id)
-            if current_step and current_step.status not in (
-                StepStatus.SUCCEEDED,
-                StepStatus.SKIPPED,
-                StepStatus.REJECTED,
-                StepStatus.FAILED,
-            ):
-                return current_step
-        for s in plan.steps:
-            if s.status in (StepStatus.PENDING, StepStatus.READY):
-                return s
-        return None
-
-    def _dependencies_satisfied(self, state: AgentState, plan: Plan, step: PlanStep) -> bool:
-        tool_results = state.get("tool_results", {})
-        for dep_id in step.depends_on:
-            dep = plan.step(dep_id)
-            if dep is None:
-                return False
-            if dep.status != StepStatus.SUCCEEDED and dep_id not in tool_results:
-                return False
-        return True
-
     # ---------------------------------------------------------------------------
     # 1. understand
     # ---------------------------------------------------------------------------
@@ -240,76 +213,24 @@ class NodeHandlers:
     # ---------------------------------------------------------------------------
     # 3. decide
     # ---------------------------------------------------------------------------
+    def _evaluate_decision(self, state: AgentState) -> Decision:
+        """One evaluation of §6.2, shared by the node and its conditional edge
+        so the two cannot disagree (`app.agent.decide`)."""
+        return evaluate_decision(
+            state,
+            now=self._clock.now(),
+            contract_for=self._get_contract,
+            resolve_args=self._resolve_step_args,
+        )
+
     async def decide(self, state: AgentState) -> dict[str, Any]:
-        budgets = state.get("metadata", RunMetadata()).budgets
-        now = self._clock.now()
-        deadline = state.get("deadline_at")
-        if (deadline is not None and now > deadline) or (
-            state.get("step_count", 0) >= budgets.max_steps
-        ):
-            return {"status_reason": "budget_exhausted"}
-        plan = state.get("plan")
-        if plan is None:
-            return {"current_step_id": None}
-        runnable = self._find_runnable_step(state, plan)
-        if runnable is None:
-            return {"current_step_id": None}
-        if not self._dependencies_satisfied(state, plan, runnable):
-            if state.get("replan_count", 0) >= budgets.max_replans:
-                return {"status_reason": "unresolvable_plan", "current_step_id": runnable.step_id}
-            return {"status_reason": "replan_required", "current_step_id": runnable.step_id}
-        return {"current_step_id": runnable.step_id}
+        """The safety router (§6.2, ADR-006). Pure over state plus the
+        registry: writes `current_step_id`, the expanded `plan` when a fan-out
+        was expanded, and `status_reason`. Never calls a tool."""
+        return self._evaluate_decision(state).state_delta()
 
     def route_after_decide(self, state: AgentState) -> str:
-        # Rule 1: deadline_at passed, or step_count >= MAX_STEPS -> fail(budget_exhausted)
-        budgets = state.get("metadata", RunMetadata()).budgets
-        now = self._clock.now()
-        deadline = state.get("deadline_at")
-        if deadline is not None and now > deadline:
-            return "fail"
-        if state.get("step_count", 0) >= budgets.max_steps:
-            return "fail"
-
-        # Rule 2: a pending approval exists and is undecided -> request_approval (re-pause)
-        approval_state = state.get("approval_state")
-        if (
-            approval_state is not None
-            and approval_state.pending is not None
-            and approval_state.pending.step_id not in approval_state.decisions
-        ):
-            return "request_approval"
-
-        # Rule 3: no runnable step remains -> complete
-        plan = state.get("plan")
-        if plan is None:
-            return "complete"
-        runnable = self._find_runnable_step(state, plan)
-        if runnable is None:
-            return "complete"
-
-        # Rule 4: next step's dependencies unsatisfied/unresolvable
-        # and replan_count < MAX_REPLANS -> plan, else -> fail(unresolvable_plan)
-        if not self._dependencies_satisfied(state, plan, runnable):
-            if state.get("replan_count", 0) < budgets.max_replans:
-                return "plan"
-            return "fail"
-
-        # Rule 5: next step's fanout is unexpanded -> plan/fail if unhandled in AGENT-002
-        if runnable.fanout is not None:
-            if state.get("replan_count", 0) < budgets.max_replans:
-                return "plan"
-            return "fail"
-
-        # Rule 6: contract.requires_approval(step) AND NOT approval_state.grants(step)
-        # -> request_approval
-        contract = self._get_contract(runnable.tool)
-        if contract and contract.requires_approval:
-            resolved_args = self._resolve_step_args(state, runnable)
-            if approval_state is None or not approval_state.grants(runnable.step_id, resolved_args):
-                return "request_approval"
-
-        # Rule 7: otherwise -> execute_tool
-        return "execute_tool"
+        return self._evaluate_decision(state).route.value
 
     # ---------------------------------------------------------------------------
     # 4. request_approval

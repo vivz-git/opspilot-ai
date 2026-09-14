@@ -407,12 +407,19 @@ def test_tool_implementations_are_reached_only_through_the_registry() -> None:
 
 
 def test_approval_checks_have_one_execution_path() -> None:
-    """The gate is asserted in exactly the places §9.5 names — the router's
-    state (`ApprovalState.grants`), the dispatcher (barrier 2) and the token
+    """The gate is asserted in exactly the places §9.5 names — the router
+    (`app/agent/decide.py`, rule 6, over `ApprovalState.grants`), the
+    dispatcher and `execute_tool`'s re-assertion (barrier 2) and the token
     itself — and tokens are minted nowhere in the application yet (HITL-002
     adds the one issuing path and must extend this list deliberately). A
     second, independent check is a second place to get it wrong."""
-    allowed_to_check = {"security.py", "agent/state.py", "tools/registry.py", "agent/nodes.py"}
+    allowed_to_check = {
+        "security.py",
+        "agent/state.py",
+        "agent/decide.py",
+        "tools/registry.py",
+        "agent/nodes.py",
+    }
     allowed_to_mint = {"security.py"}
     offenders: dict[str, list[str]] = {}
     for path in python_files(APP):
