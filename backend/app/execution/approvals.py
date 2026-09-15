@@ -21,11 +21,13 @@ import structlog
 
 from app.agent.state import ApprovalDecisionKind, ApprovalStatus, RunStatus
 from app.errors import (
-    ApprovalConflictError,
+    ApprovalExpiredError,
+    ApprovalNotPendingError,
+    ApprovalSupersededError,
     InputValidationError,
-    LeaseAcquisitionError,
     NotFoundError,
     PolicyViolation,
+    RunNotResumableError,
 )
 from app.execution.leases import LeaseConfig, LeaseHeartbeat, UnitOfWorkFactory, new_worker_id
 from app.execution.recovery import CheckpointInspection, CheckpointPhase, RunDriver
@@ -77,6 +79,20 @@ class ApprovalService:
     def owner(self) -> str:
         return self._owner
 
+    async def get_approval(self, approval_id: uuid.UUID) -> ApprovalRow | None:
+        """Retrieve a single approval by ID without exposing persistence internals."""
+        async with self._uow_factory() as uow:
+            approval = await uow.approvals.get(approval_id)
+            await uow.commit()
+            return approval
+
+    async def list_pending_queue(self, *, limit: int = 50) -> list[ApprovalRow]:
+        """List pending approvals ordered deterministically for the human approval queue."""
+        async with self._uow_factory() as uow:
+            approvals = await uow.approvals.list_pending(limit=limit)
+            await uow.commit()
+            return approvals
+
     async def decide_approval(
         self,
         approval_id: uuid.UUID,
@@ -116,18 +132,44 @@ class ApprovalService:
                     detail={"approval_id": str(approval_id), "step_id": approval.step_id},
                 )
 
-            # 3. Check if already decided
+            # 3. Check expiration
+            if approval.status == ApprovalStatus.EXPIRED or (
+                approval.status == ApprovalStatus.PENDING and now >= approval.expires_at
+            ):
+                raise ApprovalExpiredError(
+                    f"Approval {approval_id} has expired",
+                    detail={
+                        "approval_id": str(approval_id),
+                        "expires_at": approval.expires_at.isoformat(),
+                    },
+                )
+
+            # 4. Check superseded
+            if approval.status == ApprovalStatus.SUPERSEDED:
+                raise ApprovalSupersededError(
+                    f"Approval {approval_id} has been superseded",
+                    detail={
+                        "approval_id": str(approval_id),
+                        "superseded_by": str(approval.superseded_by),
+                    },
+                )
+
+            # 5. Check if already decided
             if approval.status != ApprovalStatus.PENDING:
                 if approval.status == target_status:
                     # Idempotent duplicate: same decision and valid matching args_hash
                     await uow.commit()
                     return DecideApprovalResult(approval=approval, is_winner=False, inspection=None)
                 # Opposite or non-pending status: conflict
-                raise ApprovalConflictError(
-                    f"Approval {approval_id} is already decided as {approval.status}"
+                raise ApprovalNotPendingError(
+                    f"Approval {approval_id} is already decided as {approval.status}",
+                    detail={
+                        "approval_id": str(approval_id),
+                        "current_status": approval.status.value,
+                    },
                 )
 
-            # 4. Conditionally persist decision (UPDATE ... WHERE status='pending')
+            # 6. Conditionally persist decision (UPDATE ... WHERE status='pending')
             decided = await uow.approvals.decide(
                 approval_id,
                 status=target_status,
@@ -142,11 +184,12 @@ class ApprovalService:
                     await uow.commit()
                     return DecideApprovalResult(approval=existing, is_winner=False, inspection=None)
                 status_str = existing.status if existing is not None else "unknown"
-                raise ApprovalConflictError(
-                    f"Approval {approval_id} decision race lost (current status: {status_str})"
+                raise ApprovalNotPendingError(
+                    f"Approval {approval_id} decision race lost (current status: {status_str})",
+                    detail={"approval_id": str(approval_id), "current_status": status_str},
                 )
 
-            # 5. In same transaction, claim run and transition AWAITING_APPROVAL -> RUNNING
+            # 7. In same transaction, claim run and transition AWAITING_APPROVAL -> RUNNING
             claimed = await uow.agent_runs.acquire_lease(
                 decided.run_id,
                 owner=worker_owner,
@@ -156,8 +199,9 @@ class ApprovalService:
                 status=RunStatus.RUNNING,
             )
             if claimed is None:
-                raise LeaseAcquisitionError(
-                    f"Could not acquire run ownership on {decided.run_id} during approval decision"
+                raise RunNotResumableError(
+                    f"Could not acquire run ownership on {decided.run_id} during approval decision",
+                    detail={"run_id": str(decided.run_id)},
                 )
 
             # 6. Record approval trace event

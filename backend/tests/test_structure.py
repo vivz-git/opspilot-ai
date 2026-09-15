@@ -546,3 +546,81 @@ def test_no_static_interrupt_lists() -> None:
         if found:
             offenders[rel] = found
     assert not offenders, f"static interrupt lists forbidden: {offenders}"
+
+
+def test_api_layer_does_not_call_tool_registry_dispatch() -> None:
+    """§13, §8.5: API layer must never invoke ToolRegistry.dispatch()."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "dispatch"
+            ):
+                found.append(f"dispatch(...) at line {node.lineno}")
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"API layer calls ToolRegistry.dispatch: {offenders}"
+
+
+def test_api_layer_does_not_perform_orm_queries_directly() -> None:
+    """§13.5: API layer must delegate persistence operations to services rather than
+    executing SQLAlchemy ORM queries directly."""
+    forbidden_sql_calls = {"select", "insert", "delete"}
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        rel = _rel(path)
+        if rel == "api/health.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in forbidden_sql_calls:
+                    found.append(f"{node.func.id}(...) at line {node.lineno}")
+                elif isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_sql_calls:
+                    found.append(f".{node.func.attr}(...) at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"API endpoints perform direct ORM queries: {offenders}"
+
+
+def test_api_layer_does_not_directly_call_langgraph_resume() -> None:
+    """§9.6, ADR-023: Graph resumption belongs exclusively to ApprovalService;
+    the HTTP layer must not invoke LangGraph resume directly."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr in ("resume", "ainvoke"):
+                    found.append(f".{node.func.attr}(...) at line {node.lineno}")
+                elif isinstance(node.func, ast.Name) and node.func.id == "Command":
+                    found.append(f"Command(...) at line {node.lineno}")
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"API layer directly invokes LangGraph resume: {offenders}"
+
+
+def test_api_layer_delegates_approval_decisions_to_approval_service() -> None:
+    """§13.5: decide_approval route handler must delegate to ApprovalService.decide_approval."""
+    path = APP / "api" / "approvals.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    decide_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "decide_approval":
+            decide_fn = node
+            break
+    assert decide_fn is not None, "decide_approval endpoint not found in app/api/approvals.py"
+
+    service_delegated = any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "decide_approval"
+        for n in ast.walk(decide_fn)
+    )
+    assert service_delegated, "decide_approval handler must call service.decide_approval"

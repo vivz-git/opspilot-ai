@@ -23,7 +23,7 @@ foundation     ████████░░░░░░░░░░░░  FOU
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
 agent graph    ████████████████████  AGENT-001..009 complete
-hitl           ░░░░░░░░░░░░░░░░░░░░  HITL-001..005
+hitl           ████░░░░░░░░░░░░░░░░  HITL-001 complete; HITL-002..005 outstanding
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
@@ -1329,4 +1329,32 @@ Implemented production cooperative cancellation for OpsPilot AI across all graph
 **Test suite: 1195 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL container on port 55432 — 24 new in `tests/test_cancellation.py`, the skip is the opt-in live smoke test). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 62 source files), and `alembic check` are all clean.
 
 AGENT-009 is the final agent core node task. All 9 core agent nodes (`understand`, `plan`, `decide`, `request_approval`, `execute_tool`, `verify`, `recover`, `complete`, `fail`) and their lifecycle, routing, and safety mechanisms are complete and verified.
+
+## HITL-001 — HTTP Approval API and RFC 9457 Error Handling — 2026-09-15
+
+Implemented the HTTP approval API for OpsPilot AI exposing approval queue and decision endpoints adhering strictly to §9, §13, RFC 9457 Problem Details, ADR-001, ADR-007, and ADR-023.
+
+| File | Role | Tests |
+|---|---|---|
+| `backend/app/errors.py` | Added domain exception hierarchy for approval and lease states: `ApprovalNotPendingError`, `ApprovalExpiredError`, `ApprovalSupersededError` (all inheriting from `ApprovalConflictError`), and `RunNotResumableError` (inheriting from `LeaseAcquisitionError`). | `tests/test_api_approvals.py` |
+| `backend/app/execution/approvals.py` | Added `get_approval` and `list_pending_queue` to `ApprovalService` (ensuring read transactions commit cleanly to retain loaded attributes upon session exit with `expire_on_commit=False`). Enhanced `decide_approval` to check `expires_at` and `superseded` before conflict, and map lease acquisition failure on non-resumable runs to `RunNotResumableError`. Preserved atomic decision transition and lease handoff in single DB transaction. | `tests/test_api_approvals.py`, `tests/test_hitl_recovery.py` |
+| `backend/app/api/schemas.py` | Strict Pydantic v2 schemas (`extra="forbid"`) for `ApprovalDecisionRequest` (`decision`, `args_hash`, `decided_by`, `reason` with non-empty validation on reject) and `ApprovalResource` (safe approval serialization with `redact_payload` masking sensitive fields in `payload_preview`). | `tests/test_api_approvals.py` |
+| `backend/app/api/errors.py` | Implemented standard RFC 9457 Problem Details formatting (`application/problem+json`) with machine-readable error codes (`not_found`, `approval_not_pending`, `approval_expired`, `approval_superseded`, `run_not_resumable`, `validation_error`, `internal_error`). Strips internal SQL, credentials, stack traces, and database errors. | `tests/test_api_approvals.py` |
+| `backend/app/api/dependencies.py` | Production dependency wiring reusing existing `Settings`, `create_session_factory`, `SqlUnitOfWork`, `create_agent_graph`, `LangGraphRunDriver`, `SystemClock`, `LeaseConfig`, and security authorization (`require_authorization` respecting `auth_mode`). Reusable and overridable in tests. | `tests/test_api_approvals.py` |
+| `backend/app/api/approvals.py` | Canonical `/approvals` router providing `GET /approvals/queue`, `GET /approvals/{approval_id}`, and `POST /approvals/{approval_id}/decision`. Strictly delegates to `ApprovalService` without performing direct ORM queries, mutating persistence directly, or invoking LangGraph resume. Passes caller's `args_hash` unchanged to `ApprovalService`. | `tests/test_api_approvals.py`, `tests/test_structure.py` |
+| `backend/app/main.py` | Wired `approvals_router`, `register_error_handlers`, and optional DI overrides in `create_app`. | `tests/test_api_approvals.py` |
+| `backend/tests/test_api_approvals.py` | 17 comprehensive unit and PostgreSQL integration tests verifying queue retrieval, approval retrieval, 404 on missing approval, valid approve/reject, schema validation, reject reason enforcement, extra-field forbidding, exact `args_hash` flow, idempotent retry, conflicting decision 409, expired approval 409, superseded approval 409, non-resumable run 409, authorization enforcement, and safe serialization. | `tests/test_api_approvals.py` |
+| `backend/tests/test_structure.py` | Added 4 structural invariants proving API layer does not call `ToolRegistry.dispatch()`, does not perform direct ORM queries, does not directly invoke LangGraph resume, and delegates decisions to `ApprovalService`. | `tests/test_structure.py` |
+
+**Verification & Invariants:**
+1. **Delegation Boundary**: AST structural tests verify the API layer never queries ORM models, never calls `ToolRegistry.dispatch()`, and never calls LangGraph resume directly. All operations delegate to `ApprovalService`.
+2. **Exact args_hash**: The API layer passes the caller's `args_hash` unchanged to `ApprovalService.decide_approval(...)`, ensuring persisted hash equality.
+3. **Crash-Safe Transaction Preserved**: Atomic decision handoff (`approvals` status update + `agent_runs` status update + trace event + commit) in `ApprovalService` is fully preserved.
+4. **RFC 9457 Conformance**: All error responses return `application/problem+json` with standard machine-readable codes.
+5. **No Secret Leaks**: Payload previews are redacted with `redact_payload`; database errors and stack traces are suppressed from client responses.
+
+**Deliberately not done.** No frontend/UI (FE-001..008); no verification framework (VERIFY-001..003); no public execution or campaign API routes (API-001..003, API-005..007); no token minting / `ApprovalGate` lookup (HITL-002).
+
+**Test suite: 1226 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL test database — 17 new in `tests/test_api_approvals.py`, 4 new in `tests/test_structure.py`). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 67 source files), and `alembic check` are all clean.
+
 

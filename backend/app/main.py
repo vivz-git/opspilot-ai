@@ -10,21 +10,35 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import create_async_engine
 from starlette.middleware.cors import CORSMiddleware
 
+from app.api.approvals import router as approvals_router
+from app.api.errors import register_error_handlers
 from app.api.health import discover_alembic_head
 from app.api.health import router as health_router
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
 
+if TYPE_CHECKING:
+    from app.execution.approvals import ApprovalService
+    from app.execution.recovery import RunDriver
+    from app.runtime import Clock
+
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    approval_service: ApprovalService | None = None,
+    driver: RunDriver | None = None,
+    clock: Clock | None = None,
+) -> FastAPI:
     settings = settings or get_settings()
     settings.validate_runtime()
     configure_logging(settings)
@@ -44,6 +58,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.database_url.get_secret_value(), pool_pre_ping=True
     )
     app.state.alembic_head_revision = discover_alembic_head(BACKEND_ROOT)
+    app.state.approval_service = approval_service
+    app.state.run_driver = driver
+    app.state.clock = clock
+
+    register_error_handlers(app)
 
     app.add_middleware(
         CORSMiddleware,
@@ -54,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.include_router(health_router)
+    app.include_router(approvals_router)
 
     return app
 

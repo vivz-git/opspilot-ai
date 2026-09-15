@@ -169,10 +169,26 @@ class ApprovalConflictError(OpsPilotError):
     error_class = ErrorClass.POLICY_VIOLATION
 
 
+class ApprovalNotPendingError(ApprovalConflictError):
+    """Raised when deciding an approval that is already decided with a conflicting decision."""
+
+
+class ApprovalExpiredError(ApprovalConflictError):
+    """Raised when deciding an approval whose TTL has elapsed."""
+
+
+class ApprovalSupersededError(ApprovalConflictError):
+    """Raised when deciding an approval that has been superseded by a newer approval."""
+
+
 class LeaseAcquisitionError(OpsPilotError):
     """Raised when a worker fails to acquire ownership of a run during a lifecycle transition."""
 
     error_class = ErrorClass.INTERNAL
+
+
+class RunNotResumableError(LeaseAcquisitionError):
+    """Raised when deciding an approval whose agent run is not in a resumable state."""
 
 
 def is_retryable(error_class: ErrorClass, *, idempotent: bool, nondeterministic: bool) -> bool:
