@@ -390,6 +390,20 @@ class ApprovalRepository(Protocol):
         """Retrieve the pending approval for a given run and step, if any."""
         ...
 
+    async def get_approved(self, run_id: uuid.UUID, step_id: str) -> ApprovalRow | None:
+        """The current `approved` decision for exactly this run and step, or
+        `None` (HITL-002).
+
+        Selects `approved` rows only. A step may carry several historical
+        decisions (each replan that changes the arguments requests afresh,
+        §9.3), so the *most recently decided* one is the current decision and
+        an older grant never outranks it; the gate then binds that one row to
+        the exact arguments about to be sent. Never a pending, rejected,
+        expired, superseded or cancelled row, and never a row from another
+        run or step.
+        """
+        ...
+
     async def create_request(
         self,
         *,

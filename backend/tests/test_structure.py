@@ -410,8 +410,10 @@ def test_approval_checks_have_one_execution_path() -> None:
     """The gate is asserted in exactly the places §9.5 names — the router
     (`app/agent/decide.py`, rule 6, over `ApprovalState.grants`), the
     dispatcher and `execute_tool`'s re-assertion (barrier 2) and the token
-    itself — and tokens are minted nowhere in the application yet (HITL-002
-    adds the one issuing path and must extend this list deliberately). A
+    itself — and tokens are issued on exactly one path (HITL-002): the
+    minting primitive `ApprovalGate.issue` is called only inside
+    `security.py`, and the application's one issuing call,
+    `ApprovalGate.issue_from_persisted`, is made only by `execute_tool`. A
     second, independent check is a second place to get it wrong."""
     allowed_to_check = {
         "security.py",
@@ -421,6 +423,7 @@ def test_approval_checks_have_one_execution_path() -> None:
         "agent/nodes.py",
     }
     allowed_to_mint = {"security.py"}
+    allowed_to_issue = {"agent/nodes.py"}
     offenders: dict[str, list[str]] = {}
     for path in python_files(APP):
         rel = _rel(path)
@@ -435,6 +438,8 @@ def test_approval_checks_have_one_execution_path() -> None:
                 if attr == "issue" and chain and chain[-1] == "ApprovalGate":
                     if rel not in allowed_to_mint:
                         found.append(f"ApprovalGate.issue(...) at line {node.lineno}")
+                elif attr == "issue_from_persisted" and rel not in allowed_to_issue:
+                    found.append(f"ApprovalGate.issue_from_persisted(...) at line {node.lineno}")
                 elif attr in ("authorises", "grants") and rel not in allowed_to_check:
                     found.append(f".{attr}(...) at line {node.lineno}")
             elif (
@@ -624,3 +629,204 @@ def test_api_layer_delegates_approval_decisions_to_approval_service() -> None:
         for n in ast.walk(decide_fn)
     )
     assert service_delegated, "decide_approval handler must call service.decide_approval"
+
+
+# ---------------------------------------------------------------------------
+# HITL-002 — one mint authority, one issuing path, no ORM in the leaf
+# (§9.5, §12, ADR-010)
+# ---------------------------------------------------------------------------
+def token_forgeries(tree: ast.AST) -> list[str]:
+    """Every way a module could produce an `ApprovalToken` without the gate:
+    calling the constructor, reaching for the module-private `_MINT`
+    sentinel (by import or attribute), or allocating an instance around
+    `__init__` (`object.__new__(ApprovalToken)`, `ApprovalToken.__new__`).
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "app.security":
+            for alias in node.names:
+                if alias.name == "_MINT":
+                    found.append(f"import _MINT at line {node.lineno}")
+        elif isinstance(node, ast.Name) and node.id == "_MINT":
+            found.append(f"_MINT at line {node.lineno}")
+        elif isinstance(node, ast.Attribute) and node.attr == "_MINT":
+            found.append(f"._MINT at line {node.lineno}")
+        elif isinstance(node, ast.Call):
+            if (isinstance(node.func, ast.Name) and node.func.id == "ApprovalToken") or (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "ApprovalToken"
+            ):
+                found.append(f"ApprovalToken(...) at line {node.lineno}")
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "__new__":
+                receiver = _receiver_names(node.func.value)
+                first_arg = node.args[0] if node.args else None
+                if receiver[-1:] == ["ApprovalToken"] or (
+                    isinstance(first_arg, ast.Name) and first_arg.id == "ApprovalToken"
+                ):
+                    found.append(f"__new__(ApprovalToken) at line {node.lineno}")
+    return sorted(set(found))
+
+
+def test_only_security_can_mint_an_approval_token() -> None:
+    """Barrier 3 is structural only if the sentinel and the constructor are
+    unreachable from every other module. Before HITL-002 `execute_tool`
+    allocated a placeholder token around `__init__` for a validation
+    preview; that is exactly the forgery this scan refuses."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        if rel == "security.py":
+            continue
+        found = token_forgeries(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"ApprovalToken forged outside ApprovalGate: {offenders}"
+
+
+FORGERY_SNIPPETS = {
+    "constructor": "t = ApprovalToken(approval_id=a, run_id=r, step_id=s, args_hash=h)",
+    "constructor-with-sentinel": (
+        "ApprovalToken(approval_id=a, run_id=r, step_id=s, args_hash=h, mint=x)"
+    ),
+    "import-sentinel": "from app.security import _MINT",
+    "module-attribute-sentinel": "import app.security as sec\nmint = sec._MINT",
+    "object-new": "t = object.__new__(ApprovalToken)",
+    "class-new": "t = ApprovalToken.__new__(ApprovalToken)",
+}
+
+
+@pytest.mark.parametrize("snippet", list(FORGERY_SNIPPETS.values()), ids=list(FORGERY_SNIPPETS))
+def test_the_token_forgery_scan_catches_the_forgery(snippet: str) -> None:
+    assert token_forgeries(ast.parse(snippet)), snippet
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "t = ApprovalGate.issue_from_persisted(row, run_id=r, step_id=s, tool=x, args=a, now=n)",
+        "def f(token: ApprovalToken | None = None) -> None: ...",
+        "assert isinstance(token, ApprovalToken)",
+    ],
+    ids=["gate-issue", "type-annotation", "isinstance"],
+)
+def test_the_token_forgery_scan_allows_legitimate_uses(snippet: str) -> None:
+    assert token_forgeries(ast.parse(snippet)) == [], snippet
+
+
+def test_security_imports_nothing_but_the_standard_library_and_errors() -> None:
+    """The leaf test above bounds `app.` imports; this bounds everything
+    else. `security.py` consumes an `ApprovalRecordProtocol`, never an ORM
+    row type, a session or SQLAlchemy — the persistence layer runs the query
+    and hands over a record."""
+    import sys
+
+    tree = ast.parse((APP / "security.py").read_text(encoding="utf-8"), filename="security.py")
+    third_party = {
+        name
+        for name in imported_modules(APP / "security.py")
+        if name not in sys.stdlib_module_names
+    }
+    assert third_party == {"app"}, f"security.py imports outside the stdlib: {third_party}"
+    internal = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app.")
+    }
+    assert internal == {"app.errors"}
+
+
+def test_the_approved_row_lookup_feeds_only_the_gate() -> None:
+    """`ApprovalRepository.get_approved` exists for one caller — the node
+    that hands the row to `ApprovalGate.issue_from_persisted`. A second
+    caller would be a second place to decide what "approved" means."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        if _under(path, "persistence/") or rel == "agent/nodes.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = [
+            f"get_approved(...) at line {node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_approved"
+        ]
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"approved-row lookup outside execute_tool: {offenders}"
+
+
+def test_token_issuance_never_mutates_approval_state() -> None:
+    """HITL-002 bridges a stored decision to a capability; it decides,
+    requests, supersedes and traces nothing. Approval rows are written by
+    the approval service (HITL-001) and, for requests, by HITL-003 — never
+    by the gate or by the agent nodes."""
+    writers = {"create_request", "decide", "supersede"}
+    approval_events = {
+        "APPROVAL_REQUESTED",
+        "APPROVAL_GRANTED",
+        "APPROVAL_REJECTED",
+        "APPROVAL_EXPIRED",
+        "APPROVAL_SUPERSEDED",
+    }
+    offenders: dict[str, list[str]] = {}
+    for rel in ("security.py", "agent/nodes.py", "agent/decide.py", "tools/registry.py"):
+        path = APP / rel
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in writers
+                and _receiver_names(node.func.value)[-1:] == ["approvals"]
+            ):
+                found.append(f"approvals.{node.func.attr}(...) at line {node.lineno}")
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in approval_events
+                and _receiver_names(node.value)[-1:] == ["TraceEventKind"]
+            ):
+                found.append(f"TraceEventKind.{node.attr} at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"approval state mutated on the token path: {offenders}"
+
+
+def test_api_layer_is_uninvolved_in_token_minting() -> None:
+    """§13, §16.2: the HTTP layer records a human's decision; it never
+    holds, mints or forwards the capability that executes it."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "app.security":
+                found.extend(
+                    f"import {alias.name} at line {node.lineno}"
+                    for alias in node.names
+                    if alias.name in {"ApprovalGate", "ApprovalToken", "_MINT"}
+                )
+            elif isinstance(node, ast.Name) and node.id in {"ApprovalGate", "ApprovalToken"}:
+                found.append(f"{node.id} at line {node.lineno}")
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"API layer touches the token: {offenders}"
+
+
+def test_node_handlers_accept_no_token_or_gate_injection() -> None:
+    """The one issuing path cannot be swapped out from the outside: no
+    constructor parameter of `NodeHandlers` or `create_agent_graph` names a
+    token issuer, a gate or a mint. (The pre-HITL-002 `token_issuer` hook was
+    such a parameter — an injectable second authority — and is gone.)"""
+    import inspect
+
+    from app.agent.graph import create_agent_graph
+    from app.agent.nodes import NodeHandlers
+
+    for fn in (NodeHandlers.__init__, create_agent_graph):
+        for name in inspect.signature(fn).parameters:
+            lowered = name.lower()
+            assert not any(word in lowered for word in ("token", "gate", "mint", "issuer")), (
+                f"{fn.__qualname__} accepts an authorisation injection point: {name}"
+            )

@@ -622,6 +622,31 @@ class SqlApprovalRepository:
         res = await self._session.execute(stmt)
         return res.scalar_one_or_none()
 
+    async def get_approved(self, run_id: uuid.UUID, step_id: str) -> ApprovalRow | None:
+        # Only `approved`, only this run and step. The partial unique index
+        # bounds *pending* rows to one per step; approved rows accumulate
+        # across replans, so the latest decision wins deterministically
+        # (`decided_at`, then `requested_at`, then the id as a total order).
+        # Fresh: the gate must see the row as it is now, not as this
+        # session last loaded it.
+        stmt = (
+            select(ApprovalRow)
+            .where(
+                ApprovalRow.run_id == run_id,
+                ApprovalRow.step_id == step_id,
+                ApprovalRow.status == ApprovalStatus.APPROVED,
+            )
+            .order_by(
+                ApprovalRow.decided_at.desc().nulls_last(),
+                ApprovalRow.requested_at.desc(),
+                ApprovalRow.id.desc(),
+            )
+            .limit(1)
+            .execution_options(populate_existing=True)
+        )
+        res = await self._session.execute(stmt)
+        return res.scalar_one_or_none()
+
     async def create_request(
         self,
         *,

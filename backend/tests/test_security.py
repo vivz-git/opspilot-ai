@@ -98,6 +98,38 @@ class TestTokenBarrier:
         with pytest.raises(dataclasses.FrozenInstanceError):
             mint().args_hash = "forged"  # type: ignore[misc]
 
+    def test_a_token_cannot_be_rebound_by_copying(self) -> None:
+        """`dataclasses.replace` re-runs `__init__` without the sentinel, so
+        a valid token cannot be turned into one for other arguments."""
+        import dataclasses
+
+        with pytest.raises(PolicyViolation):
+            dataclasses.replace(mint(), args_hash=canonical_args_hash({"draft_id": "d_2"}))
+
+    def test_a_guessed_sentinel_does_not_mint(self) -> None:
+        with pytest.raises(PolicyViolation):
+            ApprovalToken(approval_id="a", run_id="r", step_id="s", args_hash="h", mint=object())
+
+    def test_the_gate_refuses_a_missing_record_as_approval_required(self) -> None:
+        """HITL-002's issuing path (`tests/test_hitl_gate.py` has the full
+        matrix): no durable row, no token — and both refusals are members
+        of the taxonomy, so a leaf can raise them."""
+        from datetime import UTC, datetime
+
+        from app.errors import ApprovalInvalidError, ApprovalRequiredError
+
+        assert issubclass(ApprovalRequiredError, PolicyViolation)
+        assert issubclass(ApprovalInvalidError, PolicyViolation)
+        with pytest.raises(ApprovalRequiredError):
+            ApprovalGate.issue_from_persisted(
+                None,
+                run_id="r_1",
+                step_id="s6",
+                tool="send_email_mock",
+                args=ARGS,
+                now=datetime(2026, 9, 15, tzinfo=UTC),
+            )
+
 
 class TestTokenAuthorisation:
     def test_authorises_the_exact_call(self) -> None:

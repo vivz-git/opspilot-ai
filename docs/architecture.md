@@ -1047,9 +1047,11 @@ also owns three things the diagram leaves implicit:
   `POLICY_VIOLATION` for the token).
 - **Two approval checks, one path.** The token is matched against the call
   (`ApprovalToken.authorises`) *and* its stored `approvals` row must be
-  `approved` for the same run, step, tool, `args_hash` and risk. A token
-  minted for a pending, rejected, expired, cancelled or superseded row does
-  not authorise anything, whatever it says.
+  `approved` for the same run, step, tool, `args_hash` and risk, not chained
+  forward (`superseded_by` unset) and inside its TTL (`now < expires_at`),
+  read fresh at dispatch time (HITL-002). A token minted for a pending,
+  rejected, expired, cancelled or superseded row does not authorise
+  anything, whatever it says — nor does one whose row moved after minting.
 - **One port per tool.** An implementation receives exactly the port its
   contract declares (`Adapters.port(contract.port)`) inside a `ToolContext`
   that only the dispatcher constructs; `tests/test_structure.py` proves no
@@ -1152,6 +1154,17 @@ Three independent barriers must all fail for an unapproved mutation to occur:
    `ApprovalGate.issue()`, from a **persisted** `approved` decision, carrying
    `(run_id, step_id, args_hash, approval_id)`. The adapter re-validates the
    hash against the payload it was handed.
+
+   As built (HITL-002): the token is an *in-process capability*, not a signed
+   credential — a frozen dataclass whose constructor demands a module-private
+   sentinel, never serialised or persisted. The application's one issuing
+   path is `ApprovalGate.issue_from_persisted`, called only by `execute_tool`
+   over the row `ApprovalRepository.get_approved(run_id, step_id)` returns
+   (the current `approved` decision for exactly that run and step); it
+   refuses unless the row is `approved`, names this run, step and tool, is
+   not superseded, is inside its TTL, and its `args_hash` equals the hash of
+   the arguments about to be sent. `security.py` stays a leaf: it consumes an
+   `ApprovalRecordProtocol`, never the ORM.
 
 Barrier 3 is what makes the guarantee structural rather than procedural: code
 that calls `MailPort.send(...)` from anywhere — a script, a test, a future

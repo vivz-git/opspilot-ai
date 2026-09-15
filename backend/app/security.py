@@ -1,26 +1,44 @@
-"""Approval binding primitives: the canonical argument hash and the token.
+"""Approval binding primitives: the canonical argument hash, the token and
+the gate that mints it from a persisted decision.
 
 See docs/architecture.md §9.4-§9.5. This module is a leaf so that both the
 agent (which mints tokens from stored decisions) and the integration layer
-(whose mutating port methods require one) can depend on it.
+(whose mutating port methods require one) can depend on it. It therefore
+never sees a database: the persistence layer runs the query and hands the
+gate an `ApprovalRecordProtocol` — the handful of columns the decision
+needs — and the gate answers from that record alone.
 
 Two properties are enforced here rather than documented:
 
 1. An approval is bound to the *arguments*, not merely to a step, so a plan
    revision cannot reuse a human's grant for different arguments.
 2. `ApprovalToken` cannot be constructed by ordinary code. Only
-   `ApprovalGate.issue` — which is only reachable from a persisted, approved
-   decision — can mint one. Any other call site raises `PolicyViolation`.
+   `ApprovalGate.issue` — reached in the application solely through
+   `ApprovalGate.issue_from_persisted`, from a durable `approved` row — can
+   mint one. Any other call site raises `PolicyViolation`.
+
+What the token is, precisely: an **in-process capability**, not a signed
+credential. A frozen dataclass whose constructor demands a module-private
+sentinel (`_MINT`) that nothing else imports; `tests/test_structure.py`
+proves no other module references the sentinel or the constructor. It is
+never serialised, never persisted and never crosses a process boundary, so
+there is nothing to sign — the guarantee is that code which cannot reach
+the sentinel cannot produce an instance, and the only code that can is the
+gate, which first checks the row. The dispatcher and the adapter still
+re-check every token they are handed (§8.5, ADR-024): the token is proof of
+provenance, not a substitute for the stored decision.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import InitVar, dataclass
-from typing import Any, Final
+from datetime import datetime
+from typing import Any, Final, Protocol
 
-from app.errors import PolicyViolation
+from app.errors import ApprovalInvalidError, ApprovalRequiredError, PolicyViolation
 
 #: Excluded from the hash because they legitimately differ between attempts or
 #: are themselves the authorisation. Including them would make every retry look
@@ -109,14 +127,118 @@ class ApprovalToken:
         )
 
 
+#: The one status from which a token may be minted. Spelled here rather
+#: than imported from `app.agent.state.ApprovalStatus` because this module
+#: is a leaf (§4.1); `tests/test_security.py` pins the two to each other.
+APPROVED_STATUS: Final[str] = "approved"
+
+
+class ApprovalRecordProtocol(Protocol):
+    """The columns of an `approvals` row (§12.6) the gate decides from.
+
+    A structural view, so the persistence layer's `ApprovalRow` satisfies it
+    without this module importing the ORM, and a unit test can hand the gate
+    a plain object. Read-only on purpose: the gate never mutates approval
+    state (HITL-002 bridges a decision to a capability; it does not decide).
+    """
+
+    @property
+    def id(self) -> uuid.UUID: ...
+    @property
+    def run_id(self) -> uuid.UUID: ...
+    @property
+    def step_id(self) -> str: ...
+    @property
+    def tool(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def args_hash(self) -> str: ...
+    @property
+    def superseded_by(self) -> uuid.UUID | None: ...
+    @property
+    def expires_at(self) -> datetime: ...
+
+
 class ApprovalGate:
     """The only place an `ApprovalToken` comes from.
 
-    The real implementation loads the approval row and refuses unless it is
-    `approved` and its `args_hash` matches the arguments about to be sent. The
-    signature is fixed here because it is a security boundary; the persistence
-    lookup is HITL-002.
+    `issue_from_persisted` is the application's single issuing path (HITL-002):
+    it takes the current `approved` row the repository found for the step —
+    or `None` — and refuses unless every binding holds. `issue` is the
+    minting primitive underneath it, kept for the tests that script a human
+    decision; `tests/test_structure.py` allows it nowhere else.
     """
+
+    @staticmethod
+    def issue_from_persisted(
+        record: ApprovalRecordProtocol | None,
+        *,
+        run_id: str,
+        step_id: str,
+        tool: str | None,
+        args: dict[str, Any],
+        now: datetime,
+    ) -> ApprovalToken:
+        """Mint a token for `args` from a durable approved decision, or refuse.
+
+        Barrier 3 of §9.5. Every check fails closed and none has a fallback:
+        there is no "closest" approval, no "same step, other tool", no "same
+        tool, other arguments". In order —
+
+        1. a record exists for the requested run and step, else
+           `ApprovalRequiredError`;
+        2. its status is `approved` (a pending, rejected, expired, superseded
+           or cancelled row authorises nothing);
+        3. it names this run;
+        4. it names this step;
+        5. it names this tool, when the caller states one;
+        6. it has not been superseded (`superseded_by` is unset);
+        7. its TTL has not elapsed (`now < expires_at`) — a grant is usable
+           only inside the window the human was shown;
+        8. its `args_hash` equals `canonical_args_hash(args)`, the hash of
+           the arguments about to be sent (§9.4).
+
+        Any failure after (1) is `ApprovalInvalidError`. Both are
+        `PolicyViolation`: terminal, never retried (§10.1). `now` is the
+        injected clock's reading, never wall time (§18.2).
+        """
+        base: dict[str, Any] = {"run_id": run_id, "step_id": step_id, "tool": tool}
+        if record is None:
+            raise ApprovalRequiredError(
+                "no approved decision is stored for this step; human approval is required",
+                detail=base,
+            )
+        detail = {**base, "approval_id": str(record.id)}
+        mismatches: list[str] = []
+        if str(record.status) != APPROVED_STATUS:
+            mismatches.append(f"status={record.status}")
+        if str(record.run_id) != run_id:
+            mismatches.append("run_id")
+        if record.step_id != step_id:
+            mismatches.append("step_id")
+        if tool is not None and str(record.tool) != tool:
+            mismatches.append("tool")
+        if record.superseded_by is not None:
+            mismatches.append("superseded")
+        if now >= record.expires_at:
+            mismatches.append("expired")
+        actual = canonical_args_hash(args)
+        if record.args_hash != actual:
+            mismatches.append("args_hash")
+        if mismatches:
+            raise ApprovalInvalidError(
+                "stored approval does not authorise this call",
+                detail={**detail, "mismatch": mismatches},
+            )
+        return ApprovalGate.issue(
+            approval_id=str(record.id),
+            run_id=run_id,
+            step_id=step_id,
+            args=args,
+            approved_args_hash=record.args_hash,
+            decision="approve",
+        )
 
     @staticmethod
     def issue(

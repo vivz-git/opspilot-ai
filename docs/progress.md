@@ -23,7 +23,7 @@ foundation     ████████░░░░░░░░░░░░  FOU
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
 agent graph    ████████████████████  AGENT-001..009 complete
-hitl           ████░░░░░░░░░░░░░░░░  HITL-001 complete; HITL-002..005 outstanding
+hitl           ████████░░░░░░░░░░░░  HITL-001, 002 complete; HITL-003..005 outstanding
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
@@ -1357,4 +1357,67 @@ Implemented the HTTP approval API for OpsPilot AI exposing approval queue and de
 
 **Test suite: 1226 passed, 1 skipped** (`cd backend && uv run pytest` with `DATABASE_URL` pointing to PostgreSQL test database — 17 new in `tests/test_api_approvals.py`, 4 new in `tests/test_structure.py`). `ruff check .`, `ruff format --check .`, `mypy app` (strict, 67 source files), and `alembic check` are all clean.
 
+## HITL-002 — Token minting and `ApprovalGate` lookup from approved rows — 2026-09-15
 
+Barrier 3 of §9.5 is now real: a mutating tool receives an `ApprovalToken`
+only when a durable, currently valid `approved` row exists for the exact
+`(run_id, step_id, tool, canonical_args_hash(args))`, and the token is minted
+on exactly one path. HITL-002 bridges a stored decision to an execution-time
+capability; it approves, rejects, requests, supersedes and traces nothing.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/security.py` | `ApprovalRecordProtocol` — the read-only structural view of an `approvals` row (`id`, `run_id`, `step_id`, `tool`, `status`, `args_hash`, `superseded_by`, `expires_at`) the gate decides from, so the leaf never imports the ORM. `ApprovalGate.issue_from_persisted(record, *, run_id, step_id, tool, args, now)` — the application's single issuing path. Refuses `ApprovalRequiredError` when `record is None`; otherwise collects every failed binding — `status != "approved"`, `run_id`, `step_id`, `tool` (when stated), `superseded_by is not None`, `now >= expires_at`, `args_hash != canonical_args_hash(args)` — and raises `ApprovalInvalidError` naming all of them. Only then does it call `ApprovalGate.issue`, the one expression in the codebase that passes `_MINT`. `APPROVED_STATUS` spells the enum value locally (a leaf cannot import `ApprovalStatus`); a test pins the two. | `tests/test_hitl_gate.py` (gate matrix), `tests/test_security.py` |
+| `app/errors.py` | `ApprovalRequiredError` and `ApprovalInvalidError` moved into the taxonomy (both `PolicyViolation`, terminal) so the leaf can raise them. `app.tools.registry` re-exports them; every existing import site is unchanged. | `tests/test_security.py` |
+| `app/persistence/protocols.py`, `app/persistence/repositories.py` | `ApprovalRepository.get_approved(run_id, step_id) -> ApprovalRow \| None`: `status = 'approved'` only, exact run and step, ordered `decided_at DESC NULLS LAST, requested_at DESC, id DESC LIMIT 1`, `populate_existing` so a session that loaded the row before another transaction decided it never answers from its stale copy. The partial unique index bounds *pending* rows to one per step; approved rows accumulate across replans, so the latest decision is the current one and an older grant never outranks it. | `tests/test_hitl_gate.py::TestApprovedRowLookup` |
+| `app/agent/nodes.py` | `execute_tool` for a gated tool: resolve `$ref`s → validate the plan's own arguments → barrier 2 (`approval_state.grants`) → `uow.approvals.get_approved` → `ApprovalGate.issue_from_persisted(..., now=clock.now())` → `ToolRegistry.dispatch(approval_token=token)`. Ungated tools receive no token. Two second authorisation paths were removed: the placeholder token `execute_tool` used to allocate with `object.__new__(ApprovalToken)` for input pre-validation (replaced by `_validate_plan_arguments`, which ignores only errors located at a dispatcher-owned field), and the injectable `token_issuer` constructor hook. A gated step on handlers with no `uow_factory` fails closed (`ApprovalRequiredError`). Every attempt re-reads the row; nothing is cached. | `tests/test_hitl_gate.py::TestExecuteToolMintsFromTheRow`, `::TestAgentGraphEndToEnd` |
+| `app/tools/registry.py` | `_verify_stored_decision` now also refuses `superseded_by IS NOT NULL` and `clock.now() >= expires_at`, reading the row fresh — so the dispatcher's stored-decision check agrees with the gate and a token that was valid when minted is re-judged at dispatch. | `tests/test_hitl_gate.py::TestDispatcherRechecksAGateMintedToken`, `tests/test_tool_dispatch.py` |
+| `tests/test_structure.py` | 12 new structural tests: a token-forgery scan (constructor, `_MINT` by import or attribute, `object.__new__`/`ApprovalToken.__new__`) proven by six canaries and three allowed uses; `ApprovalGate.issue` only in `security.py` and `issue_from_persisted` only in `agent/nodes.py`; `get_approved` called only by `execute_tool`; no `approvals.create_request/decide/supersede` and no `TraceEventKind.APPROVAL_*` on the token path (HITL-003 keeps request creation); the API layer never imports or names `ApprovalGate`/`ApprovalToken`; `NodeHandlers`/`create_agent_graph` accept no token/gate/mint/issuer parameter; `security.py` imports only the stdlib and `app.errors`. | `tests/test_structure.py` |
+
+**What the token is.** An in-process capability, not a signed credential: a
+frozen dataclass whose `__post_init__` demands a module-private sentinel that
+no other module references (the structural scan proves it). It is never
+serialised, persisted or sent anywhere, so there is nothing to sign — the
+guarantee is that code which cannot reach the sentinel cannot produce an
+instance, and the only code that can is the gate, which first checks the row.
+It is proof of provenance; the dispatcher and the adapter still re-check every
+token they are handed.
+
+**Defense in depth, as it now stands.** Router (rule 6) → `execute_tool`'s
+`approval_state.grants` re-assertion → `ApprovalGate.issue_from_persisted`
+over the durable row → `ToolRegistry._assert_gate` (`token.authorises`) →
+`ToolRegistry._verify_stored_decision` (row is `approved`, same run/step/tool/
+hash/risk, not superseded, inside its TTL, read fresh at dispatch) → the
+adapter's token requirement → the per-key advisory lock and the outbox
+`UNIQUE(idempotency_key)`. No layer was removed; one gained two conditions.
+
+**Concurrency and replay** (real Postgres, `tests/test_hitl_gate.py`): two
+concurrent `execute_tool` calls with identical valid authorisation each mint a
+token and dispatch; the key lock serialises them and the constraint makes the
+loser `duplicate_suppressed` — one outbox row. Two drivers of the *same*
+attempt: one `DuplicateAttemptError`, one effect. A token replayed into another
+run, step or tool, or presented with other arguments, is refused by the
+dispatcher. An approval that expires (clock moved past `expires_at`) or is
+chained forward (`superseded_by` set by raw SQL, since no repository method
+does it to an approved row today) between minting and dispatch is refused by
+the dispatcher. Expiry at the check boundary is closed: `now == expires_at` is
+expired, the same comparison `ApprovalService` uses.
+
+**Deliberately not done.** HITL-003 (`request_approval` idempotent upsert and
+`approval_requested` emission — the graph still persists no approval row when
+it pauses, so the end-to-end test scripts the human through the repository);
+HITL-004 (single-flight resume contention); HITL-005 (payload preview); no
+migration (every check is expressible over the existing `approvals` columns);
+no durable `tool_calls` row or `policy_violation` trace for a gate refusal
+inside `execute_tool` — like barrier 2's refusal today, it is recorded in the
+run state (`errors`, `tool_calls`) and fails the run, and the dispatcher's
+durable record covers refusals of a presented token.
+
+**Test suite: 1304 passed, 1 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` pointing at PostgreSQL — 60 new in `tests/test_hitl_gate.py`,
+4 in `tests/test_security.py`, 12 in `tests/test_structure.py`; one assertion in
+`tests/test_tool_dispatch.py` widened to the fuller mismatch detail).
+`ruff check .`, `ruff format --check .`, `mypy app` (strict, 67 source files)
+and `alembic check` are clean. gitleaks reports two pre-existing findings in
+`tests/test_responder.py` (commit `83cf2573`): deliberate credential-shaped
+strings that exercise the sanitizer, not credentials.

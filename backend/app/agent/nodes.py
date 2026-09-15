@@ -16,6 +16,7 @@ from typing import Any, Final
 
 import structlog
 from langgraph.types import interrupt
+from pydantic import ValidationError
 
 from app.agent.decide import Decision, evaluate_decision
 from app.agent.normalizer import RuleTaskNormalizer, TaskNormalizer
@@ -50,6 +51,7 @@ from app.agent.state import (
 from app.errors import (
     REPLANNABLE,
     TERMINAL_ERRORS,
+    ApprovalRequiredError,
     ErrorClass,
     InputValidationError,
     PlannerError,
@@ -68,7 +70,7 @@ from app.runtime import (
     SystemClock,
     UuidIdGenerator,
 )
-from app.security import ApprovalToken, canonical_args_hash
+from app.security import ApprovalGate, ApprovalToken, canonical_args_hash
 from app.tools.contracts import (
     REGISTRY,
     SideEffect,
@@ -76,7 +78,7 @@ from app.tools.contracts import (
     ToolName,
     VerificationMode,
 )
-from app.tools.registry import ApprovalRequiredError, ToolRegistry
+from app.tools.registry import DISPATCHER_OWNED_KEYS, ToolRegistry
 
 __all__ = [
     "NodeHandlers",
@@ -152,7 +154,6 @@ class NodeHandlers:
         id_gen: IdGenerator | None = None,
         normalizer: TaskNormalizer | None = None,
         planner: Planner | None = None,
-        token_issuer: Callable[[str, str, dict[str, Any]], ApprovalToken | None] | None = None,
         arg_resolver: Callable[[AgentState, PlanStep], dict[str, Any]] | None = None,
         understand_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
         plan_handler: Callable[[AgentState], Awaitable[dict[str, Any]]] | None = None,
@@ -178,7 +179,6 @@ class NodeHandlers:
         self._id_gen = id_gen or UuidIdGenerator()
         self._normalizer = normalizer or RuleTaskNormalizer()
         self._planner: Planner = planner or RulePlanner()
-        self._token_issuer = token_issuer
         self._arg_resolver = arg_resolver
         self._understand_handler = understand_handler
         self._plan_handler = plan_handler
@@ -217,6 +217,66 @@ class NodeHandlers:
         if self._arg_resolver is not None:
             return self._arg_resolver(state, step)
         return resolve_step_args(state, step)
+
+    @staticmethod
+    def _validate_plan_arguments(
+        contract: ToolContract, step_id: str, resolved_args: dict[str, Any]
+    ) -> None:
+        """Classify a planning fault (`INPUT_VALIDATION`) before the gate.
+
+        Validates the resolved arguments against `contract.input_model` and
+        ignores only the errors located at a dispatcher-owned field: those
+        fields are injected by `ToolRegistry.dispatch`, which validates the
+        complete input again. A plan that *supplies* one is still refused —
+        by the dispatcher's hygiene check, which is the one place that
+        distinction is made.
+        """
+        try:
+            contract.input_model.model_validate(dict(resolved_args))
+        except ValidationError as exc:
+            problems = [
+                {"loc": list(map(str, e["loc"])), "msg": e["msg"], "type": e["type"]}
+                for e in exc.errors(include_url=False, include_input=False)
+                if not (e["loc"] and str(e["loc"][0]) in DISPATCHER_OWNED_KEYS)
+            ]
+            if problems:
+                raise InputValidationError(
+                    f"Step {step_id} arguments invalid for tool {contract.name.value}",
+                    detail={"step_id": step_id, "tool": contract.name.value, "errors": problems},
+                ) from exc
+
+    async def _issue_approval_token(
+        self, *, run_id: str, step_id: str, tool: ToolName, resolved_args: dict[str, Any]
+    ) -> ApprovalToken:
+        """Barrier 3 of §9.5 (HITL-002): the durable decision becomes a
+        capability, or the step is refused.
+
+        The repository selects the current `approved` row for exactly this
+        run and step (SQL lives there, §12); `ApprovalGate.issue_from_persisted`
+        binds it to this tool and to `canonical_args_hash(resolved_args)` and
+        mints the only kind of token the dispatcher and the adapter accept.
+        Nothing here approves, rejects, requests or mutates an approval, and
+        nothing is cached: every attempt re-reads the row, so a decision that
+        expired or was superseded after an earlier attempt is seen. Without a
+        durable store there is nothing to mint from, so the step fails closed.
+        """
+        if self._uow_factory is None:
+            raise ApprovalRequiredError(
+                "no durable approval store is bound; an approval token cannot be issued",
+                detail={"step_id": step_id, "tool": tool.value},
+            )
+        run_uuid = uuid.UUID(run_id)
+        async with self._uow_factory() as uow:
+            record = await uow.approvals.get_approved(run_uuid, step_id)
+            await uow.commit()
+        return ApprovalGate.issue_from_persisted(
+            record,
+            run_id=str(run_uuid),
+            step_id=step_id,
+            tool=tool.value,
+            args=resolved_args,
+            now=self._clock.now(),
+        )
 
     async def _is_cancelled(self, state: AgentState) -> bool:
         """Cooperative cancellation check at node entry boundaries (§13.2)."""
@@ -565,34 +625,13 @@ class NodeHandlers:
             resolved_args = self._resolve_step_args(state, step)
             args_hash = canonical_args_hash(resolved_args)
 
-            # 2. Validate resolved arguments against the tool input model
-            try:
-                candidate = dict(resolved_args)
-                fields = contract.input_model.model_fields
-                if "idempotency_key" in fields and "idempotency_key" not in candidate:
-                    candidate["idempotency_key"] = "0" * 16
-                if "approval_token" in fields and "approval_token" not in candidate:
-                    dummy_token = object.__new__(ApprovalToken)
-                    object.__setattr__(dummy_token, "approval_id", "preview_token")
-                    object.__setattr__(
-                        dummy_token,
-                        "run_id",
-                        str(state.get("run_id", "00000000-0000-0000-0000-000000000000")),
-                    )
-                    object.__setattr__(dummy_token, "step_id", current_step_id)
-                    object.__setattr__(dummy_token, "args_hash", args_hash)
-                    candidate["approval_token"] = dummy_token
-                contract.input_model.model_validate(candidate)
-            except Exception as val_exc:
-                raise InputValidationError(
-                    f"Step {current_step_id} arguments invalid for tool "
-                    f"{step.tool.value}: {val_exc}",
-                    detail={
-                        "step_id": current_step_id,
-                        "tool": step.tool.value,
-                        "errors": str(val_exc),
-                    },
-                ) from val_exc
+            # 2. Validate the plan's own arguments against the tool input
+            #    model, so a planning fault is classified before the gate is
+            #    consulted. The dispatcher-owned fields (`idempotency_key`,
+            #    `approval_token`) are not the plan's to supply and are not
+            #    validated here — the dispatcher injects the real ones (§8.5).
+            #    Nothing token-shaped is ever fabricated for this preview.
+            self._validate_plan_arguments(contract, current_step_id, resolved_args)
 
             # 3. Gate Re-assertion (Barrier 2, §9.5, §16.2)
             if contract.requires_approval:
@@ -628,11 +667,6 @@ class NodeHandlers:
                         "step_count": step_count,
                     }
 
-            # Issue or retrieve approval token if token issuer is provided
-            token: ApprovalToken | None = None
-            if contract.requires_approval and self._token_issuer is not None:
-                token = self._token_issuer(str(state["run_id"]), current_step_id, resolved_args)
-
             # 4. The only tool execution path: ToolRegistry.dispatch (§8.5, ADR-024)
             if self._registry is None:
                 no_reg_err = PolicyViolation("ToolRegistry not bound in node handlers")
@@ -649,6 +683,20 @@ class NodeHandlers:
                     ],
                     "step_count": step_count,
                 }
+
+            # 5. Barrier 3 (§9.5, HITL-002): a gated tool is dispatched with a
+            #    token minted from the durable `approved` row for exactly this
+            #    run, step, tool and argument hash — or not at all. An ungated
+            #    tool never receives one (the dispatcher refuses a token for
+            #    an ungated tool as a policy violation).
+            token: ApprovalToken | None = None
+            if contract.requires_approval:
+                token = await self._issue_approval_token(
+                    run_id=str(state["run_id"]),
+                    step_id=current_step_id,
+                    tool=step.tool,
+                    resolved_args=resolved_args,
+                )
 
             # Resolve execution_step_id if uow_factory is provided
             execution_step_id = uuid.UUID(hex=self._id_gen.new_id())

@@ -888,7 +888,10 @@ class TestApprovalGate:
             await uow.commit()
         with pytest.raises(ApprovalInvalidError) as exc:
             await g.dispatch(registry, token=token)
-        assert exc.value.detail["mismatch"] == ["status=superseded"]
+        # Both the status and the `superseded_by` chain are named (HITL-002
+        # added the column check so an approved row chained forward is dead
+        # even before its status moves).
+        assert exc.value.detail["mismatch"] == ["status=superseded", "superseded"]
 
     async def test_a_token_naming_no_stored_approval_is_rejected(
         self, registry: ToolRegistry, uow_factory: UnitOfWorkFactory, adapters: Adapters

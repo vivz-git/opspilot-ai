@@ -140,6 +140,18 @@ class PolicyViolation(OpsPilotError):
     error_class = ErrorClass.POLICY_VIOLATION
 
 
+class ApprovalRequiredError(PolicyViolation):
+    """A gated tool was reached with no grant: no token was presented to the
+    dispatcher (barrier 2 of §9.5), or no durable `approved` row exists from
+    which `ApprovalGate` could mint one (barrier 3, HITL-002)."""
+
+
+class ApprovalInvalidError(PolicyViolation):
+    """A grant exists but does not authorise *this* call: wrong run, step,
+    tool or arguments, or its stored decision is not a live `approved` row
+    (pending, rejected, expired, superseded, cancelled, or past its TTL)."""
+
+
 class BudgetExhaustedError(OpsPilotError):
     error_class = ErrorClass.BUDGET_EXHAUSTED
 

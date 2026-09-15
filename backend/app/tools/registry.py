@@ -21,7 +21,8 @@ mutating port around it.
         ├─ bind         implementation + the *declared* port, nothing else
         ├─ step check   the execution_steps row is this run, this step, this tool
         ├─ decision     gated tool: the approval row is `approved`, same run,
-        │               step, tool, hash and risk    (barrier "stored decision")
+        │               step, tool, hash and risk, not superseded, inside its
+        │               TTL                          (barrier "stored decision")
         ├─ tool_started trace, committed before anything executes
         ├─ lock         mutating tool: per-key advisory lock for the attempt
         ├─ execute      under contract.timeout_ms, through the port
@@ -70,6 +71,8 @@ from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError, Operation
 
 from app.agent.state import ApprovalStatus
 from app.errors import (
+    ApprovalInvalidError,
+    ApprovalRequiredError,
     ConfigurationError,
     ErrorClass,
     InputValidationError,
@@ -124,13 +127,10 @@ class UnknownToolError(InputValidationError):
     tool is not an attempt of anything, so nothing is recorded (§16.3)."""
 
 
-class ApprovalRequiredError(PolicyViolation):
-    """A gated tool was dispatched with no grant (barrier 2 of §9.5)."""
-
-
-class ApprovalInvalidError(PolicyViolation):
-    """A token was presented but does not authorise *this* call: wrong run,
-    step, tool or arguments, or its stored decision is not `approved`."""
+# `ApprovalRequiredError` and `ApprovalInvalidError` are members of the
+# taxonomy (`app.errors`) because `ApprovalGate` — a leaf, HITL-002 — raises
+# them too; they are re-exported here so the dispatch error family stays
+# importable from one place.
 
 
 class ToolNotBoundError(InternalError):
@@ -524,10 +524,12 @@ class ToolRegistry:
                 },
             )
 
-    @staticmethod
-    async def _verify_stored_decision(uow: UnitOfWork, a: _Attempt) -> None:
+    async def _verify_stored_decision(self, uow: UnitOfWork, a: _Attempt) -> None:
         """The token says a human approved; the row proves it. Every field the
-        token does not carry (tool, risk, current status) is checked here."""
+        token does not carry (tool, risk, current status, supersession, TTL)
+        is checked here, against the row as it is *now* — a decision that
+        expired or was superseded after the token was minted authorises
+        nothing, however recently it was minted."""
         token = a.token
         if token is None:  # pragma: no cover - _assert_gate ran first
             raise ApprovalRequiredError("no approval token", detail={"step_id": a.step_id})
@@ -538,7 +540,7 @@ class ToolRegistry:
             raise ApprovalInvalidError(
                 "approval token names a malformed approval id", detail=base
             ) from None
-        row = await uow.approvals.get(approval_id)
+        row = await uow.approvals.get(approval_id, fresh=True)
         if row is None:
             raise ApprovalInvalidError("approval token names no stored approval", detail=base)
         mismatches = []
@@ -554,6 +556,10 @@ class ToolRegistry:
             mismatches.append("args_hash")
         if row.risk != a.contract.risk:
             mismatches.append("risk")
+        if row.superseded_by is not None:
+            mismatches.append("superseded")
+        if self._clock.now() >= row.expires_at:
+            mismatches.append("expired")
         if mismatches:
             raise ApprovalInvalidError(
                 "stored approval does not authorise this call",
