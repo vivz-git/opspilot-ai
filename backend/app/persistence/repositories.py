@@ -602,7 +602,15 @@ class SqlApprovalRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get(self, approval_id: uuid.UUID) -> ApprovalRow | None:
+    async def get(self, approval_id: uuid.UUID, *, fresh: bool = False) -> ApprovalRow | None:
+        if fresh:
+            stmt = (
+                select(ApprovalRow)
+                .where(ApprovalRow.id == approval_id)
+                .execution_options(populate_existing=True)
+            )
+            res = await self._session.execute(stmt)
+            return res.scalar_one_or_none()
         return await self._session.get(ApprovalRow, approval_id)
 
     async def get_pending(self, run_id: uuid.UUID, step_id: str) -> ApprovalRow | None:
@@ -666,11 +674,15 @@ class SqlApprovalRepository:
                 decision_reason=decision_reason,
                 decided_at=decided_at,
             )
+            .execution_options(synchronize_session=False)
             .returning(ApprovalRow)
         )
         res = await self._session.execute(stmt)
+        row = res.scalar_one_or_none()
+        if row is not None:
+            await self._session.refresh(row)
         await self._session.flush()
-        return res.scalar_one_or_none()
+        return row
 
     async def supersede(
         self, approval_id: uuid.UUID, superseded_by: uuid.UUID

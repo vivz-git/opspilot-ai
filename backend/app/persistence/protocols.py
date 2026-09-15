@@ -382,7 +382,7 @@ class ToolCallRepository(Protocol):
 class ApprovalRepository(Protocol):
     """Repository protocol for `opspilot.approvals` (§12.6, §9.6)."""
 
-    async def get(self, approval_id: uuid.UUID) -> ApprovalRow | None:
+    async def get(self, approval_id: uuid.UUID, *, fresh: bool = False) -> ApprovalRow | None:
         """Retrieve an approval by its UUID PK."""
         ...
 

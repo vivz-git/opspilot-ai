@@ -636,6 +636,7 @@ class TestGraphIntegration:
         handlers = NodeHandlers(
             understand_handler=pass_understand,
             plan_handler=pass_plan,
+            clock=FixedClock(TEST_NOW),
         )
         graph = create_agent_graph(
             checkpointer=MemorySaver(),
@@ -675,6 +676,7 @@ class TestGraphIntegration:
         handlers = NodeHandlers(
             understand_handler=pass_understand,
             plan_handler=pass_plan,
+            clock=FixedClock(TEST_NOW),
         )
         graph = create_agent_graph(checkpointer=MemorySaver(), node_handlers=handlers)
         cfg = {"configurable": {"thread_id": "thread_reject_test"}}
@@ -723,6 +725,7 @@ class TestGraphIntegration:
         handlers = NodeHandlers(
             understand_handler=pass_understand,
             plan_handler=pass_plan,
+            clock=FixedClock(TEST_NOW),
         )
         handlers.execute_tool = failing_execute  # type: ignore[method-assign]
 

@@ -80,12 +80,17 @@ from typing import Any, Protocol
 
 import structlog
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import StateSnapshot
+from langgraph.types import Command, StateSnapshot
 
-from app.agent.state import TERMINAL_RUN_STATUSES, RunStatus
+from app.agent.state import (
+    TERMINAL_RUN_STATUSES,
+    ApprovalDecisionKind,
+    ApprovalStatus,
+    RunStatus,
+)
 from app.execution.leases import LeaseConfig, LeaseHeartbeat, UnitOfWorkFactory
 from app.persistence.checkpointing import DURABILITY, thread_config
-from app.persistence.models import TraceEventKind, TraceEventSeverity
+from app.persistence.models import ApprovalRow, TraceEventKind, TraceEventSeverity
 from app.runtime import Clock
 
 __all__ = [
@@ -124,6 +129,7 @@ class CheckpointInspection:
     #: checkpoint's row without re-running anything.
     status: RunStatus | None = None
     status_reason: str | None = None
+    step_id: str | None = None
 
 
 class RunDriver(Protocol):
@@ -131,9 +137,11 @@ class RunDriver(Protocol):
 
     async def inspect(self, run_id: uuid.UUID) -> CheckpointInspection: ...
 
-    async def resume(self, run_id: uuid.UUID) -> CheckpointInspection:
-        """Continue from the durable checkpoint with no new input, until the
-        graph next stops (END or an interrupt); return the resulting state."""
+    async def resume(
+        self, run_id: uuid.UUID, resume_value: str | None = None
+    ) -> CheckpointInspection:
+        """Continue from the durable checkpoint with optional resume_value (for
+        interrupted gates); return the resulting state."""
         ...
 
 
@@ -149,11 +157,13 @@ class LangGraphRunDriver:
         snapshot = await self._graph.aget_state(thread_config(run_id))
         return classify_snapshot(snapshot)
 
-    async def resume(self, run_id: uuid.UUID) -> CheckpointInspection:
-        # `None` input = "continue from the checkpoint". On a paused thread
-        # this only re-raises the interrupt; it never steps past a gate —
-        # only a `Command(resume=decision)` from the approval path does.
-        await self._graph.ainvoke(None, thread_config(run_id), durability=DURABILITY)
+    async def resume(
+        self, run_id: uuid.UUID, resume_value: str | None = None
+    ) -> CheckpointInspection:
+        # `None` input = "continue from the checkpoint". When resume_value is
+        # provided, Command(resume=decision) unblocks the interrupt gate.
+        input_data: Any = Command(resume=resume_value) if resume_value is not None else None
+        await self._graph.ainvoke(input_data, thread_config(run_id), durability=DURABILITY)
         return await self.inspect(run_id)
 
 
@@ -176,12 +186,26 @@ def classify_snapshot(snapshot: StateSnapshot) -> CheckpointInspection:
         phase = CheckpointPhase.IN_PROGRESS
     else:
         phase = CheckpointPhase.FINISHED
+
+    step_id: str | None = None
+    if isinstance(values.get("current_step_id"), str) and values["current_step_id"]:
+        step_id = values["current_step_id"]
+    if step_id is None and interrupted:
+        all_interrupts = list(snapshot.interrupts)
+        for task in snapshot.tasks:
+            all_interrupts.extend(task.interrupts)
+        for intr in all_interrupts:
+            if isinstance(intr.value, dict) and intr.value.get("step_id"):
+                step_id = str(intr.value["step_id"])
+                break
+
     return CheckpointInspection(
         phase=phase,
         checkpoint_id=str(checkpoint_id),
         next_nodes=next_nodes,
         status=status,
         status_reason=status_reason if isinstance(status_reason, str) else None,
+        step_id=step_id,
     )
 
 
@@ -312,6 +336,50 @@ class Reconciler:
             )
             return RecoveryOutcome.ERRORED
 
+    async def _find_decided_approval(
+        self, run_id: uuid.UUID, step_id: str | None = None
+    ) -> ApprovalRow | None:
+        async with self._uow_factory() as uow:
+            approvals = await uow.approvals.list_by_run(run_id)
+            await uow.commit()
+
+        if not approvals:
+            return None
+
+        # Step-specific lookup: when step_id is known from the paused checkpoint
+        if step_id is not None:
+            step_approvals = [a for a in approvals if a.step_id == step_id]
+            if step_approvals:
+                if any(a.status is ApprovalStatus.PENDING for a in step_approvals):
+                    return None
+                decided = [
+                    a
+                    for a in step_approvals
+                    if a.status in (ApprovalStatus.APPROVED, ApprovalStatus.REJECTED)
+                ]
+                if not decided:
+                    return None
+                decided.sort(
+                    key=lambda a: (a.decided_at or a.requested_at, a.requested_at),
+                    reverse=True,
+                )
+                return decided[0]
+
+        # Fallback when step_id was not captured: check entire run
+        if any(a.status is ApprovalStatus.PENDING for a in approvals):
+            return None
+
+        decided_all = [
+            a for a in approvals if a.status in (ApprovalStatus.APPROVED, ApprovalStatus.REJECTED)
+        ]
+        if not decided_all:
+            return None
+        decided_all.sort(
+            key=lambda a: (a.decided_at or a.requested_at, a.requested_at),
+            reverse=True,
+        )
+        return decided_all[0]
+
     async def _recover(self, candidate: _Candidate) -> RecoveryOutcome:
         run_id = candidate.run_id
         log = _log.bind(run_id=str(run_id), owner=self._owner)
@@ -367,10 +435,30 @@ class Reconciler:
             )
             return RecoveryOutcome.ORPHANED
 
-        if inspection.phase is CheckpointPhase.PAUSED:  # R2
-            log.info("orphan_is_paused_for_approval", checkpoint_id=inspection.checkpoint_id)
-            await self._settle_paused(candidate, event=True, payload=provenance)
-            return RecoveryOutcome.PAUSED
+        if inspection.phase is CheckpointPhase.PAUSED:  # R2 / crash-window resume
+            decided_approval = await self._find_decided_approval(
+                candidate.run_id, inspection.step_id
+            )
+            if decided_approval is None:
+                log.info("orphan_is_paused_for_approval", checkpoint_id=inspection.checkpoint_id)
+                await self._settle_paused(candidate, event=True, payload=provenance)
+                return RecoveryOutcome.PAUSED
+
+            stored_decision = (
+                ApprovalDecisionKind.APPROVE.value
+                if decided_approval.status == ApprovalStatus.APPROVED
+                else ApprovalDecisionKind.REJECT.value
+            )
+            provenance["approval_id"] = str(decided_approval.id)
+            provenance["approval_decision"] = stored_decision
+            log.info(
+                "orphan_is_paused_with_decision_resuming",
+                checkpoint_id=inspection.checkpoint_id,
+                approval_id=str(decided_approval.id),
+                decision=stored_decision,
+            )
+            await self._emit_recovered(candidate, status="resumed", payload=provenance)
+            return await self._resume(candidate, provenance, resume_value=stored_decision)
 
         if inspection.phase is CheckpointPhase.FINISHED:  # R3 / R3'
             await self._settle_finished(candidate, inspection, event=True, payload=provenance)
@@ -381,14 +469,20 @@ class Reconciler:
         await self._emit_recovered(candidate, status="resumed", payload=provenance)
         return await self._resume(candidate, provenance)
 
-    async def _resume(self, candidate: _Candidate, provenance: dict[str, Any]) -> RecoveryOutcome:
+    async def _resume(
+        self,
+        candidate: _Candidate,
+        provenance: dict[str, Any],
+        *,
+        resume_value: str | None = None,
+    ) -> RecoveryOutcome:
         run_id = candidate.run_id
         log = _log.bind(run_id=str(run_id), owner=self._owner)
-        if candidate.status is RunStatus.QUEUED:
+        if candidate.status in (RunStatus.QUEUED, RunStatus.AWAITING_APPROVAL):
             async with self._uow_factory() as uow:
                 await uow.agent_runs.transition_status(
                     run_id,
-                    expected=(RunStatus.QUEUED,),
+                    expected=(candidate.status,),
                     status=RunStatus.RUNNING,
                     owner=self._owner,
                     started_at=self._clock.now(),
@@ -404,7 +498,12 @@ class Reconciler:
             sleep=self._sleep,
         )
         heartbeat.start()
-        resume_task = asyncio.create_task(self._driver.resume(run_id), name=f"resume:{run_id}")
+        resume_coro = (
+            self._driver.resume(run_id, resume_value=resume_value)
+            if resume_value is not None
+            else self._driver.resume(run_id)
+        )
+        resume_task = asyncio.create_task(resume_coro, name=f"resume:{run_id}")
         lost_task = asyncio.create_task(heartbeat.lost.wait(), name=f"lease-watch:{run_id}")
         try:
             done, _ = await asyncio.wait(

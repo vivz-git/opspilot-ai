@@ -9,3 +9,38 @@ or marks them `failed(orphaned)`.
 API-007's `Executor` composes these; nothing here starts a graph on its
 own.
 """
+
+from app.execution.approvals import ApprovalService, DecideApprovalResult
+from app.execution.leases import (
+    LeaseConfig,
+    LeaseHeartbeat,
+    LeaseNotAcquired,
+    hold_lease,
+    new_worker_id,
+)
+from app.execution.recovery import (
+    CheckpointInspection,
+    CheckpointPhase,
+    LangGraphRunDriver,
+    Reconciler,
+    ReconciliationReport,
+    RecoveryOutcome,
+    RunDriver,
+)
+
+__all__ = [
+    "ApprovalService",
+    "CheckpointInspection",
+    "CheckpointPhase",
+    "DecideApprovalResult",
+    "LangGraphRunDriver",
+    "LeaseConfig",
+    "LeaseHeartbeat",
+    "LeaseNotAcquired",
+    "Reconciler",
+    "ReconciliationReport",
+    "RecoveryOutcome",
+    "RunDriver",
+    "hold_lease",
+    "new_worker_id",
+]

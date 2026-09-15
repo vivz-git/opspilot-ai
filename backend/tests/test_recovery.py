@@ -748,9 +748,11 @@ class TestHitlSafety:
         resumes: list[uuid.UUID] = []
 
         class CountingDriver(LangGraphRunDriver):
-            async def resume(self, run_id: uuid.UUID) -> CheckpointInspection:
+            async def resume(
+                self, run_id: uuid.UUID, *args: Any, **kwargs: Any
+            ) -> CheckpointInspection:
                 resumes.append(run_id)
-                return await super().resume(run_id)
+                return await super().resume(run_id, *args, **kwargs)
 
         clock.advance(seconds=LEASE.ttl.total_seconds() + 1)
         rec = reconciler(engine, CountingDriver(graph), clock, "reconciler-B")

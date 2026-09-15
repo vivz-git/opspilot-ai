@@ -163,6 +163,18 @@ class ConfigurationError(OpsPilotError):
     error_class = ErrorClass.INTERNAL
 
 
+class ApprovalConflictError(OpsPilotError):
+    """Raised when deciding an approval that is not pending or conflicts with prior decision."""
+
+    error_class = ErrorClass.POLICY_VIOLATION
+
+
+class LeaseAcquisitionError(OpsPilotError):
+    """Raised when a worker fails to acquire ownership of a run during a lifecycle transition."""
+
+    error_class = ErrorClass.INTERNAL
+
+
 def is_retryable(error_class: ErrorClass, *, idempotent: bool, nondeterministic: bool) -> bool:
     """Is this class retryable for a tool with these contract properties?"""
     if error_class in TERMINAL_ERRORS:
