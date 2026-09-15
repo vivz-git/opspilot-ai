@@ -179,7 +179,9 @@ class TestNodeOverCheckpointedState:
         assert payload["step_id"] == STEP
         assert payload["tool"] == ToolName.SEND_EMAIL_MOCK.value
         assert payload["args_hash"] == canonical_args_hash(self.ARGS)
-        assert payload["payload_preview"] == self.ARGS
+        assert payload["payload_preview"]["draft_id"] == self.ARGS["draft_id"]
+        assert payload["payload_preview"]["to_email"] == self.ARGS["to_email"]
+        assert payload["payload_preview"]["action"] == ToolName.SEND_EMAIL_MOCK.value
         assert payload["approval_id"].startswith(f"appr_{str(run_id)[:8]}_{STEP}_")
         assert paused["status"] is RunStatus.RUNNING
         assert paused["approval_state"].decisions == {}
@@ -892,7 +894,12 @@ class TestGraphPausesDurably:
         assert row.status is ApprovalStatus.PENDING
         assert row.args_hash == canonical_args_hash(run.args) == payload["args_hash"]
         assert row.tool == ToolName.SEND_EMAIL_MOCK.value and row.risk is RiskLevel.HIGH
-        assert row.payload_preview == run.args
+        assert row.payload_preview["draft_id"] == run.args["draft_id"]
+        assert row.payload_preview["to_email"] == run.args["to_email"]
+        assert row.payload_preview["subject"] == "Hello"
+        assert row.payload_preview["body"] == "A short note."
+        assert row.payload_preview["action"] == ToolName.SEND_EMAIL_MOCK.value
+        assert row.title == f"Send outreach email to {run.args['to_email']}"
         assert row.requested_at == T0 and row.expires_at == T0 + TTL
         assert payload["approval_id"] == str(row.id)
         assert payload["run_id"] == str(run.run_id) and payload["step_id"] == STEP

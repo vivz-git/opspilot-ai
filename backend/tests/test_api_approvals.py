@@ -24,6 +24,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -615,3 +616,66 @@ class TestApprovalApiPostgresIntegration:
             grant_events = [e for e in events if e.kind == TraceEventKind.APPROVAL_GRANTED]
             assert len(grant_events) == 1
             assert grant_events[0].payload["approval_id"] == str(approval_id)
+
+    async def test_concurrent_http_post_decision_produces_one_200_and_one_409(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: Two concurrent HTTP POST decisions on the same approval
+        produce one 200 and one 409 Problem Details with code='approval_not_pending'."""
+        clock = FixedClock(T0)
+        uow_factory = uow_factory_for(engine)
+        run_id = await create_run(uow_factory)
+
+        harness = Harness()
+        graph = harness.build(checkpointer)
+
+        args_hash = "canonical-hash-xyz"
+        approval_id = await _pause_run_for_approval(
+            engine,
+            graph,
+            run_id,
+            clock,
+            step_id="s1",
+            args_hash=args_hash,
+        )
+
+        driver = LangGraphRunDriver(graph)
+        approval_service = ApprovalService(
+            uow_factory=uow_factory,
+            driver=driver,
+            clock=clock,
+            lease=LEASE,
+        )
+
+        app = create_app(
+            settings=harness_settings(),
+            approval_service=approval_service,
+            clock=clock,
+        )
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            t1 = client.post(
+                f"/approvals/{approval_id}/decision",
+                json={
+                    "decision": "approve",
+                    "args_hash": args_hash,
+                    "decided_by": "operator-1@opspilot.dev",
+                    "reason": "First concurrent approve",
+                },
+            )
+            t2 = client.post(
+                f"/approvals/{approval_id}/decision",
+                json={
+                    "decision": "approve",
+                    "args_hash": args_hash,
+                    "decided_by": "operator-2@opspilot.dev",
+                    "reason": "Second concurrent approve",
+                },
+            )
+            r1, r2 = await asyncio.gather(t1, t2)
+
+        statuses = sorted([r1.status_code, r2.status_code])
+        assert statuses == [200, 409]
+        conflict_resp = r1 if r1.status_code == 409 else r2
+        assert conflict_resp.headers["content-type"].startswith("application/problem+json")
+        assert conflict_resp.json()["code"] == "approval_not_pending"

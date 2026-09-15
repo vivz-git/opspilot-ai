@@ -31,7 +31,7 @@ from app.errors import (
 )
 from app.execution.leases import LeaseConfig, LeaseHeartbeat, UnitOfWorkFactory, new_worker_id
 from app.execution.recovery import CheckpointInspection, CheckpointPhase, RunDriver
-from app.persistence.models import ApprovalRow, TraceEventKind
+from app.persistence.models import ApprovalRow, TraceEventKind, TraceEventSeverity
 from app.runtime import Clock, IdGenerator, UuidIdGenerator
 
 __all__ = [
@@ -154,77 +154,109 @@ class ApprovalService:
                     },
                 )
 
-            # 5. Check if already decided
+            # 5. Check if already decided sequentially
             if approval.status != ApprovalStatus.PENDING:
-                if approval.status == target_status:
-                    # Idempotent duplicate: same decision and valid matching args_hash
+                if approval.status != target_status:
+                    # Opposite or non-pending status: conflict
+                    raise ApprovalNotPendingError(
+                        f"Approval {approval_id} is already decided as {approval.status}",
+                        detail={
+                            "approval_id": str(approval_id),
+                            "current_status": approval.status.value,
+                        },
+                    )
+
+                # Same decision: check run state to determine if resume retry is needed
+                run = await uow.agent_runs.get(approval.run_id)
+                if run is None or run.status not in (
+                    RunStatus.AWAITING_APPROVAL,
+                    RunStatus.RUNNING,
+                ):
+                    # Run is terminal or not in a leasable status: return idempotent duplicate
                     await uow.commit()
                     return DecideApprovalResult(approval=approval, is_winner=False, inspection=None)
-                # Opposite or non-pending status: conflict
-                raise ApprovalNotPendingError(
-                    f"Approval {approval_id} is already decided as {approval.status}",
-                    detail={
-                        "approval_id": str(approval_id),
-                        "current_status": approval.status.value,
+
+                # If another live worker holds the lease, do not steal or resume
+                if (
+                    run.lease_owner is not None
+                    and run.lease_owner != worker_owner
+                    and run.lease_expires_at is not None
+                    and run.lease_expires_at > now
+                ):
+                    await uow.commit()
+                    return DecideApprovalResult(approval=approval, is_winner=False, inspection=None)
+
+                # If lease is expired or held by us, claim ownership for retry resume
+                claimed = await uow.agent_runs.acquire_lease(
+                    approval.run_id,
+                    owner=worker_owner,
+                    now=now,
+                    ttl=self._lease.ttl,
+                    expected=(RunStatus.AWAITING_APPROVAL, RunStatus.RUNNING),
+                    status=RunStatus.RUNNING,
+                )
+                if claimed is None:
+                    # Another worker won the lease race meanwhile
+                    await uow.commit()
+                    return DecideApprovalResult(approval=approval, is_winner=False, inspection=None)
+
+                await uow.commit()
+                decided = approval
+            else:
+                # 6. Conditionally persist decision (UPDATE ... WHERE status='pending')
+                decided_opt = await uow.approvals.decide(
+                    approval_id,
+                    status=target_status,
+                    decided_by=decided_by,
+                    decision_reason=reason,
+                    decided_at=now,
+                )
+                if decided_opt is None:
+                    # Lost race to concurrent decision: always raise ApprovalNotPendingError (§9.6)
+                    existing = await uow.approvals.get(approval_id, fresh=True)
+                    status_str = existing.status if existing is not None else "unknown"
+                    raise ApprovalNotPendingError(
+                        f"Approval {approval_id} decision race lost (current status: {status_str})",
+                        detail={"approval_id": str(approval_id), "current_status": status_str},
+                    )
+                decided = decided_opt
+
+                # 7. In same transaction, claim run and transition AWAITING_APPROVAL -> RUNNING
+                claimed = await uow.agent_runs.acquire_lease(
+                    decided.run_id,
+                    owner=worker_owner,
+                    now=now,
+                    ttl=self._lease.ttl,
+                    expected=(RunStatus.AWAITING_APPROVAL, RunStatus.RUNNING),
+                    status=RunStatus.RUNNING,
+                )
+                if claimed is None:
+                    raise RunNotResumableError(
+                        f"Could not acquire run ownership on {decided.run_id} during decision",
+                        detail={"run_id": str(decided.run_id)},
+                    )
+
+                # 8. Record approval trace event
+                trace_kind = (
+                    TraceEventKind.APPROVAL_GRANTED
+                    if target_status == ApprovalStatus.APPROVED
+                    else TraceEventKind.APPROVAL_REJECTED
+                )
+                await uow.trace_events.append(
+                    run_id=decided.run_id,
+                    kind=trace_kind,
+                    status=target_status.value,
+                    step_id=decided.step_id,
+                    payload={
+                        "approval_id": str(decided.id),
+                        "decision": decision_kind.value,
+                        "decided_by": decided_by,
+                        "reason": reason,
                     },
                 )
 
-            # 6. Conditionally persist decision (UPDATE ... WHERE status='pending')
-            decided = await uow.approvals.decide(
-                approval_id,
-                status=target_status,
-                decided_by=decided_by,
-                decision_reason=reason,
-                decided_at=now,
-            )
-            if decided is None:
-                # Lost race to concurrent decision: reload fresh state directly from DB
-                existing = await uow.approvals.get(approval_id, fresh=True)
-                if existing is not None and existing.status == target_status:
-                    await uow.commit()
-                    return DecideApprovalResult(approval=existing, is_winner=False, inspection=None)
-                status_str = existing.status if existing is not None else "unknown"
-                raise ApprovalNotPendingError(
-                    f"Approval {approval_id} decision race lost (current status: {status_str})",
-                    detail={"approval_id": str(approval_id), "current_status": status_str},
-                )
-
-            # 7. In same transaction, claim run and transition AWAITING_APPROVAL -> RUNNING
-            claimed = await uow.agent_runs.acquire_lease(
-                decided.run_id,
-                owner=worker_owner,
-                now=now,
-                ttl=self._lease.ttl,
-                expected=(RunStatus.AWAITING_APPROVAL, RunStatus.RUNNING),
-                status=RunStatus.RUNNING,
-            )
-            if claimed is None:
-                raise RunNotResumableError(
-                    f"Could not acquire run ownership on {decided.run_id} during approval decision",
-                    detail={"run_id": str(decided.run_id)},
-                )
-
-            # 6. Record approval trace event
-            trace_kind = (
-                TraceEventKind.APPROVAL_GRANTED
-                if target_status == ApprovalStatus.APPROVED
-                else TraceEventKind.APPROVAL_REJECTED
-            )
-            await uow.trace_events.append(
-                run_id=decided.run_id,
-                kind=trace_kind,
-                status=target_status.value,
-                step_id=decided.step_id,
-                payload={
-                    "approval_id": str(decided.id),
-                    "decision": decision_kind.value,
-                    "decided_by": decided_by,
-                    "reason": reason,
-                },
-            )
-
-            # 7. COMMIT the transaction
-            await uow.commit()
+                # 9. COMMIT the transaction
+                await uow.commit()
 
         _log.info(
             "approval_decided_committed",
@@ -238,7 +270,7 @@ class ApprovalService:
         if self._before_resume is not None:
             await self._before_resume()
 
-        # 8. Resume graph using Command(resume=stored_decision)
+        # 10. Resume graph using Command(resume=stored_decision)
         stored_decision = decision_kind.value
         heartbeat = LeaseHeartbeat(
             uow_factory=self._uow_factory,
@@ -250,10 +282,50 @@ class ApprovalService:
         heartbeat.start()
         try:
             inspection = await self._driver.resume(decided.run_id, resume_value=stored_decision)
+        except Exception as exc:
+            await heartbeat.stop()
+            if not heartbeat.lost.is_set():
+                async with self._uow_factory() as uow:
+                    await uow.agent_runs.transition_status(
+                        decided.run_id,
+                        expected=(RunStatus.RUNNING,),
+                        status=RunStatus.FAILED,
+                        owner=worker_owner,
+                        status_reason="resume_failed",
+                        finished_at=self._clock.now(),
+                        release_lease=True,
+                    )
+                    await uow.trace_events.append(
+                        run_id=decided.run_id,
+                        kind=TraceEventKind.RUN_FAILED,
+                        severity=TraceEventSeverity.ERROR,
+                        status=RunStatus.FAILED.value,
+                        error={
+                            "class": "resume_failed",
+                            "message": "graph raised while resuming from approval decision",
+                            "detail": repr(exc),
+                        },
+                        payload={
+                            "approval_id": str(decided.id),
+                            "owner": worker_owner,
+                        },
+                    )
+                    await uow.commit()
+            raise
         finally:
             await heartbeat.stop()
 
-        # 9. Settle the row
+        # If lease was lost during resume execution, abort without settling the row
+        if heartbeat.lost.is_set():
+            _log.warning(
+                "resume_abandoned",
+                run_id=str(decided.run_id),
+                owner=worker_owner,
+                reason="lease_lost",
+            )
+            return DecideApprovalResult(approval=decided, is_winner=True, inspection=inspection)
+
+        # 11. Settle the row
         if inspection.phase is CheckpointPhase.FINISHED and inspection.status is not None:
             async with self._uow_factory() as uow:
                 await uow.agent_runs.transition_status(

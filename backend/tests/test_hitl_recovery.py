@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 from app.agent.state import ApprovalDecisionKind, ApprovalStatus, RunStatus
-from app.errors import ApprovalConflictError, PolicyViolation
+from app.errors import ApprovalConflictError, ApprovalNotPendingError, PolicyViolation
 from app.execution.approvals import ApprovalService
 from app.execution.recovery import (
     CheckpointInspection,
@@ -641,3 +641,290 @@ class TestHitlCrashWindowRecovery:
         assert report.outcomes.get(run_id) is RecoveryOutcome.LEASE_LOST
         row = await read_run(uow_factory, run_id)
         assert row.lease_owner == "worker-C"
+
+
+@pytest.mark.usefixtures("_database")
+class TestHitlSingleFlightResumeContention:
+    """HITL-004: Single-flight resume contention and multi-worker resume coordination."""
+
+    async def test_concurrent_approve_calls_produce_one_resume_and_one_409(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: Two concurrent approve calls produce exactly one resume
+        and one 409 conflict; exactly one outbox row / finish effect."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        draft_id, to_email = await seed_draft(uow_factory)
+        harness = Harness(effect=outbox_effect(uow_factory, draft_id, to_email))
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        approval_id = await _pause_run_for_approval(engine, graph, run_id, clock)
+
+        service1 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-racer-1",
+        )
+        service2 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-racer-2",
+        )
+
+        t1 = service1.decide_approval(
+            approval_id,
+            decision="approve",
+            args_hash="hash-s1",
+            decided_by="operator-1",
+        )
+        t2 = service2.decide_approval(
+            approval_id,
+            decision="approve",
+            args_hash="hash-s1",
+            decided_by="operator-2",
+        )
+
+        results = await asyncio.gather(t1, t2, return_exceptions=True)
+        winners = [r for r in results if not isinstance(r, Exception) and r.is_winner]
+        conflicts = [r for r in results if isinstance(r, ApprovalNotPendingError)]
+
+        assert len(winners) == 1
+        assert len(conflicts) == 1
+        assert harness.calls(run_id)["finish"] == 1
+        outbox_rows = await outbox_rows_for(uow_factory, run_id)
+        assert len(outbox_rows) == 1
+
+    async def test_n_worker_stampede_race_has_single_winner(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: 6 concurrent approve calls produce exactly 1 winner and 5 conflicts."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        approval_id = await _pause_run_for_approval(engine, graph, run_id, clock)
+
+        services = [
+            ApprovalService(
+                uow_factory=uow_factory,
+                driver=LangGraphRunDriver(graph),
+                clock=clock,
+                lease=LEASE,
+                owner=f"worker-stampede-{i}",
+            )
+            for i in range(6)
+        ]
+
+        tasks = [
+            srv.decide_approval(
+                approval_id,
+                decision="approve",
+                args_hash="hash-s1",
+                decided_by=f"operator-{i}",
+            )
+            for i, srv in enumerate(services)
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        winners = [r for r in results if not isinstance(r, Exception) and r.is_winner]
+        conflicts = [r for r in results if isinstance(r, ApprovalNotPendingError)]
+
+        assert len(winners) == 1
+        assert len(conflicts) == 5
+        assert harness.calls(run_id)["finish"] == 1
+
+    async def test_approval_retry_after_worker_crash_and_lease_expiry(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: When Worker A crashes after commit and lease expires, a retried
+        decision at Worker B re-acquires the expired lease and resumes the graph."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        approval_id = await _pause_run_for_approval(engine, graph, run_id, clock)
+
+        async def crash_after_commit() -> None:
+            raise RuntimeError("crash after commit")
+
+        service1 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="crashed-worker-1",
+            before_resume=crash_after_commit,
+        )
+
+        with pytest.raises(RuntimeError):
+            await service1.decide_approval(
+                approval_id,
+                decision="approve",
+                args_hash="hash-s1",
+            )
+
+        # Lease is currently expired
+        clock.advance(seconds=LEASE.ttl.total_seconds() + 5)
+
+        # Worker B arrives with retry
+        service2 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-retry-2",
+        )
+
+        res = await service2.decide_approval(
+            approval_id,
+            decision="approve",
+            args_hash="hash-s1",
+        )
+        assert res.is_winner is True
+        assert harness.calls(run_id)["finish"] == 1
+        settled = await read_run(uow_factory, run_id)
+        assert settled.status is RunStatus.COMPLETED
+        assert settled.lease_owner is None
+
+    async def test_approval_retry_while_worker_running_does_not_duplicate_resume(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: When Worker A holds an active unexpired lease, a retried call at Worker B
+        returns is_winner=False and does not dispatch a second resume."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        approval_id = await _pause_run_for_approval(engine, graph, run_id, clock)
+
+        # Mark approval as approved, but leave run actively leased to Worker A
+        async with uow_factory() as uow:
+            await uow.approvals.decide(
+                approval_id,
+                status=ApprovalStatus.APPROVED,
+                decided_by="operator-A",
+                decided_at=clock.now(),
+            )
+            claimed = await uow.agent_runs.acquire_lease(
+                run_id,
+                owner="active-worker-A",
+                now=clock.now(),
+                ttl=LEASE.ttl,
+                expected=(RunStatus.AWAITING_APPROVAL,),
+                status=RunStatus.RUNNING,
+            )
+            assert claimed is not None
+            await uow.commit()
+
+        service2 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-B",
+        )
+
+        res = await service2.decide_approval(
+            approval_id,
+            decision="approve",
+            args_hash="hash-s1",
+        )
+        assert res.is_winner is False
+        assert harness.calls(run_id)["finish"] == 0
+
+    async def test_resume_failure_settles_run_to_failed(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: When driver.resume raises an unhandled exception, ApprovalService
+        settles run to FAILED(status_reason='resume_failed') and releases the lease."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        approval_id = await _pause_run_for_approval(engine, graph, run_id, clock)
+
+        class FailingDriver(LangGraphRunDriver):
+            async def resume(
+                self, rid: uuid.UUID, resume_value: str | None = None
+            ) -> CheckpointInspection:
+                raise RuntimeError("engine crashed during resume")
+
+        service = ApprovalService(
+            uow_factory=uow_factory,
+            driver=FailingDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-fail-test",
+        )
+
+        with pytest.raises(RuntimeError, match="engine crashed during resume"):
+            await service.decide_approval(
+                approval_id,
+                decision="approve",
+                args_hash="hash-s1",
+            )
+
+        row = await read_run(uow_factory, run_id)
+        assert row.status is RunStatus.FAILED
+        assert row.status_reason == "resume_failed"
+        assert row.lease_owner is None
+
+    async def test_concurrent_reject_calls_produce_one_resume_and_one_409(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """HITL-004: Two concurrent reject calls produce 1 winner (resumes to REJECTED)
+        and 1 conflict (409); zero tool executions."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        draft_id, to_email = await seed_draft(uow_factory)
+        harness = Harness(effect=outbox_effect(uow_factory, draft_id, to_email))
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        approval_id = await _pause_run_for_approval(engine, graph, run_id, clock)
+
+        service1 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-rejector-1",
+        )
+        service2 = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="worker-rejector-2",
+        )
+
+        t1 = service1.decide_approval(
+            approval_id,
+            decision="reject",
+            args_hash="hash-s1",
+            reason="Declined by 1",
+        )
+        t2 = service2.decide_approval(
+            approval_id,
+            decision="reject",
+            args_hash="hash-s1",
+            reason="Declined by 2",
+        )
+
+        results = await asyncio.gather(t1, t2, return_exceptions=True)
+        winners = [r for r in results if not isinstance(r, Exception) and r.is_winner]
+        conflicts = [r for r in results if isinstance(r, ApprovalNotPendingError)]
+
+        assert len(winners) == 1
+        assert len(conflicts) == 1
+        settled = await read_run(uow_factory, run_id)
+        assert settled.status is RunStatus.REJECTED
+        outbox_rows = await outbox_rows_for(uow_factory, run_id)
+        assert len(outbox_rows) == 1

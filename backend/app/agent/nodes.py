@@ -10,8 +10,8 @@ import asyncio
 import contextlib
 import re
 import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final
 
@@ -30,6 +30,7 @@ from app.agent.planner import (
     revision_requested,
     validate_plan,
 )
+from app.agent.preview import build_approval_preview
 from app.agent.resolver import resolve_step_args
 from app.agent.state import (
     TERMINAL_RUN_STATUSES,
@@ -63,7 +64,6 @@ from app.errors import (
     is_retryable,
     recovery_action,
 )
-from app.observability.redaction import redact_payload
 from app.persistence.models import TraceEventKind
 from app.persistence.protocols import ApprovalUpsert, UnitOfWorkFactory
 from app.runtime import (
@@ -126,6 +126,7 @@ class _ApprovalRequest:
     approval_id: str
     args_hash: str
     decision: ApprovalDecision | None = None
+    preview: dict[str, Any] = field(default_factory=dict)
 
 
 def create_initial_state(
@@ -561,7 +562,7 @@ class NodeHandlers:
         resolved_args = self._resolve_step_args(state, step)
         args_hash = canonical_args_hash(resolved_args)
         run_id_str = str(state.get("run_id", "default_run"))
-        preview = redact_payload(resolved_args, max_bytes=_PREVIEW_MAX_BYTES)
+        contract = self._get_contract(step.tool) or REGISTRY[step.tool]
 
         if self._uow_factory is not None:
             request = await self._persist_approval_request(
@@ -569,10 +570,22 @@ class NodeHandlers:
                 run_id=uuid.UUID(run_id_str),
                 step=step,
                 args_hash=args_hash,
-                preview=preview,
+                resolved_args=resolved_args,
+                tool_results=state.get("tool_results"),
+                contract=contract,
             )
+            preview = request.preview
         else:
-            request = self._checkpointed_approval_request(state, step, run_id_str, args_hash)
+            preview, _, _ = await build_approval_preview(
+                step,
+                resolved_args,
+                tool_results=state.get("tool_results"),
+                uow=None,
+                risk=contract.risk,
+            )
+            request = self._checkpointed_approval_request(
+                state, step, run_id_str, args_hash, preview=preview
+            )
 
         decision = request.decision
         if decision is None:
@@ -629,7 +642,10 @@ class NodeHandlers:
         run_id: uuid.UUID,
         step: PlanStep,
         args_hash: str,
-        preview: dict[str, Any],
+        preview: dict[str, Any] | None = None,
+        resolved_args: dict[str, Any] | None = None,
+        tool_results: Mapping[str, ToolResult] | None = None,
+        contract: ToolContract | None = None,
     ) -> _ApprovalRequest:
         """The durable request (§9.7): one transaction that upserts the
         `approvals` row and, only when this transaction inserted it, appends
@@ -640,17 +656,30 @@ class NodeHandlers:
         rather than requested again. A persistence failure propagates: there
         is no safe way to pause without a durable request to decide on.
         """
-        contract = self._get_contract(step.tool) or REGISTRY[step.tool]
+        target_contract = contract or self._get_contract(step.tool) or REGISTRY[step.tool]
         now = self._clock.now()
         async with uow_factory() as uow:
+            if preview is None:
+                final_preview, title, summary = await build_approval_preview(
+                    step,
+                    resolved_args or step.args,
+                    tool_results=tool_results,
+                    uow=uow,
+                    risk=target_contract.risk,
+                )
+            else:
+                final_preview = preview
+                title = f"{step.tool.value}: approve step {step.step_id}"
+                summary = step.rationale or target_contract.purpose
+
             upsert: ApprovalUpsert = await uow.approvals.upsert_request(
                 run_id=run_id,
                 step_id=step.step_id,
                 tool=step.tool,
-                risk=contract.risk,
-                title=f"{step.tool.value}: approve step {step.step_id}",
-                summary=step.rationale or contract.purpose,
-                payload_preview=preview,
+                risk=target_contract.risk,
+                title=title,
+                summary=summary,
+                payload_preview=final_preview,
                 args_hash=args_hash,
                 requested_at=now,
                 expires_at=now + self._approval_ttl,
@@ -681,7 +710,7 @@ class NodeHandlers:
                     payload={
                         "approval_id": str(row.id),
                         "args_hash": row.args_hash,
-                        "risk": contract.risk.value,
+                        "risk": target_contract.risk.value,
                         "expires_at": row.expires_at.isoformat(),
                     },
                 )
@@ -711,11 +740,20 @@ class NodeHandlers:
             superseded=[str(old.id) for old in upsert.superseded],
             status=row.status.value,
         )
-        return _ApprovalRequest(approval_id=str(row.id), args_hash=row.args_hash, decision=decision)
+        return _ApprovalRequest(
+            approval_id=str(row.id),
+            args_hash=row.args_hash,
+            decision=decision,
+            preview=row.payload_preview or final_preview,
+        )
 
     @staticmethod
     def _checkpointed_approval_request(
-        state: AgentState, step: PlanStep, run_id: str, args_hash: str
+        state: AgentState,
+        step: PlanStep,
+        run_id: str,
+        args_hash: str,
+        preview: dict[str, Any] | None = None,
     ) -> _ApprovalRequest:
         """Without a durable store the checkpointed `approval_state` is the
         only record: a decision already held for these exact arguments is
@@ -725,7 +763,12 @@ class NodeHandlers:
         approval_state = state.get("approval_state") or ApprovalState()
         held = approval_state.decisions.get(step.step_id)
         decision = held if held is not None and held.args_hash == args_hash else None
-        return _ApprovalRequest(approval_id=approval_id, args_hash=args_hash, decision=decision)
+        return _ApprovalRequest(
+            approval_id=approval_id,
+            args_hash=args_hash,
+            decision=decision,
+            preview=preview or {},
+        )
 
     def _decision_from_resume(
         self,

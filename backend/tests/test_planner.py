@@ -2205,6 +2205,7 @@ class TestStructure:
             "graph.py",
             "nodes.py",
             "normalizer.py",
+            "preview.py",
             "resolver.py",
             "state.py",
         }

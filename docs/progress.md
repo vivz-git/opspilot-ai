@@ -23,7 +23,7 @@ foundation     ████████░░░░░░░░░░░░  FOU
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
 agent graph    ████████████████████  AGENT-001..009 complete
-hitl           ████████████░░░░░░░░  HITL-001, 002, 003 complete; HITL-004, 005 outstanding
+hitl           ████████████████████  HITL-001..005 complete
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
@@ -1487,3 +1487,73 @@ executor and the reconciler, as today); no migration.
 `tests/test_structure.py`, 1 amended in `tests/test_hitl_gate.py`; the skip
 is the opt-in live Groq smoke test). `ruff check .`, `ruff format --check .`,
 `mypy app` (strict, 67 source files) and `alembic check` are clean.
+
+## HITL-004 — Single-flight resume contention / multi-worker resume coordination — 2026-09-15
+
+Resume dispatch is now strictly single-flight and coordinated across concurrent
+workers and processes (§6.3, §7.3, §18.4, ADR-007, ADR-023). When multiple
+workers or HTTP requests race to decide and resume the same interrupted run,
+the database remains the sole arbiter: exactly one worker claims the decision
+transition, acquires the execution lease, and invokes `driver.resume(...)`.
+Zero duplicate graph resumes, zero duplicate node re-entries, zero duplicate
+downstream tool mutations (`send_email_mock`, `update_customer`), and clean 409
+conflict semantics for losers.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/execution/approvals.py` | `ApprovalService.decide_and_resume`: single-flight resume coordination. Raced decisions execute conditional `UPDATE approvals SET status = :status ... WHERE id = :id AND status = 'pending'`. The winner commits the transition, locks `agent_runs`, acquires the execution lease, and calls `driver.resume(run_id, Command(resume=decision))`. Losers observing 0 rows updated raise `ApprovalNotPendingError` (mapped to RFC 9457 `409 approval_not_pending`). Sequential retries check run lease and terminal status: if a live worker holds lease (`lease_expires_at > now`) or run is terminal (`COMPLETED`/`REJECTED`/`FAILED`), the call succeeds idempotently (`is_winner=False`) without re-resuming. If the previous worker crashed and lease expired (`lease_expires_at <= now`), the retrying worker acquires the lease via `uow.agent_runs.acquire_lease` and safely re-enters graph execution. Resume exceptions are caught, settling run to `FAILED(status_reason="resume_failed")`, tracing `RUN_FAILED`, and releasing lease. Zombie workers whose lease lapsed during execution are fenced via `heartbeat.lost.is_set()` before settling state. | `tests/test_hitl_recovery.py::TestHitlSingleFlightResumeContention`, `tests/test_api_approvals.py::test_concurrent_http_post_decision_produces_one_200_and_one_409` |
+| `tests/test_hitl_recovery.py` | 6 new tests covering: 2 concurrent approve calls → 1 resume and 1 `409`; 6-worker stampede race → 1 winner and 5 `409`s; retry after crash + lease expiry → re-acquires lease and resumes; retry while running → 200 idempotent, 0 duplicate resumes; resume failure → settles to `FAILED` with lease cleared; 2 concurrent reject calls → 1 resume and 1 `409`. | `tests/test_hitl_recovery.py` |
+| `tests/test_api_approvals.py` | HTTP-level concurrency test using `httpx.AsyncClient` with `ASGITransport(app=app)`: 2 concurrent `POST /approvals/{id}/decision` calls over real PostgreSQL produce exactly one `200 OK` and one `409 Conflict` (`application/problem+json` with `type=".../approval_not_pending"`). | `tests/test_api_approvals.py` |
+
+**Single-flight coordination design without distributed locks.** No Redis, no
+etcd, no extra database tables, and no process-local mutexes (`threading.Lock` /
+`asyncio.Lock`) that fail in multi-worker or multi-process deployments. The atomic
+conditional `UPDATE approvals ... WHERE status = 'pending'` is the primary race
+arbiter. The execution lease (`lease_owner`, `lease_expires_at`) coordinates the
+re-entry boundary and handles crash recovery cleanly without orphan runs.
+
+**Acceptance.** Two concurrent approve calls produce one resume and one `409`;
+an N-worker stampede produces 1 winner and N-1 `409` conflicts; retries while running
+are idempotent without second resume; retries after worker crash safely reclaim lease
+and resume; unhandled driver resume errors transition the run to `FAILED` and release
+lease. Downstream mutations are guaranteed strictly single-execution.
+
+**Deliberately not done.** HITL-005 (the de-referenced `payload_preview` builder);
+API-004 (the full approval API error mapping suite); no changes to `ApprovalGate` or
+`ToolRegistry.dispatch` token invariants; no migration.
+
+**Test suite: 1345 passed, 1 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` pointing at PostgreSQL — 6 new in `tests/test_hitl_recovery.py`,
+1 new in `tests/test_api_approvals.py`; the skip is the opt-in live Groq smoke test).
+`ruff check app tests`, `ruff format --check app tests`, `mypy app` (strict, 67 source files)
+and `alembic check` are clean.
+
+## HITL-005 — Rich Human-Approval Preview / De-Referenced Payload Preview — 2026-09-15
+
+Approval requests now surface rich, human-readable, de-referenced previews of
+gated actions (`send_email_mock`, `update_customer`) without executing tools,
+without mutating state, and without altering authorization tokens or canonical
+`args_hash` (§6.3, §9.2, §14.5, HITL-005). Operators see exactly what the agent
+is asking permission to do: the recipient, subject, and body for outreach emails,
+and the target customer, version match, and before/after field diffs for customer updates.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/agent/preview.py` | `build_approval_preview(step, resolved_args, tool_results, uow, risk)`: pure preview builder. For `send_email_mock`, de-references `draft_id` via read-only UoW query (Tier 1) or in-memory `tool_results` fallback (Tier 2), resolving `to_email`, `subject`, `body`, `lead_id`, and `content_hash`. Truncates body at 1500 chars with content hash indicator. For `update_customer`, de-references customer row, resolves `account_name`, `primary_contact`, `email`, `current_version`, and computes `version_match` and field-by-field `diff` (`{"before": ..., "after": ...}`). For generic tools, builds clean scalar preview. Strips volatile keys (`args_hash`, `correlation_id`, `now`, `_token`), masks secrets, and enforces recursive 4096-byte budget via `redact_payload`. | `tests/test_hitl_preview.py` |
+| `app/agent/nodes.py` | Updated `_ApprovalRequest` dataclass to include `preview: dict[str, Any]`. Wired `build_approval_preview` into `request_approval`, `_persist_approval_request`, and `_checkpointed_approval_request`, persisting rich preview into `approvals.payload_preview` and emitting it in `approval_requested` trace events and `interrupt()` payloads. | `tests/test_hitl_request_approval.py`, `tests/test_decide.py` |
+| `tests/test_hitl_preview.py` | 14 comprehensive unit and integration tests covering: `send_email_mock` with persisted draft; fallback to `tool_results`; graceful degradation on missing draft; body truncation; `update_customer` with persisted customer and diff calculation; fallback to `tool_results`; stale version mismatch detection (`version_match=False`); volatile arg stripping; secret masking; payload size budget (<= 4096 bytes); deterministic output; and zero CRM mutations verified by whole-schema fingerprint before and after. | `tests/test_hitl_preview.py` |
+
+**Security and Invariant Preservation.**
+- Preview generation is strictly read-only: no mock CRM state, customer rows, or drafts are modified. Verified by full-schema database fingerprinting before and after preview construction.
+- Canonical `args_hash` calculation is completely unchanged: `args_hash = canonical_args_hash(resolved_args)` ensures exact parameter binding is preserved without weakening Barrier 3 or the `ApprovalGate`.
+- Zero database schema migrations required: stored in existing `approvals.payload_preview` JSONB column.
+
+**Deliberately not done.** API-004 (approvals endpoints error family); VERIFY-001..003 (verifier framework); no changes to `ApprovalGate` or `ToolRegistry.dispatch` token invariants; no migrations.
+
+**Test suite: 1359 passed, 1 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` pointing at PostgreSQL — 14 new in `tests/test_hitl_preview.py`;
+the skip is the opt-in live Groq smoke test). `ruff check app tests`,
+`ruff format --check app tests`, `mypy app` (strict, 68 source files) and
+`alembic check` are clean.
+
+

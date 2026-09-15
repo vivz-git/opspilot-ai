@@ -1324,7 +1324,9 @@ class TestGraphIntegration:
         snapshot = graph.get_state(cfg)
         interrupt = snapshot.tasks[0].interrupts[0].value
         assert interrupt["step_id"] == "s2[0]"
-        assert interrupt["payload_preview"] == {"draft_id": "d_1", "to_email": "lead0@example.com"}
+        assert interrupt["payload_preview"]["draft_id"] == "d_1"
+        assert interrupt["payload_preview"]["to_email"] == "lead0@example.com"
+        assert interrupt["payload_preview"]["action"] == ToolName.SEND_EMAIL_MOCK.value
         assert [s.step_id for s in snapshot.values["plan"].steps] == ["s1", "s2", "s2[0]", "s2[1]"]
         assert [c[0] for c in executor.calls] == ["s1"], "nothing sent before approval"
 
@@ -1675,6 +1677,7 @@ class TestStructuralSafety:
             "graph.py",
             "nodes.py",
             "normalizer.py",
+            "preview.py",
             "resolver.py",
             "state.py",
         }
