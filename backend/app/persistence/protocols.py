@@ -11,6 +11,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
@@ -45,6 +46,7 @@ from app.tools.contracts import RiskLevel, ToolName
 __all__ = [
     "AgentRunRepository",
     "ApprovalRepository",
+    "ApprovalUpsert",
     "CompanyRepository",
     "CustomerRepository",
     "EmailOutboxRepository",
@@ -378,6 +380,23 @@ class ToolCallRepository(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class ApprovalUpsert:
+    """What `ApprovalRepository.upsert_request` found or did (HITL-003, §9.7).
+
+    `row` is the approval the caller must act on: a `pending` request to pause
+    for, or an `approved`/`rejected` decision already made for these exact
+    arguments. `created` is true only when *this* transaction inserted `row`
+    — the one condition under which `approval_requested` may be emitted.
+    `superseded` lists the rows this request chained forward (status
+    `superseded`, `superseded_by = row.id`) because their arguments differ.
+    """
+
+    row: ApprovalRow
+    created: bool
+    superseded: tuple[ApprovalRow, ...] = ()
+
+
 @runtime_checkable
 class ApprovalRepository(Protocol):
     """Repository protocol for `opspilot.approvals` (§12.6, §9.6)."""
@@ -420,6 +439,42 @@ class ApprovalRepository(Protocol):
         id: uuid.UUID | None = None,
     ) -> ApprovalRow:
         """Create and persist a pending approval request."""
+        ...
+
+    async def upsert_request(
+        self,
+        *,
+        run_id: uuid.UUID,
+        step_id: str,
+        tool: ToolName,
+        risk: RiskLevel,
+        title: str,
+        summary: str,
+        payload_preview: dict[str, Any],
+        args_hash: str,
+        requested_at: datetime,
+        expires_at: datetime,
+    ) -> ApprovalUpsert:
+        """The idempotent request `request_approval` makes on every execution
+        (HITL-003, §9.7) — the logical identity is `(run_id, step_id, args_hash)`.
+
+        Exactly one of these happens, and the result says which:
+
+        - a current `approved` (inside its TTL at `requested_at`) or
+          `rejected` row for these exact arguments exists → it is returned,
+          `created=False`; a decision is never regressed to a request;
+        - a `pending` row for these exact arguments exists → it is returned,
+          `created=False`; a re-executed node finds its own request;
+        - otherwise a `pending` row is inserted and returned, `created=True`,
+          and every current row of this step for *other* arguments (an open
+          request, or a decision the changed arguments have invalidated) is
+          marked `superseded` with `superseded_by` pointing at it.
+
+        Safe under concurrent callers for the same step: requests for one
+        `(run_id, step_id)` are serialised, so two identical requests produce
+        one row and one `created=True`, and a decision committed while a
+        request is in flight is observed rather than overwritten.
+        """
         ...
 
     async def decide(

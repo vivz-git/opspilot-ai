@@ -32,6 +32,7 @@ from app.persistence.models import (
 from app.persistence.protocols import (
     AgentRunRepository,
     ApprovalRepository,
+    ApprovalUpsert,
     CompanyRepository,
     CustomerRepository,
     EmailOutboxRepository,
@@ -69,6 +70,7 @@ __all__ = [
     "AgentRunRepository",
     "ApprovalRepository",
     "ApprovalRow",
+    "ApprovalUpsert",
     "Base",
     "Company",
     "CompanyRepository",

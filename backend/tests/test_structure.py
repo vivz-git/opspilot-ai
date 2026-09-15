@@ -756,41 +756,120 @@ def test_the_approved_row_lookup_feeds_only_the_gate() -> None:
     assert not offenders, f"approved-row lookup outside execute_tool: {offenders}"
 
 
-def test_token_issuance_never_mutates_approval_state() -> None:
-    """HITL-002 bridges a stored decision to a capability; it decides,
-    requests, supersedes and traces nothing. Approval rows are written by
-    the approval service (HITL-001) and, for requests, by HITL-003 — never
-    by the gate or by the agent nodes."""
-    writers = {"create_request", "decide", "supersede"}
-    approval_events = {
+#: The one place the graph writes an approval *request* (HITL-003, §9.7): the
+#: `request_approval` node and the helper that performs its transaction. Every
+#: other function in the modules below is on the token path and must neither
+#: write an approval row nor emit an approval event.
+APPROVAL_REQUEST_PATH = frozenset({"request_approval", "_persist_approval_request"})
+APPROVAL_WRITERS = frozenset({"create_request", "upsert_request", "decide", "supersede"})
+APPROVAL_EVENTS = frozenset(
+    {
         "APPROVAL_REQUESTED",
         "APPROVAL_GRANTED",
         "APPROVAL_REJECTED",
         "APPROVAL_EXPIRED",
         "APPROVAL_SUPERSEDED",
     }
+)
+
+
+def _approval_mutations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Approval-row writes and approval trace events, as `(line, what)`."""
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in APPROVAL_WRITERS
+            and _receiver_names(node.func.value)[-1:] == ["approvals"]
+        ):
+            found.append((node.lineno, f"approvals.{node.func.attr}(...)"))
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in APPROVAL_EVENTS
+            and _receiver_names(node.value)[-1:] == ["TraceEventKind"]
+        ):
+            found.append((node.lineno, f"TraceEventKind.{node.attr}"))
+    return found
+
+
+def _request_path_lines(tree: ast.Module) -> set[int]:
+    """The source lines belonging to the request path's functions."""
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name in APPROVAL_REQUEST_PATH
+        ):
+            lines.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    return lines
+
+
+def test_token_issuance_never_mutates_approval_state() -> None:
+    """HITL-002 bridges a stored decision to a capability; it decides,
+    requests, supersedes and traces nothing. Approval rows are written by
+    the approval service (HITL-001) and, for requests, by `request_approval`
+    (HITL-003) — never by the gate, the router, the dispatcher or
+    `execute_tool`. The request path is exempt by function; every other line
+    of `agent/nodes.py` is still held to it."""
     offenders: dict[str, list[str]] = {}
     for rel in ("security.py", "agent/nodes.py", "agent/decide.py", "tools/registry.py"):
         path = APP / rel
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        found: list[str] = []
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in writers
-                and _receiver_names(node.func.value)[-1:] == ["approvals"]
-            ):
-                found.append(f"approvals.{node.func.attr}(...) at line {node.lineno}")
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr in approval_events
-                and _receiver_names(node.value)[-1:] == ["TraceEventKind"]
-            ):
-                found.append(f"TraceEventKind.{node.attr} at line {node.lineno}")
+        exempt = _request_path_lines(tree) if rel == "agent/nodes.py" else set()
+        found = [
+            f"{what} at line {line}"
+            for line, what in _approval_mutations(tree)
+            if line not in exempt
+        ]
         if found:
             offenders[rel] = found
     assert not offenders, f"approval state mutated on the token path: {offenders}"
+
+
+def test_approval_requests_are_made_only_by_request_approval() -> None:
+    """HITL-003, §9.7: the graph requests approval in exactly one place. The
+    idempotent primitive `ApprovalRepository.upsert_request` and the
+    `approval_requested`/`approval_superseded` events it justifies are used
+    by `request_approval`'s transaction and nowhere else in the application
+    (the persistence package defines the primitive); `create_request` — the
+    unconditional insert — is never called by application code, so a
+    re-executed node cannot reach a path that inserts twice."""
+    request_only = ("upsert_request", "create_request", "APPROVAL_REQUESTED", "APPROVAL_SUPERSEDED")
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP):
+        rel = _rel(path)
+        if _under(path, "persistence/"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        exempt = _request_path_lines(tree) if rel == "agent/nodes.py" else set()
+        found = [
+            f"{what} at line {line}"
+            for line, what in _approval_mutations(tree)
+            if any(name in what for name in request_only) and line not in exempt
+        ]
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"approval requested outside request_approval: {offenders}"
+
+    nodes = ast.parse((APP / "agent" / "nodes.py").read_text(encoding="utf-8"))
+    on_path = {
+        what for line, what in _approval_mutations(nodes) if line in _request_path_lines(nodes)
+    }
+    assert "approvals.upsert_request(...)" in on_path, "the request must go through the upsert"
+    assert "TraceEventKind.APPROVAL_REQUESTED" in on_path
+    assert "approvals.create_request(...)" not in on_path
+    assert not {"approvals.decide(...)", "approvals.supersede(...)"} & on_path, (
+        "request_approval never decides or supersedes on its own; the upsert does"
+    )
+    assert (
+        not {
+            "TraceEventKind.APPROVAL_GRANTED",
+            "TraceEventKind.APPROVAL_REJECTED",
+            "TraceEventKind.APPROVAL_EXPIRED",
+        }
+        & on_path
+    ), "decision events belong to the approval service (HITL-001)"
 
 
 def test_api_layer_is_uninvolved_in_token_minting() -> None:

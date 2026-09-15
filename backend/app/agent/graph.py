@@ -8,6 +8,7 @@ and enforces dynamic `interrupt()` in `request_approval` with empty static inter
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -45,6 +46,7 @@ def create_agent_graph(
     cancellation_source: (
         CancellationSource | Callable[[str], bool | Awaitable[bool]] | None
     ) = None,
+    approval_ttl: timedelta | None = None,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
     """Assemble and compile the production LangGraph agent graph (§6.1)."""
     handlers = node_handlers or NodeHandlers(
@@ -60,6 +62,7 @@ def create_agent_graph(
         seeded_random=seeded_random,
         sleep=sleep,
         cancellation_source=cancellation_source,
+        approval_ttl=approval_ttl,
     )
 
     builder: StateGraph[AgentState] = StateGraph(AgentState)

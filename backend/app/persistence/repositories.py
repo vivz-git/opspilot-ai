@@ -16,6 +16,7 @@ from typing import Any, Self
 
 import sqlalchemy as sa
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import joinedload
 
@@ -43,6 +44,7 @@ from app.persistence.models import (
     TraceEventKind,
     TraceEventSeverity,
 )
+from app.persistence.protocols import ApprovalUpsert
 from app.tools.contracts import RiskLevel, ToolName
 
 __all__ = [
@@ -679,6 +681,202 @@ class SqlApprovalRepository:
         self._session.add(row)
         await self._session.flush()
         return row
+
+    #: Statuses a request can find "current" for its step: an open request or
+    #: a decision that has not been chained forward. Expired, cancelled and
+    #: superseded rows are history and never reused.
+    _CURRENT_STATUSES = (ApprovalStatus.PENDING, ApprovalStatus.APPROVED, ApprovalStatus.REJECTED)
+    _DECIDED_STATUSES = (ApprovalStatus.APPROVED, ApprovalStatus.REJECTED)
+    #: Bound on the read → conditional-write loop below. A retry means a
+    #: *decision* committed between our read and our write (decisions do not
+    #: take the request lock), which cannot repeat indefinitely: a decided row
+    #: is never pending again.
+    _UPSERT_ATTEMPTS = 4
+
+    async def upsert_request(
+        self,
+        *,
+        run_id: uuid.UUID,
+        step_id: str,
+        tool: ToolName,
+        risk: RiskLevel,
+        title: str,
+        summary: str,
+        payload_preview: dict[str, Any],
+        args_hash: str,
+        requested_at: datetime,
+        expires_at: datetime,
+    ) -> ApprovalUpsert:
+        # Serialise every request for this (run, step) with a transaction-
+        # scoped advisory lock — the same mechanism `trace_events` uses
+        # (`app.persistence.trace_events`), for the same reason: before the
+        # first request there is no row to lock, and the partial unique index
+        # alone cannot stop a second `pending` row from being inserted after
+        # the first one was *approved* (it is no longer in the index). Under
+        # the lock, the read below sees every committed request, so a decided
+        # row is found rather than re-requested. The key is distinct from the
+        # per-run trace key, and the lock is taken before any approval row
+        # lock — the order `ApprovalService` also follows (row, then trace),
+        # so there is no ordering cycle and no deadlock.
+        lock_key = sa.func.hashtextextended(
+            sa.cast(f"approval-request:{run_id}:{step_id}", sa.Text), 0
+        )
+        await self._session.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_key)))
+
+        for _ in range(self._UPSERT_ATTEMPTS):
+            current = await self._current_rows(run_id, step_id)
+
+            # 1. A decision for these exact arguments is final: hand it back.
+            #    An approval is a grant bounded by its TTL (the gate refuses it
+            #    past `expires_at`), so an elapsed one is asked afresh; a
+            #    rejection is final regardless.
+            decided = [
+                r
+                for r in current
+                if r.status in self._DECIDED_STATUSES
+                and r.args_hash == args_hash
+                and (r.status is ApprovalStatus.REJECTED or requested_at < r.expires_at)
+            ]
+            if decided:
+                return ApprovalUpsert(row=decided[0], created=False)
+
+            # 2. The open request for these exact arguments: the re-executed
+            #    node finding its own row.
+            pending = next((r for r in current if r.status is ApprovalStatus.PENDING), None)
+            if pending is not None and pending.args_hash == args_hash:
+                return ApprovalUpsert(row=pending, created=False)
+
+            # 3. Nothing current matches: request afresh, chaining forward
+            #    whatever the changed arguments invalidated. The open request
+            #    must be closed *before* the insert (the partial index admits
+            #    one `pending` per step) and conditionally — if the human
+            #    decided it meanwhile, the row is no longer ours to close and
+            #    the loop re-reads it as a decision.
+            stale = [r for r in current if r.args_hash != args_hash]
+            if pending is not None:
+                closed = await self._session.execute(
+                    update(ApprovalRow)
+                    .where(
+                        ApprovalRow.id == pending.id,
+                        ApprovalRow.status == ApprovalStatus.PENDING,
+                    )
+                    .values(status=ApprovalStatus.SUPERSEDED)
+                    .returning(ApprovalRow.id)
+                    .execution_options(synchronize_session=False)
+                )
+                if closed.scalar_one_or_none() is None:
+                    continue
+
+            inserted = await self._insert_pending(
+                run_id=run_id,
+                step_id=step_id,
+                tool=tool,
+                risk=risk,
+                title=title,
+                summary=summary,
+                payload_preview=payload_preview,
+                args_hash=args_hash,
+                requested_at=requested_at,
+                expires_at=expires_at,
+            )
+            if inserted is None:
+                # `ON CONFLICT DO NOTHING` on the partial index: a writer that
+                # bypassed the request lock inserted a `pending` row for this
+                # step. Re-read and treat it like any other current row.
+                continue
+
+            superseded: list[ApprovalRow] = []
+            if stale:
+                # `superseded_by` is a foreign key to the new row, so it can
+                # only be set once that row exists; the status flip for the
+                # open request above and this pointer commit as one unit.
+                res = await self._session.execute(
+                    update(ApprovalRow)
+                    .where(
+                        ApprovalRow.id.in_([r.id for r in stale]),
+                        ApprovalRow.superseded_by.is_(None),
+                        ApprovalRow.status.in_(
+                            (*self._DECIDED_STATUSES, ApprovalStatus.SUPERSEDED)
+                        ),
+                    )
+                    .values(status=ApprovalStatus.SUPERSEDED, superseded_by=inserted.id)
+                    .returning(ApprovalRow.id)
+                    .execution_options(synchronize_session=False)
+                )
+                touched = set(res.scalars().all())
+                for r in stale:
+                    if r.id in touched:
+                        await self._session.refresh(r)
+                        superseded.append(r)
+            await self._session.flush()
+            return ApprovalUpsert(row=inserted, created=True, superseded=tuple(superseded))
+
+        raise RuntimeError(
+            f"approval request for run {run_id} step {step_id!r} did not settle "
+            f"in {self._UPSERT_ATTEMPTS} attempts"
+        )
+
+    async def _current_rows(self, run_id: uuid.UUID, step_id: str) -> list[ApprovalRow]:
+        """This step's open request and un-chained decisions, as they are
+        now (`populate_existing`), latest decision first."""
+        stmt = (
+            select(ApprovalRow)
+            .where(
+                ApprovalRow.run_id == run_id,
+                ApprovalRow.step_id == step_id,
+                ApprovalRow.superseded_by.is_(None),
+                ApprovalRow.status.in_(self._CURRENT_STATUSES),
+            )
+            .order_by(
+                ApprovalRow.decided_at.desc().nulls_last(),
+                ApprovalRow.requested_at.desc(),
+                ApprovalRow.id.desc(),
+            )
+            .execution_options(populate_existing=True)
+        )
+        res = await self._session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def _insert_pending(
+        self,
+        *,
+        run_id: uuid.UUID,
+        step_id: str,
+        tool: ToolName,
+        risk: RiskLevel,
+        title: str,
+        summary: str,
+        payload_preview: dict[str, Any],
+        args_hash: str,
+        requested_at: datetime,
+        expires_at: datetime,
+    ) -> ApprovalRow | None:
+        """`INSERT … ON CONFLICT DO NOTHING RETURNING *` against the partial
+        unique index: the row, or `None` when another `pending` row for the
+        step already exists."""
+        stmt = (
+            pg_insert(ApprovalRow)
+            .values(
+                run_id=run_id,
+                step_id=step_id,
+                tool=tool,
+                risk=risk,
+                title=title,
+                summary=summary,
+                payload_preview=payload_preview,
+                args_hash=args_hash,
+                status=ApprovalStatus.PENDING,
+                requested_at=requested_at,
+                expires_at=expires_at,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[ApprovalRow.run_id, ApprovalRow.step_id],
+                index_where=sa.text("status = 'pending'"),
+            )
+            .returning(ApprovalRow)
+        )
+        res = await self._session.execute(stmt)
+        return res.scalar_one_or_none()
 
     async def decide(
         self,

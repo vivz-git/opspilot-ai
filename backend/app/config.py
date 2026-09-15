@@ -155,6 +155,10 @@ class Settings(BaseSettings):
         return timedelta(seconds=self.lease_ttl_seconds)
 
     @property
+    def approval_ttl(self) -> timedelta:
+        return timedelta(seconds=self.approval_ttl_seconds)
+
+    @property
     def heartbeat_interval(self) -> timedelta:
         return timedelta(seconds=self.heartbeat_interval_seconds)
 

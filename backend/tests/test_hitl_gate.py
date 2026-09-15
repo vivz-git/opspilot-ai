@@ -1144,7 +1144,11 @@ class TestAgentGraphEndToEnd:
     ) -> None:
         """§9.9 (1), (6): no `mock_crm` write while paused; after the human's
         stored approval the graph resumes through `request_approval` →
-        `decide` → `execute_tool` → gate → dispatcher → one outbox row."""
+        `decide` → `execute_tool` → gate → dispatcher → one outbox row.
+
+        Since HITL-003 the pausing node persists the request itself, so the
+        human decides *that* row — the one the interrupt names — through the
+        same conditional `decide` the API performs."""
         run_id = await create_run(uow_factory)
         draft_id = await save_draft(adapters)
         args = {"draft_id": draft_id, "to_email": DANA}
@@ -1177,9 +1181,21 @@ class TestAgentGraphEndToEnd:
             assert pause.value["args_hash"] == canonical_args_hash(args)
             assert await outbox_rows(_sf(uow_factory)) == []
 
-            # 2. The human decides — durably, through the repository, for the
-            #    exact hash the interrupt showed.
-            approval_id = await script_decision(uow_factory, run_id=run_id, step_id="s6", args=args)
+            # 2. The human decides — durably, through the repository, the
+            #    request the node persisted, for the exact hash it showed.
+            approval_id = uuid.UUID(pause.value["approval_id"])
+            async with uow_factory() as uow:
+                pending = await uow.approvals.get_pending(run_id, "s6")
+                assert pending is not None and pending.id == approval_id
+                assert pending.args_hash == canonical_args_hash(args)
+                decided = await uow.approvals.decide(
+                    approval_id,
+                    status=ApprovalStatus.APPROVED,
+                    decided_by="operator",
+                    decided_at=clock.now(),
+                )
+                assert decided is not None
+                await uow.commit()
 
             # 3. Resume: the token is minted from that row inside execute_tool.
             final = await graph.ainvoke(

@@ -54,7 +54,11 @@ def get_approval_service(request: Request) -> ApprovalService:
     driver: RunDriver | None = getattr(request.app.state, "run_driver", None)
     if driver is None:
         checkpointer = getattr(request.app.state, "checkpointer", None)
-        graph = create_agent_graph(checkpointer=checkpointer, uow_factory=uow_factory)
+        graph = create_agent_graph(
+            checkpointer=checkpointer,
+            uow_factory=uow_factory,
+            approval_ttl=settings.approval_ttl,
+        )
         driver = LangGraphRunDriver(graph)
         request.app.state.run_driver = driver
 

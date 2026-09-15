@@ -23,7 +23,7 @@ foundation     ████████░░░░░░░░░░░░  FOU
 persistence    ████████████████████  DB-001..007 done
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
 agent graph    ████████████████████  AGENT-001..009 complete
-hitl           ████████░░░░░░░░░░░░  HITL-001, 002 complete; HITL-003..005 outstanding
+hitl           ████████████░░░░░░░░  HITL-001, 002, 003 complete; HITL-004, 005 outstanding
 verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
@@ -1421,3 +1421,69 @@ durable record covers refusals of a presented token.
 and `alembic check` are clean. gitleaks reports two pre-existing findings in
 `tests/test_responder.py` (commit `83cf2573`): deliberate credential-shaped
 strings that exercise the sanitizer, not credentials.
+
+## HITL-003 — `request_approval`: idempotent durable request, then `interrupt()` — 2026-09-15
+
+The pause is now durable and idempotent (§6.3, §7, §9.7, ADR-007). Every
+execution of `request_approval` — the first, and every re-execution LangGraph
+performs on resume or re-entry — makes the same request: the `approvals` row
+is upserted on the logical identity `(run_id, step_id, args_hash)`,
+`approval_requested` is emitted only when that upsert genuinely inserted, and
+both commit in one transaction before the node pauses. No tool is invoked in
+this node, ever.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/persistence/protocols.py`, `app/persistence/repositories.py` | `ApprovalRepository.upsert_request(...) -> ApprovalUpsert(row, created, superseded)`. A transaction-scoped advisory lock keyed on `(run_id, step_id)` — the mechanism `trace_events` already uses for "no row exists to lock yet" — serialises requests for a step; it is taken before any approval row lock, the order `ApprovalService` also follows (row, then per-run trace lock), so no lock-ordering cycle exists. Under it, a bounded read → conditional-write loop: a current `approved` (inside its TTL at `requested_at`) or `rejected` row for these exact arguments is returned as-is; an identical `pending` row is returned; otherwise the open request is closed by `UPDATE … WHERE status = 'pending'` (zero rows means a decision landed between the read and the write — decisions do not take the request lock — and the loop re-reads it as a decision), a `pending` row is inserted with `INSERT … ON CONFLICT (run_id, step_id) WHERE status = 'pending' DO NOTHING RETURNING` against the existing partial unique index, and every current row for *other* arguments — open or decided — is marked `superseded` with `superseded_by` pointing at the new row (the pointer is a foreign key, so it is set after the insert, in the same transaction). Expired, cancelled and superseded rows are history: never reused, never in the way. No migration: the partial unique index remains the backstop. | `tests/test_hitl_request_approval.py::TestUpsertRequest`, `::TestUpsertRequestUnderConcurrency` |
+| `app/agent/nodes.py` | `request_approval` → `_persist_approval_request`: one unit of work that upserts and, only when `created`, appends `approval_superseded` for each chained row and then `approval_requested` — through `uow.trace_events.append`, so the per-run monotonic `seq` and its advisory lock are unchanged — and commits. What the row says decides the rest: `pending` → `interrupt()` with the canonical payload `{approval_id, run_id, step_id, tool, args_hash, payload_preview}` (`approval_id` is the row id; `payload_preview` is the resolved arguments through `redact_payload`, the same redaction the API applies); `approved`/`rejected` for these exact arguments → the `ApprovalDecision` is built from the row (`decided_by`, `decided_at`, `decision_reason`) and written into `approval_state` without pausing again. The resume value is consumed only when the row is still pending; the durable row always outranks it. Control then falls through to `decide`, which re-applies rule 6 on the arguments as they will now be sent, and `execute_tool` still mints from the persisted row (HITL-002) — this node's word is never authorisation. Without `uow_factory` the checkpointed `approval_state` is the record: a held decision for these exact arguments is reused, anything else is asked, and the identity is derived from `(run_id, step_id, args_hash)`. A persistence failure propagates: there is no safe way to pause without a durable request to decide on. The TTL is `approval_ttl` on `NodeHandlers`/`create_agent_graph` (default 24 h), wired from `Settings.approval_ttl` by `app/api/dependencies.py`. | `tests/test_hitl_request_approval.py::TestNodeOverCheckpointedState`, `::TestGraphPausesDurably`, `::TestGraphResumes`, `::TestChangedArgumentsAfterAGrant` |
+| `tests/test_hitl_gate.py` | The end-to-end HITL-002 test decided a request it had inserted itself; the pausing node now persists the request, so the human decides *that* row — the one the interrupt names — and the outbox row must trace to it. | `tests/test_hitl_gate.py::TestAgentGraphEndToEnd` |
+| `tests/test_structure.py` | The token-path scan (`test_token_issuance_never_mutates_approval_state`) is now per function: `request_approval` and `_persist_approval_request` are the one exemption in `agent/nodes.py`; every other function there, and all of `security.py`, `agent/decide.py` and `tools/registry.py`, still writes no approval row and emits no approval event. A new test pins `upsert_request`, `approval_requested` and `approval_superseded` to that request path and forbids `create_request` — the unconditional insert — anywhere in application code, so a re-executed node cannot reach a path that inserts twice. | `tests/test_structure.py` |
+
+**Why the naive `SELECT pending → mark superseded → INSERT` is wrong, and
+what replaces it.** The partial unique index bounds `pending` rows to one per
+step, but an *approved* row is no longer in the index: two workers that both
+read "no request yet" can, after the first one's row is approved, insert a
+second `pending` for the same arguments — the human asked twice, a grant
+regressed. And a request for changed arguments that reads the open request
+races the human's `UPDATE … WHERE status = 'pending'`: whichever commits
+second must not overwrite the other. The advisory lock closes the first race
+(every request for a step sees every committed request, so a decision is
+found, not re-asked); the conditional close plus re-read closes the second
+(the decision is kept and then chained forward as `superseded`, and the new
+arguments are still asked). `ON CONFLICT DO NOTHING` remains under the lock
+so that a writer bypassing it produces a re-read, not a duplicate.
+
+**Replay and crash windows** (real Postgres saver, production graph): a
+re-entry with no decision pauses on the identical payload with no new row
+and no new event; a crash after the request transaction committed but before
+the interrupt was checkpointed re-executes the node, which finds its row and
+event; a decision that arrives while the worker is away is found on plain
+re-entry (no resume value) and the run completes without pausing again; a
+fresh process resumes from the checkpoint alone; the reconciler (ADR-023)
+recovers a run whose decision committed before its worker died, resuming the
+production graph with the stored decision into exactly one send. Changed
+arguments after a grant: the old approval becomes `superseded` (pointer to the
+new request), `approval_superseded` then `approval_requested` are traced,
+`get_approved` finds nothing until the new request is decided, and the send
+traces to the new row.
+
+**Acceptance.** Pausing performs zero `mock_crm` writes — asserted by a
+content fingerprint of every `mock_crm` table before and after, not a count
+of one table — and re-entry creates no second approval row and no duplicate
+trace event. Rejection is `rejected` with `status_reason=approval_rejected`,
+never `failed`; an optional step is skipped and the run completes.
+
+**Deliberately not done.** HITL-004 (single-flight resume contention: two
+concurrent approve calls → one resume and one `409`); HITL-005 (the
+de-referenced `payload_preview` — this task stores the redacted resolved
+arguments, which is what the interrupt already surfaced); no `status =
+awaiting_approval` write from inside the node (a node that raises
+`GraphInterrupt` writes no state, so the run row's transition stays with the
+executor and the reconciler, as today); no migration.
+
+**Test suite: 1338 passed, 1 skipped** (`cd backend && uv run pytest` with
+`DATABASE_URL` pointing at PostgreSQL — 33 new in
+`tests/test_hitl_request_approval.py`, 1 new and 1 narrowed in
+`tests/test_structure.py`, 1 amended in `tests/test_hitl_gate.py`; the skip
+is the opt-in live Groq smoke test). `ruff check .`, `ruff format --check .`,
+`mypy app` (strict, 67 source files) and `alembic check` are clean.

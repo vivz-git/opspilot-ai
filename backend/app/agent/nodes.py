@@ -11,6 +11,7 @@ import contextlib
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final
 
@@ -37,6 +38,7 @@ from app.agent.state import (
     ApprovalDecision,
     ApprovalDecisionKind,
     ApprovalState,
+    ApprovalStatus,
     FinalResponse,
     Plan,
     PlanStep,
@@ -61,7 +63,9 @@ from app.errors import (
     is_retryable,
     recovery_action,
 )
-from app.persistence.protocols import UnitOfWorkFactory
+from app.observability.redaction import redact_payload
+from app.persistence.models import TraceEventKind
+from app.persistence.protocols import ApprovalUpsert, UnitOfWorkFactory
 from app.runtime import (
     CancellationSource,
     Clock,
@@ -81,6 +85,7 @@ from app.tools.contracts import (
 from app.tools.registry import DISPATCHER_OWNED_KEYS, ToolRegistry
 
 __all__ = [
+    "DEFAULT_APPROVAL_TTL",
     "NodeHandlers",
     "PLANNING_FAILURE_REASONS",
     "STATUS_REASON_INVALID_PLAN",
@@ -102,6 +107,25 @@ _log = structlog.get_logger("opspilot.agent.nodes")
 STATUS_REASON_INVALID_PLAN = "invalid_plan"
 STATUS_REASON_PLANNER_ERROR = "planner_error"
 PLANNING_FAILURE_REASONS = frozenset({STATUS_REASON_INVALID_PLAN, STATUS_REASON_PLANNER_ERROR})
+
+#: How long a human has to answer an approval request (§9.8) when the graph is
+#: assembled without `Settings` — the same 24 hours `OPSPILOT_APPROVAL_TTL_SECONDS`
+#: defaults to.
+DEFAULT_APPROVAL_TTL: Final = timedelta(hours=24)
+#: The stored `payload_preview` is written through the same redaction the API
+#: applies when it serves it (§14.5); this is the byte budget it uses.
+_PREVIEW_MAX_BYTES: Final = 4096
+
+
+@dataclass(frozen=True)
+class _ApprovalRequest:
+    """What `request_approval` learned about its step's approval, from the
+    durable row (or, without a store, from the checkpointed state): the
+    identity to surface in the interrupt, and the decision if one exists."""
+
+    approval_id: str
+    args_hash: str
+    decision: ApprovalDecision | None = None
 
 
 def create_initial_state(
@@ -172,10 +196,12 @@ class NodeHandlers:
         cancellation_source: (
             CancellationSource | Callable[[str], bool | Awaitable[bool]] | None
         ) = None,
+        approval_ttl: timedelta | None = None,
     ) -> None:
         self._registry = registry
         self._uow_factory = uow_factory
         self._clock = clock or SystemClock()
+        self._approval_ttl = approval_ttl or DEFAULT_APPROVAL_TTL
         self._id_gen = id_gen or UuidIdGenerator()
         self._normalizer = normalizer or RuleTaskNormalizer()
         self._planner: Planner = planner or RulePlanner()
@@ -505,6 +531,22 @@ class NodeHandlers:
     # 4. request_approval
     # ---------------------------------------------------------------------------
     async def request_approval(self, state: AgentState) -> dict[str, Any]:
+        """The only pause in the graph (§6.3, §7, §9.7, ADR-007) — and never a
+        tool call.
+
+        LangGraph re-executes this node from the top on `Command(resume=…)`,
+        so every execution makes the same idempotent request: the `approvals`
+        row is upserted on `(run_id, step_id, args_hash)` and
+        `approval_requested` is emitted only when that upsert genuinely
+        inserted, both in one transaction. What the row says then decides
+        the rest: a `pending` row is what `interrupt()` surfaces (the run
+        pauses, or — on re-execution — the human's resume value comes back);
+        an `approved`/`rejected` row for these exact arguments is the
+        decision itself, recorded into `approval_state` without pausing
+        again. Either way control falls through to `decide`, which re-applies
+        rule 6 to the arguments as they will now be sent; the durable row is
+        what `execute_tool` mints from (HITL-002), never this node's word.
+        """
         if await self._is_cancelled(state):
             return {
                 "status": RunStatus.FAILED,
@@ -513,64 +555,55 @@ class NodeHandlers:
         current_step_id = state.get("current_step_id")
         plan = state.get("plan")
         step = plan.step(current_step_id) if plan and current_step_id else None
-        if step is None:
+        if step is None or current_step_id is None or plan is None:
             return {"status": RunStatus.FAILED, "status_reason": "no_step_for_approval"}
 
         resolved_args = self._resolve_step_args(state, step)
         args_hash = canonical_args_hash(resolved_args)
         run_id_str = str(state.get("run_id", "default_run"))
-        approval_id = f"appr_{run_id_str[:8]}_{current_step_id}"
+        preview = redact_payload(resolved_args, max_bytes=_PREVIEW_MAX_BYTES)
 
-        approval_state = state.get("approval_state")
-        if approval_state and current_step_id in approval_state.decisions:
-            # Already decided upon re-execution
-            return {"status": RunStatus.RUNNING}
-
-        # Dynamic interruption point: execution pauses here, no tools invoked!
-        interrupted_val = interrupt(
-            {
-                "approval_id": approval_id,
-                "run_id": run_id_str,
-                "step_id": current_step_id,
-                "tool": step.tool.value,
-                "args_hash": args_hash,
-                "payload_preview": resolved_args,
-            }
-        )
-
-        # Resumed execution continues below
-        if await self._is_cancelled(state):
-            return {
-                "status": RunStatus.FAILED,
-                "status_reason": "cancelled",
-            }
-        decision_obj: ApprovalDecision
-        if isinstance(interrupted_val, ApprovalDecision):
-            decision_obj = interrupted_val
-        elif isinstance(interrupted_val, dict):
-            dec_kind = ApprovalDecisionKind(interrupted_val.get("decision", "approve"))
-            decision_obj = ApprovalDecision(
-                approval_id=approval_id,
-                step_id=current_step_id,
-                decision=dec_kind,
+        if self._uow_factory is not None:
+            request = await self._persist_approval_request(
+                self._uow_factory,
+                run_id=uuid.UUID(run_id_str),
+                step=step,
                 args_hash=args_hash,
-                decided_by=str(interrupted_val.get("decided_by", "operator")),
-                decided_at=self._clock.now(),
-                reason=interrupted_val.get("reason"),
+                preview=preview,
             )
         else:
-            dec_kind = ApprovalDecisionKind(str(interrupted_val))
-            decision_obj = ApprovalDecision(
-                approval_id=approval_id,
+            request = self._checkpointed_approval_request(state, step, run_id_str, args_hash)
+
+        decision = request.decision
+        if decision is None:
+            # Dynamic interruption point: execution pauses here, no tools invoked.
+            # The payload is canonical — the same durable identity on every
+            # execution — so a re-entry surfaces the same request, not a new one.
+            interrupted_val = interrupt(
+                {
+                    "approval_id": request.approval_id,
+                    "run_id": run_id_str,
+                    "step_id": current_step_id,
+                    "tool": step.tool.value,
+                    "args_hash": request.args_hash,
+                    "payload_preview": preview,
+                }
+            )
+            # Resumed execution continues below
+            if await self._is_cancelled(state):
+                return {
+                    "status": RunStatus.FAILED,
+                    "status_reason": "cancelled",
+                }
+            decision = self._decision_from_resume(
+                interrupted_val,
+                approval_id=request.approval_id,
                 step_id=current_step_id,
-                decision=dec_kind,
-                args_hash=args_hash,
-                decided_by="operator",
-                decided_at=self._clock.now(),
+                args_hash=request.args_hash,
             )
 
         updated_plan = plan
-        if decision_obj.decision == ApprovalDecisionKind.REJECT and plan is not None:
+        if decision.decision is ApprovalDecisionKind.REJECT:
             new_steps = []
             for s in plan.steps:
                 if s.step_id == current_step_id:
@@ -583,11 +616,149 @@ class NodeHandlers:
         return {
             "approval_state": ApprovalState(
                 pending=None,
-                decisions={current_step_id: decision_obj},
+                decisions={current_step_id: decision},
             ),
             "plan": updated_plan,
             "status": RunStatus.RUNNING,
         }
+
+    async def _persist_approval_request(
+        self,
+        uow_factory: UnitOfWorkFactory,
+        *,
+        run_id: uuid.UUID,
+        step: PlanStep,
+        args_hash: str,
+        preview: dict[str, Any],
+    ) -> _ApprovalRequest:
+        """The durable request (§9.7): one transaction that upserts the
+        `approvals` row and, only when this transaction inserted it, appends
+        `approval_requested` — plus `approval_superseded` for every earlier
+        row the changed arguments invalidated. Roll back and neither exists;
+        commit and both do. The row is read fresh on every execution, so a
+        decision the human made while the worker was away is found here
+        rather than requested again. A persistence failure propagates: there
+        is no safe way to pause without a durable request to decide on.
+        """
+        contract = self._get_contract(step.tool) or REGISTRY[step.tool]
+        now = self._clock.now()
+        async with uow_factory() as uow:
+            upsert: ApprovalUpsert = await uow.approvals.upsert_request(
+                run_id=run_id,
+                step_id=step.step_id,
+                tool=step.tool,
+                risk=contract.risk,
+                title=f"{step.tool.value}: approve step {step.step_id}",
+                summary=step.rationale or contract.purpose,
+                payload_preview=preview,
+                args_hash=args_hash,
+                requested_at=now,
+                expires_at=now + self._approval_ttl,
+            )
+            row = upsert.row
+            if upsert.created:
+                for old in upsert.superseded:
+                    await uow.trace_events.append(
+                        run_id=run_id,
+                        kind=TraceEventKind.APPROVAL_SUPERSEDED,
+                        node="request_approval",
+                        tool=step.tool,
+                        step_id=step.step_id,
+                        status=ApprovalStatus.SUPERSEDED.value,
+                        payload={
+                            "approval_id": str(old.id),
+                            "superseded_by": str(row.id),
+                            "args_hash": old.args_hash,
+                        },
+                    )
+                await uow.trace_events.append(
+                    run_id=run_id,
+                    kind=TraceEventKind.APPROVAL_REQUESTED,
+                    node="request_approval",
+                    tool=step.tool,
+                    step_id=step.step_id,
+                    status=ApprovalStatus.PENDING.value,
+                    payload={
+                        "approval_id": str(row.id),
+                        "args_hash": row.args_hash,
+                        "risk": contract.risk.value,
+                        "expires_at": row.expires_at.isoformat(),
+                    },
+                )
+            await uow.commit()
+
+        decision: ApprovalDecision | None = None
+        if row.status is ApprovalStatus.APPROVED or row.status is ApprovalStatus.REJECTED:
+            decision = ApprovalDecision(
+                approval_id=str(row.id),
+                step_id=step.step_id,
+                decision=(
+                    ApprovalDecisionKind.APPROVE
+                    if row.status is ApprovalStatus.APPROVED
+                    else ApprovalDecisionKind.REJECT
+                ),
+                args_hash=row.args_hash,
+                decided_by=row.decided_by or "operator",
+                decided_at=row.decided_at or now,
+                reason=row.decision_reason,
+            )
+        _log.info(
+            "approval_request_settled",
+            run_id=str(run_id),
+            step_id=step.step_id,
+            approval_id=str(row.id),
+            created=upsert.created,
+            superseded=[str(old.id) for old in upsert.superseded],
+            status=row.status.value,
+        )
+        return _ApprovalRequest(approval_id=str(row.id), args_hash=row.args_hash, decision=decision)
+
+    @staticmethod
+    def _checkpointed_approval_request(
+        state: AgentState, step: PlanStep, run_id: str, args_hash: str
+    ) -> _ApprovalRequest:
+        """Without a durable store the checkpointed `approval_state` is the
+        only record: a decision already held for these exact arguments is
+        reused, anything else is asked. The identity is derived, not
+        generated, so re-execution surfaces the same request."""
+        approval_id = f"appr_{run_id[:8]}_{step.step_id}_{args_hash[:12]}"
+        approval_state = state.get("approval_state") or ApprovalState()
+        held = approval_state.decisions.get(step.step_id)
+        decision = held if held is not None and held.args_hash == args_hash else None
+        return _ApprovalRequest(approval_id=approval_id, args_hash=args_hash, decision=decision)
+
+    def _decision_from_resume(
+        self,
+        value: Any,  # noqa: ANN401 - whatever `Command(resume=...)` carried
+        *,
+        approval_id: str,
+        step_id: str,
+        args_hash: str,
+    ) -> ApprovalDecision:
+        """The human's answer as `Command(resume=…)` delivered it: a stored
+        decision kind (`"approve"`/`"reject"`, what the approval service and
+        the reconciler send), a mapping with `decision`/`decided_by`/`reason`,
+        or a complete `ApprovalDecision`. Bound to the hash the human saw."""
+        if isinstance(value, ApprovalDecision):
+            return value
+        if isinstance(value, dict):
+            return ApprovalDecision(
+                approval_id=approval_id,
+                step_id=step_id,
+                decision=ApprovalDecisionKind(value.get("decision", "approve")),
+                args_hash=args_hash,
+                decided_by=str(value.get("decided_by", "operator")),
+                decided_at=self._clock.now(),
+                reason=value.get("reason"),
+            )
+        return ApprovalDecision(
+            approval_id=approval_id,
+            step_id=step_id,
+            decision=ApprovalDecisionKind(str(value)),
+            args_hash=args_hash,
+            decided_by="operator",
+            decided_at=self._clock.now(),
+        )
 
     # ---------------------------------------------------------------------------
     # 5. execute_tool
