@@ -15,11 +15,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent.state import ApprovalDecisionKind, ApprovalStatus
 from app.observability.redaction import redact_payload
-from app.persistence.models import ApprovalRow
+from app.persistence.models import ApprovalRow, TraceEvent, TraceEventKind, TraceEventSeverity
 
 __all__ = [
     "ApprovalDecisionRequest",
     "ApprovalResource",
+    "TraceEventResource",
+    "TracePageResponse",
 ]
 
 
@@ -87,3 +89,69 @@ class ApprovalResource(BaseModel):
             decided_by=row.decided_by,
             reason=row.decision_reason,
         )
+
+
+class TraceEventResource(BaseModel):
+    """Safe external representation of one `trace_events` row (§13.4, §14.2).
+
+    Deliberately omits the internal `TraceEvent.id` bigserial surrogate key:
+    `seq` — the durable, per-run monotonic cursor — is the only identifier a
+    client ever sees, for both REST pagination and the SSE event `id`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int
+    ts: datetime
+    kind: TraceEventKind
+    severity: TraceEventSeverity
+    node: str | None = None
+    tool: str | None = None
+    step_id: str | None = None
+    attempt: int | None = None
+    input: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
+    status: str | None = None
+    duration_ms: int | None = None
+    retry_count: int | None = None
+    error: dict[str, Any] | None = None
+    payload: dict[str, Any]
+
+    @classmethod
+    def from_row(cls, row: TraceEvent, *, max_bytes: int) -> TraceEventResource:
+        """Build a detached, redacted resource from a persisted row.
+
+        `redact_payload` always returns a fresh dict (§14.5), so this never
+        mutates `row.input`/`output`/`error`/`payload` as stored — the same
+        ORM instance can be serialized again, or committed again, unchanged.
+        """
+        return cls(
+            seq=row.seq,
+            ts=row.ts,
+            kind=row.kind,
+            severity=row.severity,
+            node=row.node,
+            tool=str(row.tool) if row.tool is not None else None,
+            step_id=row.step_id,
+            attempt=row.attempt,
+            input=redact_payload(row.input, max_bytes=max_bytes) if row.input is not None else None,
+            output=(
+                redact_payload(row.output, max_bytes=max_bytes) if row.output is not None else None
+            ),
+            status=row.status,
+            duration_ms=row.duration_ms,
+            retry_count=row.retry_count,
+            error=redact_payload(row.error, max_bytes=max_bytes) if row.error is not None else None,
+            payload=redact_payload(row.payload, max_bytes=max_bytes),
+        )
+
+
+class TracePageResponse(BaseModel):
+    """`GET /runs/{run_id}/trace` response body (§13.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: uuid.UUID
+    events: list[TraceEventResource]
+    next_seq: int | None
+    complete: bool

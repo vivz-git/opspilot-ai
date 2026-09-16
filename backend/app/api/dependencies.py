@@ -19,6 +19,7 @@ from app.errors import PolicyViolation
 from app.execution.approvals import ApprovalService
 from app.execution.leases import LeaseConfig
 from app.execution.recovery import LangGraphRunDriver, RunDriver
+from app.execution.trace import TraceService
 from app.persistence.protocols import UnitOfWorkFactory
 from app.persistence.repositories import SqlUnitOfWork
 from app.persistence.session import create_session_factory
@@ -26,19 +27,16 @@ from app.runtime import SystemClock
 
 __all__ = [
     "get_approval_service",
+    "get_trace_service",
     "require_authorization",
 ]
 
 
-def get_approval_service(request: Request) -> ApprovalService:
-    """Provide the ApprovalService from application state or construct it lazily."""
-    service: ApprovalService | None = getattr(request.app.state, "approval_service", None)
-    if service is not None:
-        return service
-
+def _get_uow_factory(request: Request) -> UnitOfWorkFactory:
+    """The shared, lazily-cached `UnitOfWorkFactory` every API dependency
+    builds its repository access from — one session factory per app, never a
+    session held across requests."""
     engine: AsyncEngine = request.app.state.db_engine
-    settings: Settings = request.app.state.settings
-
     session_factory = getattr(request.app.state, "session_factory", None)
     if session_factory is None:
         session_factory = create_session_factory(engine)
@@ -49,7 +47,17 @@ def get_approval_service(request: Request) -> ApprovalService:
     def _uow_factory() -> SqlUnitOfWork:
         return SqlUnitOfWork(typed_session_factory)
 
-    uow_factory: UnitOfWorkFactory = _uow_factory
+    return _uow_factory
+
+
+def get_approval_service(request: Request) -> ApprovalService:
+    """Provide the ApprovalService from application state or construct it lazily."""
+    service: ApprovalService | None = getattr(request.app.state, "approval_service", None)
+    if service is not None:
+        return service
+
+    settings: Settings = request.app.state.settings
+    uow_factory = _get_uow_factory(request)
 
     driver: RunDriver | None = getattr(request.app.state, "run_driver", None)
     if driver is None:
@@ -72,6 +80,24 @@ def get_approval_service(request: Request) -> ApprovalService:
         lease=lease,
     )
     request.app.state.approval_service = service
+    return service
+
+
+def get_trace_service(request: Request) -> TraceService:
+    """Provide the TraceService (API-003) from application state or construct
+    it lazily. Read-only: shares the same `UnitOfWorkFactory` as every other
+    dependency, never a driver, checkpointer, or lease."""
+    service: TraceService | None = getattr(request.app.state, "trace_service", None)
+    if service is not None:
+        return service
+
+    settings: Settings = request.app.state.settings
+    uow_factory = _get_uow_factory(request)
+
+    service = TraceService(
+        uow_factory=uow_factory, payload_max_bytes=settings.trace_payload_max_bytes
+    )
+    request.app.state.trace_service = service
     return service
 
 

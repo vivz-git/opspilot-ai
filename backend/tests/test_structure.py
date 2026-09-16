@@ -937,6 +937,156 @@ def test_verifiers_never_touch_approval_authorisation() -> None:
     assert not offenders, f"verifier touched approval gate: {offenders}"
 
 
+# ---------------------------------------------------------------------------
+# API-003 — the trace/SSE observability surface is read-only (§13.4, §3.3)
+# ---------------------------------------------------------------------------
+API_003_MODULES = ("api/runs.py", "execution/trace.py")
+
+#: Anything that would make this a second trace/execution system rather than
+#: a read-only view over the existing one.
+BROKER_MODULES = frozenset(
+    {"redis", "celery", "kombu", "pika", "aio_pika", "kafka", "confluent_kafka", "aioredis"}
+)
+
+
+def test_api_003_never_appends_or_mutates_trace_or_run_state() -> None:
+    """The trace/events endpoints read; they never call
+    `trace_events.append`, `agent_runs.update_status`/`transition_status`/
+    `acquire_lease`/`heartbeat_lease`/`release_lease`, or any other mutating
+    repository method (§13.4: reading a trace must never write one)."""
+    mutating_methods = {
+        "append",
+        "update_status",
+        "transition_status",
+        "acquire_lease",
+        "heartbeat_lease",
+        "release_lease",
+        "update_plan",
+        "update_final_response",
+        "increment_counters",
+    }
+    offenders: dict[str, list[str]] = {}
+    for rel in API_003_MODULES:
+        path = APP / rel
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = [
+            f"{node.func.attr}(...) at line {node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in mutating_methods
+        ]
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"API-003 mutates state it must only read: {offenders}"
+
+
+def test_api_003_never_touches_checkpoints_or_langgraph() -> None:
+    """A trace/event reader has no business resuming or inspecting a
+    LangGraph checkpoint (§9.6, ADR-023) — that is `ApprovalService`'s job."""
+    forbidden_names = {"Command", "interrupt"}
+    forbidden_attrs = {"resume", "ainvoke", "get_state", "aget_state", "aget_tuple"}
+    offenders: dict[str, list[str]] = {}
+    for rel in API_003_MODULES:
+        path = APP / rel
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in forbidden_names:
+                    found.append(f"{node.func.id}(...) at line {node.lineno}")
+                elif isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attrs:
+                    found.append(f".{node.func.attr}(...) at line {node.lineno}")
+        if any("checkpoint" in m for m in imported_modules(path)):
+            found.append("imports a checkpoint module")
+        if found:
+            offenders[rel] = sorted(set(found))
+    assert not offenders, f"API-003 touches checkpoints/LangGraph resume: {offenders}"
+
+
+def test_api_003_uses_no_in_process_queue_broker_or_lock() -> None:
+    """SSE fan-out is independent PostgreSQL polling per subscriber (§3.3):
+    no `asyncio.Queue`, no process-local lock, no broker client library."""
+    offenders: dict[str, list[str]] = {}
+    for rel in API_003_MODULES:
+        path = APP / rel
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        modules = imported_modules(path)
+        broker_hit = modules & BROKER_MODULES
+        if broker_hit:
+            found.append(f"broker import(s): {sorted(broker_hit)}")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in (
+                "Queue",
+                "Lock",
+                "RLock",
+                "Semaphore",
+            ):
+                chain = _receiver_names(node.value)
+                if chain and chain[-1] in ("asyncio", "threading", "multiprocessing"):
+                    found.append(f"{chain[-1]}.{node.attr} at line {node.lineno}")
+        if found:
+            offenders[rel] = found
+    assert not offenders, f"API-003 introduces process-local queue/lock/broker infra: {offenders}"
+
+
+def test_trace_event_resource_never_exposes_internal_id() -> None:
+    """`TraceEventResource` is the only public shape a trace row takes
+    (§13.4): its field list never includes the internal `TraceEvent.id`
+    bigserial surrogate key, and `from_row` never reads `row.id`."""
+    path = APP / "api" / "schemas.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    resource_cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "TraceEventResource"
+    )
+    field_names = {
+        stmt.target.id
+        for stmt in resource_cls.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+    assert "id" not in field_names, "TraceEventResource must never declare an `id` field"
+
+    from_row_fn = next(
+        node
+        for node in ast.walk(resource_cls)
+        if isinstance(node, ast.FunctionDef) and node.name == "from_row"
+    )
+    from_row_reads_id = any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "id"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "row"
+        for node in ast.walk(from_row_fn)
+    )
+    assert not from_row_reads_id, "TraceEventResource.from_row must never read row.id"
+
+
+def test_trace_redaction_never_mutates_the_row_it_serializes() -> None:
+    """`TraceEventResource.from_row` calls `redact_payload` (which always
+    returns a fresh dict, §14.5) and never assigns back onto the ORM row —
+    the persisted `trace_events` row must be unchanged after serialization."""
+    path = APP / "api" / "schemas.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    resource_cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "TraceEventResource"
+    )
+    offenders = [
+        f"assignment to row attribute at line {node.lineno}"
+        for node in ast.walk(resource_cls)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "row"
+    ]
+    assert not offenders, f"TraceEventResource mutates the persisted row: {offenders}"
+
+
 def test_verifiers_never_dispatch_tools_or_call_llm() -> None:
     """§11, §16.3: Verifiers are deterministic and never execute tools or call an LLM."""
     verifiers_dir = APP / "agent" / "verifiers"

@@ -21,6 +21,7 @@ from app.api.approvals import router as approvals_router
 from app.api.errors import register_error_handlers
 from app.api.health import discover_alembic_head
 from app.api.health import router as health_router
+from app.api.runs import router as runs_router
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
 
@@ -74,6 +75,8 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(approvals_router)
+    app.include_router(runs_router)
+    app.include_router(runs_router, prefix="/api/v1")
 
     return app
 
