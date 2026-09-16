@@ -13,6 +13,7 @@ that keep planning separate from execution.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -284,7 +285,7 @@ SCRIPTED_OUTPUTS: dict[ToolName, Callable[[dict[str, Any]], dict[str, Any]]] = {
         "subject": "Hello",
         "body": "Hi there",
         "word_count": 2,
-        "content_hash": "0123456789abcdef",
+        "content_hash": hashlib.sha256(b"Hello\n\nHi there").hexdigest(),
         "model_version": "t",
         "generated_at": TEST_NOW.isoformat(),
     },
@@ -1738,7 +1739,7 @@ class TestPlanNodeIntegration:
         assert (
             calls["s6"]["score"]["score"] == 80 and calls["s6"]["company"]["company_id"] == "co_0"
         )
-        assert calls["s7"]["content_hash"] == "0123456789abcdef"
+        assert calls["s7"]["content_hash"] == hashlib.sha256(b"Hello\n\nHi there").hexdigest()
         assert calls["s8"] == {"draft_id": "d_1", "to_email": "lead0@example.com"}
         assert final["step_count"] == 10, (
             "3 research children + 3 scores + search + draft + save + send"
@@ -2208,6 +2209,7 @@ class TestStructure:
             "preview.py",
             "resolver.py",
             "state.py",
+            "verification_recovery.py",
         }
         assert {p.name for p in PLANNER_DIR.glob("*.py")} == PLANNER_FILES
 

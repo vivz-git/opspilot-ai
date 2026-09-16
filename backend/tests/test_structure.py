@@ -200,7 +200,7 @@ MUTATING_PORT_METHODS: dict[str, frozenset[str]] = {
 MUTATING_METHOD_NAMES = frozenset().union(*MUTATING_PORT_METHODS.values())
 MUTATING_PORT_FIELDS = frozenset({"mail", "customers", "drafts"})  # `Adapters` attributes
 #: Read paths on the same ports, used by the verifiers (§11.3).
-READ_METHOD_NAMES = frozenset({"get", "get_outbox"})
+READ_METHOD_NAMES = frozenset({"get", "get_outbox", "count_outbox"})
 
 
 def _rel(path: Path) -> str:
@@ -328,6 +328,7 @@ def test_the_port_bypass_scan_catches_the_bypass(snippet: str) -> None:
     "snippet",
     [
         "record = await adapters.mail.get_outbox(message_id)",  # verifier readback
+        "count = await adapters.mail.count_outbox(idem_key)",
         "draft = await adapters.drafts.get(draft_id)",
         "customer = await adapters.customers.get(customer_id=cid)",
         "state.update({'a': 1})",  # dict.update is not CustomerPort.update
@@ -335,6 +336,7 @@ def test_the_port_bypass_scan_catches_the_bypass(snippet: str) -> None:
     ],
     ids=[
         "mail.get_outbox",
+        "mail.count_outbox",
         "drafts.get",
         "customers.get",
         "dict.update",
@@ -909,3 +911,52 @@ def test_node_handlers_accept_no_token_or_gate_injection() -> None:
             assert not any(word in lowered for word in ("token", "gate", "mint", "issuer")), (
                 f"{fn.__qualname__} accepts an authorisation injection point: {name}"
             )
+
+
+def test_verifiers_never_touch_approval_authorisation() -> None:
+    """§11, VERIFY-001: Verifiers are purely observational. They never hold,
+    mint, or touch approval gates or tokens."""
+    verifiers_dir = APP / "agent" / "verifiers"
+    if not verifiers_dir.exists():
+        return
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(verifiers_dir):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "app.security":
+                found.extend(
+                    f"import {alias.name} at line {node.lineno}"
+                    for alias in node.names
+                    if alias.name in {"ApprovalGate", "_MINT", "issue_from_persisted"}
+                )
+            elif isinstance(node, ast.Name) and node.id in {"ApprovalGate", "_MINT"}:
+                found.append(f"{node.id} at line {node.lineno}")
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"verifier touched approval gate: {offenders}"
+
+
+def test_verifiers_never_dispatch_tools_or_call_llm() -> None:
+    """§11, §16.3: Verifiers are deterministic and never execute tools or call an LLM."""
+    verifiers_dir = APP / "agent" / "verifiers"
+    if not verifiers_dir.exists():
+        return
+    forbidden_modules = {"openai", "anthropic", "groq", "langchain"}
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(verifiers_dir):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.startswith("app.tools.impl"):
+                    found.append(f"import from {node.module} at line {node.lineno}")
+                if any(node.module.startswith(m) for m in forbidden_modules):
+                    found.append(f"import {node.module} at line {node.lineno}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if any(alias.name.startswith(m) for m in forbidden_modules):
+                        found.append(f"import {alias.name} at line {node.lineno}")
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"verifier calls tools or LLM: {offenders}"

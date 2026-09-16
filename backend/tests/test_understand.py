@@ -473,13 +473,23 @@ class TestUnderstandNodeAndGraphIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 class TestPostgresCheckpointPersistence:
+    @pytest.fixture(autouse=True, scope="class")
+    @classmethod
+    def _database(cls) -> None:
+        """Alembic drives its own event loop, so migrating has to happen
+        outside the coroutine — the same split every other integration module
+        uses."""
+        from recovery_harness import migrate_to_head, require_database
+
+        require_database()
+        migrate_to_head()
+
     @pytest.mark.asyncio
     async def test_postgres_checkpoint_persists_normalized_task(self) -> None:
         """With AsyncPostgresSaver, the checkpoint after understand persists NormalizedTask."""
         settings = get_settings()
-        if "change-me-locally" in settings.database_url.get_secret_value():
-            pytest.skip("PostgreSQL not configured for integration test")
 
         run_id = uuid.uuid4()
         thread_id = str(run_id)

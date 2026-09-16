@@ -19,6 +19,8 @@ from app.agent.nodes import NodeHandlers
 from app.agent.normalizer import TaskNormalizer
 from app.agent.planner import Planner
 from app.agent.state import AgentState, PlanStep
+from app.agent.verifiers import VerifierRegistry
+from app.integrations.ports import Adapters
 from app.persistence.protocols import UnitOfWorkFactory
 from app.runtime import CancellationSource, Clock, IdGenerator, SeededRandom
 from app.tools.registry import ToolRegistry
@@ -32,6 +34,8 @@ def create_agent_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     *,
     registry: ToolRegistry | None = None,
+    adapters: Adapters | None = None,
+    verifier_registry: VerifierRegistry | None = None,
     uow_factory: UnitOfWorkFactory | None = None,
     clock: Clock | None = None,
     id_gen: IdGenerator | None = None,
@@ -51,6 +55,8 @@ def create_agent_graph(
     """Assemble and compile the production LangGraph agent graph (§6.1)."""
     handlers = node_handlers or NodeHandlers(
         registry=registry,
+        adapters=adapters,
+        verifier_registry=verifier_registry,
         uow_factory=uow_factory,
         clock=clock,
         id_gen=id_gen,
@@ -116,11 +122,16 @@ def create_agent_graph(
         handlers.route_after_verify,
         {"decide": "decide", "recover": "recover"},
     )
+    # `recover` may also send a retry back to `verify`: when a mutating tool
+    # succeeded but its read-back was unreachable, the effect is unconfirmed,
+    # and the recovery for that is another read — never a second write
+    # (VERIFY-003).
     builder.add_conditional_edges(
         "recover",
         handlers.route_after_recover,
         {
             "execute_tool": "execute_tool",
+            "verify": "verify",
             "plan": "plan",
             "decide": "decide",
             "fail": "fail",

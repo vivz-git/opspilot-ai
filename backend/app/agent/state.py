@@ -182,6 +182,12 @@ class VerificationResult(Model):
     checks: list[VerificationCheck] = Field(default_factory=list)
     duration_ms: int | None = None
     detail: str | None = None
+    #: Which verification attempt produced this result, 1-based. An
+    #: `unconfirmed` readback is retried without re-running the tool, so the
+    #: verification attempt counter is distinct from `ToolCall.attempt` — and
+    #: it is what makes the retry accounting survive a checkpoint resume
+    #: (VERIFY-003).
+    attempt: int = Field(default=1, ge=1)
 
 
 class AgentError(Model):

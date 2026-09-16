@@ -301,6 +301,10 @@ class ToolRegistry:
     def is_bound(self, name: ToolName) -> bool:
         return name in self._implementations
 
+    @property
+    def adapters(self) -> Adapters:
+        return self._adapters
+
     # -- the choke point ------------------------------------------------------
     async def dispatch(
         self,

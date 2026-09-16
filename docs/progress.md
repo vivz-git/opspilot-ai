@@ -24,7 +24,7 @@ persistence    ████████████████████  DB-
 tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
 agent graph    ████████████████████  AGENT-001..009 complete
 hitl           ████████████████████  HITL-001..005 complete
-verification   ░░░░░░░░░░░░░░░░░░░░  VERIFY-001..003
+verification   ██████████████░░░░░░  VERIFY-001..002 complete; VERIFY-003 outstanding
 api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
 frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
@@ -1556,4 +1556,97 @@ the skip is the opt-in live Groq smoke test). `ruff check app tests`,
 `ruff format --check app tests`, `mypy app` (strict, 68 source files) and
 `alembic check` are clean.
 
+## VERIFY-001 — Postcondition Verification Framework & Invariant Verifiers — 2026-09-16
 
+Postcondition verification framework (§11, ADR-008, VERIFY-001) is implemented.
+The system strictly distinguishes *tool return success* from *intended business outcome verified*.
+Verification is read-only, post-execution, and keyed to `VerificationMode` from contracts.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/agent/verifiers/base.py` | `VerificationContext` carrier and `Verifier` protocol. Pure read-only post-execution contract. | `tests/test_verifiers.py` |
+| `app/agent/verifiers/invariants.py` | Invariant verifiers for read tools (§8.4): `SearchLeadsVerifier` (limit bounds, total matched consistency, filter compliance), `ResearchCompanyVerifier` (confidence bounds, non-empty summary, company ID matching), `ScoreLeadVerifier` (0..100 score bounds, factor contribution sum consistency, band threshold verification), `DraftOutreachVerifier` (word count bounded, non-empty subject/body, placeholder rejection, SHA-256 content hash integrity). | `tests/test_verifiers.py` |
+| `app/agent/verifiers/readback.py` | Readback verifiers for mutating tools: `SendEmailMockVerifier` (outbox row exists, status="sent", recipient matching, draft ID matching, idempotency key count), `UpdateCustomerVerifier` (expected version increment, patch equality, unchanged untouched fields), `SaveDraftVerifier` (draft row exists, status="saved", lead ID match, requested content hash match). | `tests/test_verifiers.py` |
+| `app/agent/verifiers/registry.py` | `NullVerifier` (records `status=NOT_REQUIRED` for `VerificationMode.NONE` tools e.g. `get_lead`, `get_customer`), `VerifierRegistry` with default bindings for all tools. | `tests/test_verifiers.py` |
+| `app/agent/nodes.py` | Wired `verify` node and `route_after_verify` conditional routing. If verification passes or is not required, routes to `decide`. If verification fails or is unconfirmed, records `AgentError(error_class=ErrorClass.VERIFICATION_FAILED)` and routes to `recover`. Persists `VerificationResult` to `execution_steps.verification` and emits structured trace events (`verification_passed` / `verification_failed`). `execute_tool` explicitly records `VerificationStatus.NOT_REQUIRED` when contract mode is `NONE`. | `tests/test_verify_node.py` |
+| `app/agent/graph.py` | Injected `verifier_registry` and `adapters` into `create_agent_graph` and forwarded to `NodeHandlers`. | `tests/test_verify_node.py` |
+| `tests/test_verifiers.py` | 28 unit tests covering null verifier, invariant verifiers, readback verifiers, corrupted hashes, out-of-bound scores, placeholder detection, untouched field tampering, and duplicate outbox detection. | `tests/test_verifiers.py` |
+| `tests/test_verify_node.py` | 5 integration tests covering full graph execution across passed invariants, failed invariants routing to recover, readback verifiers, and NONE mode recording `NOT_REQUIRED`. | `tests/test_verify_node.py` |
+| `tests/test_structure.py` | Structural AST checks proving: verifiers never import `_MINT` or call `ApprovalGate`, verifiers never call `ToolRegistry.dispatch` or `execute_tool`, verifiers never import LLM clients or prompt modules, and verifiers only access integration ports via read methods (`get`, `get_outbox`). | `tests/test_structure.py` |
+
+**Security and Boundary Invariants.**
+- Verifiers are strictly read-only: zero tool calls, zero token minting, zero state mutation, zero LLM calls. AST enforced in `test_structure.py`.
+- Level 0 schema validation remains mandatory on all tools; postcondition verification operates on validated output and requested input intent.
+- `VerificationMode.NONE` produces an explicit `VerificationResult(status=NOT_REQUIRED)` — no silent gaps in the audit trail.
+- Zero database migrations required: utilizes existing `execution_steps.verification_status`, `verification` JSONB, and `trace_events`.
+
+**Test suite: 953 passed, 25 skipped, 417 deselected** (non-integration run; 400 passed against integration/graph files).
+`ruff check app tests`, `ruff format --check app tests`, and `mypy app` (strict, 73 source files) are clean.
+
+## VERIFY-002 — Concrete Postcondition Verifiers / Business-Outcome Verification — 2026-09-16
+
+Concrete postcondition verifiers across all OpsPilot business workflows (§11, ADR-008, VERIFY-002) are hardened.
+Every verifier strictly compares actual state/output against the caller's *requested intent* (`ctx.input_args`) rather than the tool's echoed response.
+Enforces business-outcome invariants: single-row idempotency key assertion for email dispatch, untouched fields protection against baseline customer snapshots, alignment with rule-engine score band thresholds, independent outreach text word counts, and structural filter validations.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/agent/verifiers/readback.py` | Hardened readback verifiers: `SendEmailMockVerifier` (validates against `ctx.input_args`, asserts `count_outbox(idempotency_key) == 1` to prevent duplicate sends/replays), `UpdateCustomerVerifier` (asserts `untouched_fields_intact` against `ctx.baseline_customer` across non-patch fields, asserts immutable identity fields like `customer_id`, `account_name`, `email`, `mrr`), `SaveDraftVerifier` (verifies `channel_matches_intent` and direct content matching for `subject` and `body` alongside content hash). | `tests/test_verifiers.py`, `tests/test_verify_node.py` |
+| `app/agent/verifiers/invariants.py` | Hardened invariant verifiers: `ScoreLeadVerifier` (aligned score band threshold with rule engine: `score >= 75` -> `"hot"`, `50..74` -> `"warm"`, `< 50` -> `"cold"`; asserts all 4 required score factors are present), `DraftOutreachVerifier` (independently calculates actual text word count `len(body.split()) <= max_words`, asserts `1 <= len(subject) <= 120`, expands placeholder detection across `<...>`, `[...]`, `TODO`, `FIXME`, `XXX`, `{% ... %}`), `SearchLeadsVerifier` (unique `lead_id` check, non-negative `total_matched >= 0`, multi-filter matching), `ResearchCompanyVerifier` (domain intent matching, list type validation). | `tests/test_verifiers.py` |
+| `app/integrations/ports.py` | Added `count_outbox(self, idempotency_key: str) -> int` to `MailPort` protocol. | `tests/test_verifiers.py` |
+| `app/integrations/mock/adapters.py` | Implemented `count_outbox` on `MockMailAdapter` querying `email_outbox.count_by_idempotency_key`. | `tests/test_verifiers.py` |
+| `app/persistence/protocols.py` + `repositories.py` | Added `count_by_idempotency_key` to `EmailOutboxRepository` executing `SELECT count(*) FROM email_outbox WHERE idempotency_key = :key`. | `tests/test_verifiers.py` |
+| `app/agent/verifiers/base.py` | Extended `VerificationContext` with `baseline_customer: Customer | None` and `prior_tool_results: dict[str, Any]`. | `tests/test_verifiers.py`, `tests/test_verify_node.py` |
+| `app/agent/nodes.py` | Populated `baseline_customer` in `verify` node from prior `get_customer` results or inputs; handles `UNCONFIRMED` verification by recording `AgentError(error_class=ErrorClass.TRANSIENT)` and routing to `recover`. | `tests/test_verify_node.py` |
+| `tests/test_structure.py` | Added `count_outbox` to `READ_METHOD_NAMES` AST whitelist; confirmed zero token minting, zero state mutations, zero LLM calls, zero unregistered port methods. | `tests/test_structure.py` |
+| `tests/test_verifiers.py` | 40 unit tests covering all invariant and readback assertions, threshold alignment, duplicate outbox row detection, and customer tampering detection. | `tests/test_verifiers.py` |
+| `tests/test_verify_node.py` | 7 integration tests covering full graph verify node execution, outbox duplicate detection routing to recover, and customer tampering routing to recover. | `tests/test_verify_node.py` |
+
+**Security and Boundary Invariants.**
+- Verifiers are strictly read-only and non-mutating: zero tool dispatch, zero token minting, zero LLM calls. AST enforced in `test_structure.py`.
+- Verified business outcomes: outbox uniqueness asserts `count == 1` ensuring replay protection; customer modification asserts all non-patch fields remain identical to baseline.
+- Score band thresholds aligned with rule engine (`score >= 75` is `"hot"`).
+- Zero database migrations: executes standard SQL count query over existing indexed `email_outbox.idempotency_key`.
+
+**Test suite: 968 passed, 25 skipped, 417 deselected** (non-integration run).
+`ruff check app tests`, `ruff format --check app tests`, and `mypy app` (strict, 73 source files) are clean.
+
+## VERIFY-003 — Verification Failure Recovery, Retry, Replan, Escalation & Terminal Semantics — 2026-09-16
+
+The control loop after verification is closed. `execute_tool → verify` already existed; what was missing was everything on the far side of a verdict that is not `passed`.
+
+The distinction the whole task turns on:
+
+- **`failed`** — independent evidence proves the requested postcondition is false.
+- **`unconfirmed`** — the system cannot currently determine whether the effect happened.
+
+They are never collapsed. In particular, a mutating tool that **succeeded** whose read-back came back `unconfirmed` retries **`verify`**, never `execute_tool`. You do not answer "did the email send?" by sending another email.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/agent/verification_recovery.py` | **New.** The two questions verification adds to `recover`, as pure functions over checkpointed channels: *where does the retry go* (`retry_target_for`, `RetryTarget`, `tool_effect_succeeded`) and *is repeating the mutation safe at all* (`classify_verification_failure`, `VerificationSafety`, `is_safe_to_retry_mutation`, `PROVEN_ABSENCE_CHECKS`). Plus `verify_retry_key` and the `AgentError.detail` stamp keys. No I/O, no async, no ports, no registry, no security — it narrows the inputs `recovery_action` is given rather than deciding anything twice. | `tests/test_verify_recovery.py` |
+| `app/agent/nodes.py` — `execute_tool` | A tool that returned is not yet a step that succeeded. For `verification != NONE` the step is left `running`; `VerificationMode.NONE` still settles at execution as before. | `tests/test_verify_recovery.py` |
+| `app/agent/nodes.py` — `verify` | Stamps `VerificationResult.attempt` from the checkpointed read-back counter; settles the step to `succeeded` on `passed`/`not_required`; marks its own `AgentError`s with `source="verify"`, the verification attempt and the check evidence; forces a verifier exception to `TRANSIENT` unless the verifier itself is broken. Persistence and tracing moved into `_persist_verification`, so the exception path now persists too. | `tests/test_verify_recovery.py`, `tests/test_verify_node.py` |
+| `app/agent/nodes.py` — `recover` | Reads the verification evidence before classifying. `unconfirmed` + tool succeeded → `_recover_unconfirmed` (retry `verify`). `failed` → retry `execute_tool` only when the contract is idempotent **and** every failing check is proof of absence; otherwise terminal (or `skipped`, for an optional step). Terminal reasons are `verification_failed` and `verification_unconfirmed`, never laundered into `recovery_exhausted`. Backoff and the server `retry_after` hint were factored into `_retry_delay_ms` and are shared by both retry targets. | `tests/test_verify_recovery.py`, `tests/test_recover.py` |
+| `app/agent/nodes.py` — `route_after_recover` | New `verify` route, bounded by the read-back counter; `verification_failed` / `verification_unconfirmed` route to `fail`. Every existing route is unchanged. | `tests/test_verify_recovery.py`, `tests/test_agent_graph.py` |
+| `app/agent/nodes.py` — responder | `verification_unconfirmed` gets its own operator-facing explanation, distinct from `verification_failed`: one is evidence, the other is the absence of it, and an operator acts differently on each. | `tests/test_verify_recovery.py`, `tests/test_responder.py` |
+| `app/agent/state.py` | `VerificationResult.attempt` — a read-back retry does not re-run the tool, so it cannot borrow `ToolCall.attempt`. | `tests/test_verify_recovery.py` |
+| `app/agent/graph.py` | The `recover → verify` conditional edge. | `tests/test_verify_recovery.py` |
+| `tests/test_verify_recovery.py` | **New.** 61 tests: passed/failed/unconfirmed semantics, evidence-based retry safety, five crash-and-resume scenarios against a real `MemorySaver` checkpoint, replan preservation, end-to-end loops, and the structural invariants. | — |
+
+**Why `unconfirmed` retries the read and not the write.** `retry_target_for` returns `verify` only when all three hold: the error came from `verify` (the `source` stamp, checkpointed with the error), the result is `unconfirmed`, and the latest `ToolCall` for the step says `succeeded`. All three are read from the append-only channels, so a resumed worker reaches the same conclusion the crashed one did — no process-local flag is involved. A generic `TRANSIENT` error from the dispatcher is *not* enough to route to `verify`, which is the point: the classification is evidence, not error class.
+
+**Why the error class cannot decide retry safety.** All three mutating contracts are `idempotent=True` and list `VERIFICATION_FAILED` in `retryable_errors`, so `recovery_action` alone would happily re-send an email whose read-back showed the *wrong recipient*. `classify_verification_failure` reads the verifier's own checks instead. `PROVEN_ABSENCE_CHECKS` is an allowlist of exactly the three "we re-read the entity and it is not there" checks (`outbox_record_exists`, `draft_record_exists`, `customer_record_exists`); a failure consisting only of those is safe to repeat for an idempotent tool, and everything else — wrong recipient, duplicate outbox rows, tampered untouched field, corrupted content hash, a record in an unexpected state, or any check added in future — is not. Invariant P5 keeps its veto: a non-idempotent contract is never retried whatever the evidence says.
+
+**Idempotency, stated honestly.** `send_email_mock` and `update_customer` carry a dispatcher-derived `idempotency_key`; `MockMailAdapter.send` returns the existing receipt for a known key, so a retry suppresses the duplicate rather than guaranteeing exactly-once end to end. `save_draft` has no key in its input contract (ADR-008) — a retry writes a *new* draft, which is safe precisely because the draft is internal and reversible, and is why only a proven-absent draft is retried. `update_customer` retries under optimistic concurrency: a repeat with a consumed `expected_version` raises `STALE_WRITE`, which follows the existing replan path and forces a fresh approval.
+
+**Crash and checkpoint behaviour.** Read-back retries are counted under `retry_count[f"{step_id}::verify"]` — the same channel and the same `merge_dict` reducer, a separate namespace — and guarded exactly as tool retries are: the counter may only move past the attempt the evidence belongs to (`verify_retries >= result.attempt` ⇒ no increment). Five scenarios are tested against a real checkpointer by killing a node mid-flight and resuming: crash after `execute_tool` before `verify`, crash inside the verifier, crash after `unconfirmed`, crash during the retry backoff, and crash after the retry was scheduled. In every one the tool executes exactly once and the counter advances exactly once.
+
+**What did not change.** The verification architecture (VERIFY-001/002), the approval API and `ApprovalGate` authority (HITL-001/002), durable interrupt semantics (HITL-003), single-flight resume and lease fencing (HITL-004), `ToolRegistry` as the only execution choke point, the retry/backoff/budget model, the replan taxonomy, and the terminal responder. Verification failure is still never a replan by itself; only the existing replannable classes replan, and a replanned mutation produces new arguments, a new `args_hash` and therefore no standing grant.
+
+**Trace.** `verify` emits `verification_passed` / `verification_failed` as before; an `unconfirmed` result is `warning` severity whatever the tool does (absence of evidence is not evidence of a bad effect) and its payload carries `unconfirmed`, `classification="transient"`, `recovery="retry_readback"` and `tool_effect_succeeded`. `recover` now emits `retry_scheduled` with `target="verify"` or `target="execute_tool"`, so an auditor can see which retries re-read and which re-wrote without reconstructing the state machine. No arguments, previews, tokens or secrets reach a trace. No new trace kind, and no migration.
+
+**Zero database migrations.**
+
+**Test suite: 1035 passed, 4 skipped** (full run against a live PostgreSQL 16 and the real `AsyncPostgresSaver`).
+`ruff check app tests`, `ruff format --check app tests`, `mypy app` (strict, 75 source files) and `alembic check` are clean.

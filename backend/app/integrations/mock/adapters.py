@@ -557,6 +557,11 @@ class MockMailAdapter:
                 sent_at=entry.sent_at,
             )
 
+    async def count_outbox(self, idempotency_key: str) -> int:
+        self._maybe_fail("count_outbox")
+        async with unit_of_work(self._session_factory) as uow:
+            return await uow.email_outbox.count_by_idempotency_key(idempotency_key)
+
 
 class MockContentAdapter:
     """Mock implementation of ContentPort generating deterministic templated copy."""

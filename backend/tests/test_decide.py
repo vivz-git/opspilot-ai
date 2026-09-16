@@ -1228,7 +1228,16 @@ def fanout_run_plan(
 def search_then_research(n: int) -> dict[ToolName, Callable[[dict[str, Any]], dict[str, Any]]]:
     return {
         ToolName.SEARCH_LEADS: lambda args: {"leads": leads(n), "total_matched": n},
-        ToolName.RESEARCH_COMPANY: lambda args: {"profile": {"company_id": args["company_id"]}},
+        ToolName.RESEARCH_COMPANY: lambda args: {
+            "profile": {
+                "company_id": args["company_id"],
+                "name": f"Company {args['company_id']}",
+                "domain": f"{args['company_id']}.example",
+                "summary": "Fintech company in London",
+                "confidence": 0.9,
+                "retrieved_at": TEST_NOW.isoformat(),
+            }
+        },
         ToolName.SEND_EMAIL_MOCK: lambda args: {"message_id": f"m_{args['to_email']}"},
     }
 
@@ -1680,6 +1689,7 @@ class TestStructuralSafety:
             "preview.py",
             "resolver.py",
             "state.py",
+            "verification_recovery.py",
         }
         for path in (APP / "agent").glob("*.py"):
             imports = _imports(ast.parse(path.read_text(encoding="utf-8")))

@@ -235,6 +235,10 @@ class MailPort(Protocol):
         """Readback verification path for sent outbox records."""
         ...
 
+    async def count_outbox(self, idempotency_key: str) -> int:
+        """Readback verification path asserting exactly one row exists for an idempotency key."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # ContentPort types & Protocol

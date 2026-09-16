@@ -759,6 +759,10 @@ class EmailOutboxRepository(Protocol):
         """Retrieve an outbox message by unique idempotency_key."""
         ...
 
+    async def count_by_idempotency_key(self, idempotency_key: str) -> int:
+        """Count outbox messages for an idempotency key."""
+        ...
+
     async def list_by_run(self, run_id: str) -> list[EmailOutbox]:
         """List all outbox messages recorded for a run."""
         ...

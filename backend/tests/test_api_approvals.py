@@ -486,6 +486,7 @@ class TestApprovalApiUnit:
 
 
 @pytest.mark.integration
+@pytest.mark.usefixtures("_database")
 class TestApprovalApiPostgresIntegration:
     """End-to-end integration tests using the real PostgreSQL engine and checkpointer."""
 

@@ -1377,6 +1377,15 @@ class SqlEmailOutboxRepository:
         res = await self._session.execute(stmt)
         return res.scalar_one_or_none()
 
+    async def count_by_idempotency_key(self, idempotency_key: str) -> int:
+        stmt = (
+            select(sa.func.count())
+            .select_from(EmailOutbox)
+            .where(EmailOutbox.idempotency_key == idempotency_key)
+        )
+        res = await self._session.execute(stmt)
+        return int(res.scalar_one() or 0)
+
     async def list_by_run(self, run_id: str) -> list[EmailOutbox]:
         stmt = (
             select(EmailOutbox)

@@ -40,6 +40,7 @@ from app.agent.state import (
     ApprovalDecisionKind,
     ApprovalState,
     ApprovalStatus,
+    Budgets,
     FinalResponse,
     Plan,
     PlanStep,
@@ -48,9 +49,23 @@ from app.agent.state import (
     StepStatus,
     ToolCall,
     ToolResult,
+    VerificationCheck,
     VerificationResult,
     VerificationStatus,
 )
+from app.agent.verification_recovery import (
+    ERROR_SOURCE_KEY,
+    ERROR_SOURCE_VERIFY,
+    ERROR_VERIFY_ATTEMPT_KEY,
+    RetryTarget,
+    is_safe_to_retry_mutation,
+    is_verification_error,
+    retry_target_for,
+    tool_effect_succeeded,
+    verification_attempt,
+    verify_retry_key,
+)
+from app.agent.verifiers import VerificationContext, VerifierRegistry
 from app.errors import (
     REPLANNABLE,
     TERMINAL_ERRORS,
@@ -64,7 +79,8 @@ from app.errors import (
     is_retryable,
     recovery_action,
 )
-from app.persistence.models import TraceEventKind
+from app.integrations.ports import Adapters
+from app.persistence.models import TraceEventKind, TraceEventSeverity
 from app.persistence.protocols import ApprovalUpsert, UnitOfWorkFactory
 from app.runtime import (
     CancellationSource,
@@ -83,6 +99,7 @@ from app.tools.contracts import (
     VerificationMode,
 )
 from app.tools.registry import DISPATCHER_OWNED_KEYS, ToolRegistry
+from app.tools.schemas import Customer
 
 __all__ = [
     "DEFAULT_APPROVAL_TTL",
@@ -198,8 +215,12 @@ class NodeHandlers:
             CancellationSource | Callable[[str], bool | Awaitable[bool]] | None
         ) = None,
         approval_ttl: timedelta | None = None,
+        adapters: Adapters | None = None,
+        verifier_registry: VerifierRegistry | None = None,
     ) -> None:
         self._registry = registry
+        self._adapters = adapters
+        self._verifier_registry = verifier_registry or VerifierRegistry()
         self._uow_factory = uow_factory
         self._clock = clock or SystemClock()
         self._approval_ttl = approval_ttl or DEFAULT_APPROVAL_TTL
@@ -963,20 +984,69 @@ class NodeHandlers:
                 started_at=dispatch_result.started_at,
             )
 
+            # A tool that returned is not yet a step that succeeded. For a
+            # contract with postconditions the step stays `running` until
+            # `verify` says `passed` (VERIFY-003): nothing downstream may read
+            # an unverified mutation as settled. `VerificationMode.NONE` has
+            # no postcondition to wait for, so it settles here as it always
+            # did — `route_after_execute` sends it straight to `decide`.
+            settled_now = contract is None or contract.verification == VerificationMode.NONE
+            executed_status = StepStatus.SUCCEEDED if settled_now else StepStatus.RUNNING
             updated_steps = []
             for s in plan.steps:
                 if s.step_id == current_step_id:
-                    updated_steps.append(s.model_copy(update={"status": StepStatus.SUCCEEDED}))
+                    updated_steps.append(s.model_copy(update={"status": executed_status}))
                 else:
                     updated_steps.append(s)
             updated_plan = plan.model_copy(update={"steps": updated_steps})
 
-            return {
+            delta: dict[str, Any] = {
                 "tool_results": {current_step_id: tool_result},
                 "tool_calls": [tool_call],
                 "plan": updated_plan,
                 "step_count": step_count,
             }
+
+            if contract and contract.verification == VerificationMode.NONE:
+                not_req_res = VerificationResult(
+                    step_id=current_step_id,
+                    status=VerificationStatus.NOT_REQUIRED,
+                    mode="none",
+                    checks=[],
+                    detail=(
+                        "VerificationMode.NONE: schema validation only; no postconditions required"
+                    ),
+                )
+                delta["verification_result"] = {current_step_id: not_req_res}
+                if self._uow_factory is not None:
+                    try:
+                        run_uuid = uuid.UUID(str(state["run_id"]))
+                        async with self._uow_factory() as uow:
+                            step_row = await uow.execution_steps.get_by_step_id(
+                                run_uuid, current_step_id, plan.revision if plan else 0
+                            )
+                            if step_row is not None:
+                                await uow.execution_steps.record_verification(
+                                    step_row.id,
+                                    verification_status=VerificationStatus.NOT_REQUIRED,
+                                    verification=not_req_res.model_dump(mode="json"),
+                                )
+                            await uow.trace_events.append(
+                                run_id=run_uuid,
+                                kind=TraceEventKind.VERIFICATION_PASSED,
+                                severity=TraceEventSeverity.INFO,
+                                node="execute_tool",
+                                tool=step.tool,
+                                step_id=current_step_id,
+                                attempt=attempt,
+                                status=VerificationStatus.NOT_REQUIRED.value,
+                                payload={"mode": "none", "not_required": True},
+                            )
+                            await uow.commit()
+                    except Exception as e:
+                        _log.warning("none_verification_persistence_fallback", error=str(e))
+
+            return delta
         except Exception as exc:
             err_class = getattr(exc, "error_class", ErrorClass.INTERNAL)
             rec = recovery_action(
@@ -1053,13 +1123,281 @@ class NodeHandlers:
                 "status": RunStatus.FAILED,
                 "status_reason": "cancelled",
             }
-        current_step_id = state.get("current_step_id") or "unknown"
-        res = VerificationResult(
-            step_id=current_step_id,
-            status=VerificationStatus.PASSED,
-            mode="default",
+        current_step_id = state.get("current_step_id")
+        plan = state.get("plan")
+        step = plan.step(current_step_id) if plan and current_step_id else None
+        if step is None or current_step_id is None:
+            return {}
+
+        contract = self._get_contract(step.tool) or REGISTRY.get(step.tool)
+        if contract is None:
+            return {}
+
+        # 1. Resolve requested intent (resolved arguments)
+        resolved_args = self._resolve_step_args(state, step)
+
+        # 2. Get tool output from tool_results
+        tool_results = state.get("tool_results", {})
+        tool_res = tool_results.get(current_step_id)
+        output_data = tool_res.output if tool_res else {}
+
+        # 3. Get attempt number and idempotency key from latest tool_call
+        tool_calls = state.get("tool_calls", [])
+        last_call = next((c for c in reversed(tool_calls) if c.step_id == current_step_id), None)
+        attempt = last_call.attempt if last_call else 1
+        idempotency_key = last_call.idempotency_key if last_call else None
+
+        # 3a. Which *verification* attempt is this? A read-back retry does not
+        #     re-run the tool, so it cannot borrow `ToolCall.attempt`; it is
+        #     counted under its own `retry_count` key, which is checkpointed
+        #     state and therefore identical after a resume (VERIFY-003).
+        verify_attempt = state.get("retry_count", {}).get(verify_retry_key(current_step_id), 0) + 1
+
+        # 4. Resolve adapters
+        adapters = self._adapters or (
+            getattr(self._registry, "adapters", None) if self._registry else None
         )
-        return {"verification_result": {current_step_id: res}}
+
+        # 5. Resolve baseline customer if updating customer
+        baseline_customer: Customer | None = None
+        if step.tool == ToolName.UPDATE_CUSTOMER:
+            cid = resolved_args.get("customer_id")
+            if cid:
+                for tr in tool_results.values():
+                    out = getattr(tr, "output", None)
+                    if isinstance(out, dict):
+                        c_data = out.get("customer")
+                        if isinstance(c_data, dict) and c_data.get("customer_id") == cid:
+                            with contextlib.suppress(Exception):
+                                baseline_customer = Customer.model_validate(c_data)
+                                break
+                        elif isinstance(c_data, Customer) and c_data.customer_id == cid:
+                            baseline_customer = c_data
+                            break
+            if baseline_customer is None:
+                raw_base = resolved_args.get("baseline")
+                if isinstance(raw_base, Customer):
+                    baseline_customer = raw_base
+                elif isinstance(raw_base, dict):
+                    with contextlib.suppress(Exception):
+                        baseline_customer = Customer.model_validate(raw_base)
+
+        ctx = VerificationContext(
+            run_id=uuid.UUID(str(state["run_id"])),
+            step_id=current_step_id,
+            tool=step.tool,
+            attempt=attempt,
+            contract=contract,
+            input_args=resolved_args,
+            output_data=output_data,
+            idempotency_key=idempotency_key,
+            adapters=adapters,
+            uow_factory=self._uow_factory,
+            clock=self._clock,
+            baseline_customer=baseline_customer,
+            prior_tool_results=tool_results,
+        )
+
+        verifier = self._verifier_registry.get_verifier(contract)
+        started_at = self._clock.now()
+
+        try:
+            res = await verifier.verify(ctx)
+            finished_at = self._clock.now()
+            duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+            res = res.model_copy(update={"duration_ms": duration_ms, "attempt": verify_attempt})
+            verifier_error_class: ErrorClass | None = None
+        except Exception as exc:
+            # §11.4: inability to check is not evidence of a bad write. The
+            # result is `unconfirmed` and the error is `TRANSIENT`, never
+            # `VERIFICATION_FAILED` — unless the verifier itself is broken
+            # (a bug, a policy breach), which stays terminal.
+            raw_class = getattr(exc, "error_class", ErrorClass.TRANSIENT)
+            verifier_error_class = (
+                raw_class if raw_class in TERMINAL_ERRORS else ErrorClass.TRANSIENT
+            )
+            res = VerificationResult(
+                step_id=current_step_id,
+                status=VerificationStatus.UNCONFIRMED,
+                mode=contract.verification.value,
+                checks=[
+                    VerificationCheck(
+                        name="verifier_execution",
+                        passed=False,
+                        expected="no exception",
+                        observed=str(exc),
+                    )
+                ],
+                duration_ms=int((self._clock.now() - started_at).total_seconds() * 1000),
+                detail=f"Verifier error: {exc}",
+                attempt=verify_attempt,
+            )
+
+        delta: dict[str, Any] = {"verification_result": {current_step_id: res}}
+
+        # A step is settled successfully only once its postconditions hold.
+        if res.status in (VerificationStatus.PASSED, VerificationStatus.NOT_REQUIRED):
+            if plan is not None and step.status is not StepStatus.SUCCEEDED:
+                delta["plan"] = plan.model_copy(
+                    update={
+                        "steps": [
+                            s.model_copy(update={"status": StepStatus.SUCCEEDED})
+                            if s.step_id == current_step_id
+                            else s
+                            for s in plan.steps
+                        ]
+                    }
+                )
+        elif res.status is VerificationStatus.FAILED:
+            # Independent evidence proves the postcondition is false.
+            delta["errors"] = [
+                AgentError(
+                    step_id=current_step_id,
+                    error_class=ErrorClass.VERIFICATION_FAILED,
+                    message=(
+                        res.detail
+                        or f"Postcondition verification failed for step {current_step_id} "
+                        f"({step.tool.value})"
+                    ),
+                    attempt=attempt,
+                    detail=self._verification_error_detail(res, verify_attempt),
+                    occurred_at=self._clock.now(),
+                )
+            ]
+        else:
+            # UNCONFIRMED is not FAILED: the system cannot currently tell
+            # whether the effect happened, which is a transient condition to
+            # be re-read — never a licence to mutate again.
+            delta["errors"] = [
+                AgentError(
+                    step_id=current_step_id,
+                    error_class=verifier_error_class or ErrorClass.TRANSIENT,
+                    message=(
+                        res.detail
+                        or f"Postcondition verification unconfirmed for step {current_step_id} "
+                        f"({step.tool.value})"
+                    ),
+                    attempt=attempt,
+                    detail=self._verification_error_detail(res, verify_attempt),
+                    occurred_at=self._clock.now(),
+                )
+            ]
+
+        await self._persist_verification(
+            state,
+            step=step,
+            plan=plan,
+            result=res,
+            attempt=attempt,
+            contract=contract,
+        )
+        return delta
+
+    @staticmethod
+    def _verification_error_detail(
+        result: VerificationResult, verify_attempt: int
+    ) -> dict[str, Any]:
+        """What `recover` needs to route this failure, and nothing else.
+
+        `source` says the failure came from `verify` rather than the
+        dispatcher; `verification_attempt` is the read-back retry counter the
+        exactly-once accounting compares against; the checks are the evidence
+        the retry-safety decision reads. All of it is already operator-facing
+        verification output — no arguments, previews or secrets.
+        """
+        return {
+            ERROR_SOURCE_KEY: ERROR_SOURCE_VERIFY,
+            ERROR_VERIFY_ATTEMPT_KEY: verify_attempt,
+            "verification_status": result.status.value,
+            "checks": [c.model_dump() for c in result.checks],
+        }
+
+    async def _persist_verification(
+        self,
+        state: AgentState,
+        *,
+        step: PlanStep,
+        plan: Plan | None,
+        result: VerificationResult,
+        attempt: int,
+        contract: ToolContract,
+    ) -> None:
+        """Mirror the result into `execution_steps` and the product trace.
+
+        Persistence is best-effort by design: a trace outage must not turn a
+        healthy verification into a failed run. The graph's own decision is
+        already carried by the returned delta.
+        """
+        if self._uow_factory is None:
+            return
+        try:
+            run_uuid = uuid.UUID(str(state["run_id"]))
+            async with self._uow_factory() as uow:
+                step_row = await uow.execution_steps.get_by_step_id(
+                    run_uuid, step.step_id, plan.revision if plan else 0
+                )
+                if step_row is not None:
+                    await uow.execution_steps.record_verification(
+                        step_row.id,
+                        verification_status=result.status,
+                        verification=result.model_dump(mode="json"),
+                    )
+
+                is_ok = result.status in (
+                    VerificationStatus.PASSED,
+                    VerificationStatus.NOT_REQUIRED,
+                )
+                unconfirmed = result.status is VerificationStatus.UNCONFIRMED
+                if is_ok:
+                    kind = TraceEventKind.VERIFICATION_PASSED
+                    severity = TraceEventSeverity.INFO
+                else:
+                    kind = TraceEventKind.VERIFICATION_FAILED
+                    # An unconfirmed read-back is a warning whatever the tool
+                    # does: we have found no evidence of a bad effect, only an
+                    # absence of evidence. Only a proven failed postcondition
+                    # on a mutating tool is an error.
+                    severity = (
+                        TraceEventSeverity.WARNING
+                        if unconfirmed or not contract.is_mutating
+                        else TraceEventSeverity.ERROR
+                    )
+                payload: dict[str, Any] = {
+                    "mode": result.mode,
+                    "checks": [c.model_dump() for c in result.checks],
+                    "detail": result.detail,
+                    "verification_attempt": result.attempt,
+                }
+                if unconfirmed:
+                    # Name the distinction in the trace itself: this is an
+                    # inability to check, it is classified transient, and the
+                    # recovery for it is another read-back, not another write.
+                    payload.update(
+                        {
+                            "unconfirmed": True,
+                            "classification": ErrorClass.TRANSIENT.value,
+                            "recovery": "retry_readback",
+                            "tool_effect_succeeded": tool_effect_succeeded(
+                                state.get("tool_calls", []), step.step_id
+                            ),
+                        }
+                    )
+                await uow.trace_events.append(
+                    run_id=run_uuid,
+                    kind=kind,
+                    severity=severity,
+                    node="verify",
+                    tool=step.tool,
+                    step_id=step.step_id,
+                    attempt=attempt,
+                    status=result.status.value,
+                    duration_ms=result.duration_ms,
+                    retry_count=result.attempt - 1,
+                    payload=payload,
+                )
+                await uow.commit()
+        except Exception as e:
+            _log.warning("verification_persistence_fallback", error=str(e))
 
     def route_after_verify(self, state: AgentState) -> str:
         if (
@@ -1136,6 +1474,49 @@ class NodeHandlers:
         current_retries = retries.get(current_step_id, 0)
         replan_count = state.get("replan_count", 0)
 
+        # 5a. Verification evidence (VERIFY-003). `verify` stamps its errors,
+        #     so a failure that came from the read-back is distinguishable
+        #     from a tool-execution failure without inferring it from the
+        #     error class — and the stamp is checkpointed with the error.
+        verification = state.get("verification_result", {}).get(current_step_id)
+        from_verify = is_verification_error(latest_err)
+        target = retry_target_for(
+            error=latest_err,
+            result=verification,
+            tool_calls=state.get("tool_calls", []),
+            step_id=current_step_id,
+        )
+
+        if target is RetryTarget.VERIFY:
+            # The tool already succeeded and the verifier could not reach a
+            # conclusion. The only safe recovery is another read-back.
+            return await self._recover_unconfirmed(
+                state,
+                step=step,
+                plan=plan,
+                latest_err=latest_err,
+                verification=verification,
+                budgets=budgets,
+                deadline_passed=deadline_passed,
+                step_budget_exhausted=step_budget_exhausted,
+            )
+
+        # A *proven* failed postcondition. Whether the mutation may be
+        # repeated is a question about the evidence, not the error class: an
+        # absent write is safe to redo, a wrong or duplicated one is not, and
+        # neither is a non-idempotent tool (invariant P5). An optional step
+        # still skips rather than ending the run — skipping compounds nothing,
+        # and the responder reports the effect as unconfirmed either way.
+        if (
+            from_verify
+            and verification is not None
+            and verification.status is VerificationStatus.FAILED
+            and not is_safe_to_retry_mutation(verification, contract)
+        ):
+            if step.optional and plan is not None:
+                return self._skip_optional_step(plan, current_step_id)
+            return {"status_reason": "verification_failed"}
+
         # Crash / resume idempotency: has this attempt already been accounted for?
         retry_already_counted = (
             latest_err.attempt is not None and current_retries >= latest_err.attempt
@@ -1159,31 +1540,16 @@ class NodeHandlers:
         if action == RecoveryAction.RETRY:
             if not retry_already_counted:
                 new_retries = current_retries + 1
-
-                # Server hint extraction from error detail
-                retry_after_ms = None
-                detail = latest_err.detail or {}
-                if "retry_after_ms" in detail and detail["retry_after_ms"] is not None:
-                    with contextlib.suppress(ValueError, TypeError):
-                        retry_after_ms = int(detail["retry_after_ms"])
-                elif "retry_after" in detail and detail["retry_after"] is not None:
-                    with contextlib.suppress(ValueError, TypeError):
-                        val = float(detail["retry_after"])
-                        retry_after_ms = int(val * 1000) if val < 1000 else int(val)
-
-                # Deterministic jitter via injected SeededRandom
-                jitter = 1.0
-                if self._seeded_random is not None:
-                    jitter = self._seeded_random.uniform(0.8, 1.2)
-
-                delay_ms = backoff_delay_ms(
-                    new_retries,
-                    base_ms=self._retry_base_delay_ms,
-                    max_ms=self._retry_max_delay_ms,
-                    jitter=jitter,
-                    retry_after_ms=retry_after_ms,
-                )
+                delay_ms = self._retry_delay_ms(latest_err, new_retries)
                 await self._clock_sleep(delay_ms / 1000.0)
+                await self._trace_retry_scheduled(
+                    state,
+                    step=step,
+                    target=RetryTarget.EXECUTE_TOOL,
+                    attempt=new_retries,
+                    delay_ms=delay_ms,
+                    error_class=latest_err.error_class,
+                )
                 return {
                     "retry_count": {current_step_id: new_retries},
                     "status_reason": f"retry_attempt_{new_retries}",
@@ -1194,16 +1560,7 @@ class NodeHandlers:
             }
 
         if action == RecoveryAction.SKIP and step.optional and plan is not None:
-            updated_steps = []
-            for s in plan.steps:
-                if s.step_id == current_step_id:
-                    updated_steps.append(s.model_copy(update={"status": StepStatus.SKIPPED}))
-                else:
-                    updated_steps.append(s)
-            return {
-                "plan": plan.model_copy(update={"steps": updated_steps}),
-                "status_reason": "optional_step_skipped",
-            }
+            return self._skip_optional_step(plan, current_step_id)
 
         if action == RecoveryAction.REPLAN:
             return {
@@ -1217,6 +1574,15 @@ class NodeHandlers:
             fail_reason = "budget_exhausted"
         elif latest_err.error_class in TERMINAL_ERRORS:
             fail_reason = f"terminal_error_{latest_err.error_class.value}"
+        elif from_verify:
+            # The architecture names both of these; never launder either into
+            # the generic exhaustion reason (§10.3, §11.4).
+            fail_reason = (
+                "verification_unconfirmed"
+                if verification is not None
+                and verification.status is VerificationStatus.UNCONFIRMED
+                else "verification_failed"
+            )
         elif retries_remaining == 0 and is_retryable(
             latest_err.error_class, idempotent=idempotent, nondeterministic=nondeterministic
         ):
@@ -1229,6 +1595,152 @@ class NodeHandlers:
             fail_reason = "recovery_exhausted"
 
         return {"status_reason": fail_reason}
+
+    async def _recover_unconfirmed(
+        self,
+        state: AgentState,
+        *,
+        step: PlanStep,
+        plan: Plan | None,
+        latest_err: AgentError,
+        verification: VerificationResult | None,
+        budgets: Budgets,
+        deadline_passed: bool,
+        step_budget_exhausted: bool,
+    ) -> dict[str, Any]:
+        """Retry the read-back, never the write.
+
+        The tool reported success; the verifier could not say whether the
+        effect landed. Re-executing would risk a second real effect to answer
+        a question a second read can answer for free. Read-back attempts are
+        counted under their own `retry_count` key and bounded by the same
+        retry budget; exhausting it ends the run as `verification_unconfirmed`
+        — honest about what is and is not known.
+        """
+        step_id = step.step_id
+        key = verify_retry_key(step_id)
+        verify_retries = state.get("retry_count", {}).get(key, 0)
+        attempt_seen = verification_attempt(latest_err, verification)
+
+        if deadline_passed:
+            return {"status_reason": "deadline_exceeded"}
+        if step_budget_exhausted:
+            return {"status_reason": "budget_exhausted"}
+        if latest_err.error_class in TERMINAL_ERRORS:
+            return {"status_reason": f"terminal_error_{latest_err.error_class.value}"}
+
+        # Crash/resume idempotency, the same guard `execute_tool` retries use:
+        # the counter may only move past the attempt the evidence belongs to.
+        # Checked before the budget, because a read-back already scheduled and
+        # paid for must still happen — it was within budget when it was made.
+        if verify_retries >= attempt_seen:
+            return {
+                "retry_count": {key: verify_retries},
+                "status_reason": f"retry_verify_attempt_{verify_retries}",
+            }
+
+        if verify_retries >= budgets.max_retries:
+            if step.optional and plan is not None:
+                return self._skip_optional_step(plan, step_id)
+            return {"status_reason": "verification_unconfirmed"}
+
+        new_retries = verify_retries + 1
+        delay_ms = self._retry_delay_ms(latest_err, new_retries)
+        await self._clock_sleep(delay_ms / 1000.0)
+        await self._trace_retry_scheduled(
+            state,
+            step=step,
+            target=RetryTarget.VERIFY,
+            attempt=new_retries,
+            delay_ms=delay_ms,
+            error_class=latest_err.error_class,
+        )
+        return {
+            "retry_count": {key: new_retries},
+            "status_reason": f"retry_verify_attempt_{new_retries}",
+        }
+
+    @staticmethod
+    def _skip_optional_step(plan: Plan, step_id: str) -> dict[str, Any]:
+        return {
+            "plan": plan.model_copy(
+                update={
+                    "steps": [
+                        s.model_copy(update={"status": StepStatus.SKIPPED})
+                        if s.step_id == step_id
+                        else s
+                        for s in plan.steps
+                    ]
+                }
+            ),
+            "status_reason": "optional_step_skipped",
+        }
+
+    def _retry_delay_ms(self, latest_err: AgentError, attempt: int) -> int:
+        """Exponential backoff with deterministic jitter, honouring a server
+        hint carried on the error (§10.4)."""
+        retry_after_ms = None
+        detail = latest_err.detail or {}
+        if detail.get("retry_after_ms") is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                retry_after_ms = int(detail["retry_after_ms"])
+        elif detail.get("retry_after") is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                val = float(detail["retry_after"])
+                retry_after_ms = int(val * 1000) if val < 1000 else int(val)
+
+        jitter = 1.0
+        if self._seeded_random is not None:
+            jitter = self._seeded_random.uniform(0.8, 1.2)
+
+        return backoff_delay_ms(
+            attempt,
+            base_ms=self._retry_base_delay_ms,
+            max_ms=self._retry_max_delay_ms,
+            jitter=jitter,
+            retry_after_ms=retry_after_ms,
+        )
+
+    async def _trace_retry_scheduled(
+        self,
+        state: AgentState,
+        *,
+        step: PlanStep,
+        target: RetryTarget,
+        attempt: int,
+        delay_ms: int,
+        error_class: ErrorClass,
+    ) -> None:
+        """Record which node the retry re-enters.
+
+        `target="verify"` versus `target="execute_tool"` is the difference
+        between re-reading and re-writing, so an auditor must be able to see
+        it without reconstructing the state machine. Best-effort: a trace
+        outage may not change what the run does.
+        """
+        if self._uow_factory is None:
+            return
+        try:
+            async with self._uow_factory() as uow:
+                await uow.trace_events.append(
+                    run_id=uuid.UUID(str(state["run_id"])),
+                    kind=TraceEventKind.RETRY_SCHEDULED,
+                    severity=TraceEventSeverity.WARNING,
+                    node="recover",
+                    tool=step.tool,
+                    step_id=step.step_id,
+                    attempt=attempt,
+                    retry_count=attempt,
+                    status=target.value,
+                    payload={
+                        "target": target.value,
+                        "delay_ms": delay_ms,
+                        "error_class": error_class.value,
+                    },
+                )
+                await uow.commit()
+        except Exception as e:
+            _log.warning("retry_trace_persistence_fallback", error=str(e))
 
     def route_after_recover(self, state: AgentState) -> str:
         if (
@@ -1256,6 +1768,18 @@ class NodeHandlers:
         current_retries = retries.get(current_step_id, 0) if current_step_id else 0
         replan_count = state.get("replan_count", 0)
 
+        # A read-back retry re-enters `verify`. The reason string is written
+        # by `recover` in the same super-step and checkpointed with it, and
+        # the budget it is checked against is the read-back counter — so a
+        # resumed run routes exactly where the crashed one was going.
+        if status_reason and status_reason.startswith("retry_verify_attempt_"):
+            verify_retries = (
+                retries.get(verify_retry_key(current_step_id), 0) if current_step_id else 0
+            )
+            if verify_retries <= budgets.max_retries:
+                return "verify"
+            return "fail"
+
         if status_reason and status_reason.startswith(("retry_attempt_", "retry_scheduled_")):
             if current_retries <= budgets.max_retries:
                 return "execute_tool"
@@ -1277,6 +1801,8 @@ class NodeHandlers:
             "missing_current_step",
             "step_not_found",
             "required_step_not_found",
+            "verification_failed",
+            "verification_unconfirmed",
         ) or (status_reason and status_reason.startswith("terminal_error_")):
             return "fail"
 
@@ -1340,7 +1866,17 @@ REASON_EXPLANATIONS: Final[dict[str, str]] = {
     "out_of_scope": "The user request was determined to be out of scope",
     "terminal_error_policy_violation": "A policy violation terminated execution",
     "terminal_error_internal": "An unrecoverable internal error occurred",
-    "verification_failed": "Verification check failed for a mutating action; effect is unconfirmed",
+    # The two verification terminals are deliberately distinct. The first is
+    # evidence; the second is the absence of it, and an operator acts
+    # differently on each (§11.4).
+    "verification_failed": (
+        "Independent read-back proved the requested effect did not hold, and repeating the "
+        "call could not safely correct it; the effect is unconfirmed"
+    ),
+    "verification_unconfirmed": (
+        "The effect could not be confirmed after repeated read-back attempts — no evidence "
+        "of failure, only an inability to check; the effect is unconfirmed"
+    ),
     "operator_cancelled": "The run was cancelled by an operator",
     "cancelled": "The run was cancelled by an operator",
     "stale_error": "Recovery received a stale error not matching the current step",
