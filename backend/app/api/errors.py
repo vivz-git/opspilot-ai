@@ -19,11 +19,15 @@ from app.errors import (
     ApprovalExpiredError,
     ApprovalNotPendingError,
     ApprovalSupersededError,
+    IdempotencyConflictError,
     InputValidationError,
     LeaseAcquisitionError,
     NotFoundError,
     PolicyViolation,
+    RunActiveError,
+    RunNotCancellableError,
     RunNotResumableError,
+    RunNotStartableError,
 )
 
 __all__ = [
@@ -168,6 +172,50 @@ def register_error_handlers(app: FastAPI) -> None:
             409,
             code="run_not_resumable",
             title="Run not resumable",
+            detail=str(exc),
+            instance=request.url.path,
+        )
+
+    @app.exception_handler(IdempotencyConflictError)
+    async def handle_idempotency_conflict(
+        request: Request, exc: IdempotencyConflictError
+    ) -> JSONResponse:
+        return problem_details(
+            409,
+            code="idempotency_conflict",
+            title="Idempotency conflict",
+            detail=str(exc),
+            instance=request.url.path,
+        )
+
+    @app.exception_handler(RunNotStartableError)
+    async def handle_run_not_startable(request: Request, exc: RunNotStartableError) -> JSONResponse:
+        return problem_details(
+            409,
+            code="run_not_startable",
+            title="Run not startable",
+            detail=str(exc),
+            instance=request.url.path,
+        )
+
+    @app.exception_handler(RunNotCancellableError)
+    async def handle_run_not_cancellable(
+        request: Request, exc: RunNotCancellableError
+    ) -> JSONResponse:
+        return problem_details(
+            409,
+            code="run_not_cancellable",
+            title="Run not cancellable",
+            detail=str(exc),
+            instance=request.url.path,
+        )
+
+    @app.exception_handler(RunActiveError)
+    async def handle_run_active(request: Request, exc: RunActiveError) -> JSONResponse:
+        return problem_details(
+            409,
+            code="run_active",
+            title="Run active",
             detail=str(exc),
             instance=request.url.path,
         )

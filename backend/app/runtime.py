@@ -107,7 +107,9 @@ class DeterministicRandom:
 
 
 class CancellationSource(Protocol):
-    """Protocol for checking whether a run has been cooperatively cancelled (§13.2)."""
+    """Protocol for managing and checking whether a run has been cooperatively cancelled (§13.2)."""
+
+    def cancel(self, run_id: str) -> None: ...
 
     def is_cancelled(self, run_id: str) -> bool: ...
 

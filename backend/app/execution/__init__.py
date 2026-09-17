@@ -27,6 +27,11 @@ from app.execution.recovery import (
     RecoveryOutcome,
     RunDriver,
 )
+from app.execution.runs import (
+    RunCreateResult,
+    RunDetails,
+    RunService,
+)
 
 __all__ = [
     "ApprovalService",
@@ -40,7 +45,10 @@ __all__ = [
     "Reconciler",
     "ReconciliationReport",
     "RecoveryOutcome",
+    "RunCreateResult",
+    "RunDetails",
     "RunDriver",
+    "RunService",
     "hold_lease",
     "new_worker_id",
 ]

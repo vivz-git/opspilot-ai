@@ -19,6 +19,7 @@ from app.errors import PolicyViolation
 from app.execution.approvals import ApprovalService
 from app.execution.leases import LeaseConfig
 from app.execution.recovery import LangGraphRunDriver, RunDriver
+from app.execution.runs import RunService
 from app.persistence.protocols import UnitOfWorkFactory
 from app.persistence.repositories import SqlUnitOfWork
 from app.persistence.session import create_session_factory
@@ -26,21 +27,15 @@ from app.runtime import SystemClock
 
 __all__ = [
     "get_approval_service",
+    "get_run_service",
     "require_authorization",
 ]
 
 
-def get_approval_service(request: Request) -> ApprovalService:
-    """Provide the ApprovalService from application state or construct it lazily."""
-    service: ApprovalService | None = getattr(request.app.state, "approval_service", None)
-    if service is not None:
-        return service
-
-    engine: AsyncEngine = request.app.state.db_engine
-    settings: Settings = request.app.state.settings
-
+def _get_uow_factory(request: Request) -> UnitOfWorkFactory:
     session_factory = getattr(request.app.state, "session_factory", None)
     if session_factory is None:
+        engine: AsyncEngine = request.app.state.db_engine
         session_factory = create_session_factory(engine)
         request.app.state.session_factory = session_factory
 
@@ -49,7 +44,17 @@ def get_approval_service(request: Request) -> ApprovalService:
     def _uow_factory() -> SqlUnitOfWork:
         return SqlUnitOfWork(typed_session_factory)
 
-    uow_factory: UnitOfWorkFactory = _uow_factory
+    return _uow_factory
+
+
+def get_approval_service(request: Request) -> ApprovalService:
+    """Provide the ApprovalService from application state or construct it lazily."""
+    service: ApprovalService | None = getattr(request.app.state, "approval_service", None)
+    if service is not None:
+        return service
+
+    settings: Settings = request.app.state.settings
+    uow_factory = _get_uow_factory(request)
 
     driver: RunDriver | None = getattr(request.app.state, "run_driver", None)
     if driver is None:
@@ -72,6 +77,29 @@ def get_approval_service(request: Request) -> ApprovalService:
         lease=lease,
     )
     request.app.state.approval_service = service
+    return service
+
+
+def get_run_service(request: Request) -> RunService:
+    """Provide the RunService from application state or construct it lazily."""
+    service: RunService | None = getattr(request.app.state, "run_service", None)
+    if service is not None:
+        return service
+
+    settings: Settings = request.app.state.settings
+    uow_factory = _get_uow_factory(request)
+    clock = getattr(request.app.state, "clock", None) or SystemClock()
+    ids = getattr(request.app.state, "id_gen", None)
+    cancellation_source = getattr(request.app.state, "cancellation_source", None)
+
+    service = RunService(
+        uow_factory=uow_factory,
+        settings=settings,
+        clock=clock,
+        ids=ids,
+        cancellation_source=cancellation_source,
+    )
+    request.app.state.run_service = service
     return service
 
 

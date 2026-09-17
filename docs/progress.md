@@ -1650,3 +1650,55 @@ They are never collapsed. In particular, a mutating tool that **succeeded** whos
 
 **Test suite: 1035 passed, 4 skipped** (full run against a live PostgreSQL 16 and the real `AsyncPostgresSaver`).
 `ruff check app tests`, `ruff format --check app tests`, `mypy app` (strict, 75 source files) and `alembic check` are clean.
+
+## API-003 — Run Trace Retrieval & Live Event Streaming — 2026-09-17
+
+Run execution trace retrieval and live event streaming (§13.4, §14, API-003) are implemented.
+The API layer exposes OpsPilot's existing durable audit/trace system through safe, efficient HTTP control-plane boundaries without creating a secondary tracing engine or introducing external broker/queue infrastructure.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/api/runs.py` | `GET /runs/{run_id}/trace`, `GET /api/v1/runs/{run_id}/trace`, `GET /runs/{run_id}/events`, `GET /api/v1/runs/{run_id}/events`. Prefixed parity routes with RFC 9457 error handling, query/header validation, and EventSource streaming. | `tests/test_api_trace.py` |
+| `app/api/schemas.py` | `TraceEventResource` (safe, presentation-redacted representation of durable trace events; omits DB surrogate `id`; exposes monotonic `seq`), `TraceResponse` envelope (`run_id`, `events`, `next_seq`, `complete`). | `tests/test_api_trace.py`, `tests/test_structure.py` |
+| `app/execution/runs.py` | `RunService.get_run_trace` (keyset pagination with `limit + 1` windowing, `next_seq`, `complete` status detection) and `RunService.stream_run_events` async generator (PostgreSQL polling with 500ms backoff, SSE yield, disconnect checking, terminal event closure). | `tests/test_api_trace.py`, `tests/test_structure.py` |
+| `app/persistence/protocols.py` + `repositories.py` | `TraceEventRepository.list_by_run` extended with `since_seq`, `kinds` filter list, and `severity_min` filtering using hierarchical severity rank (`DEBUG: 1, INFO: 2, WARNING: 3, ERROR: 4`). | `tests/test_api_trace.py` |
+| `tests/test_api_trace.py` | 35 tests covering REST trace retrieval (monotonic seq, pagination, filtering, 404/422 errors, redaction, non-mutation of ORM objects), SSE event streaming (headers, formatting, Last-Event-ID replay, since_seq fallback, precedence, 15s keepalive, disconnects, multi-subscriber), and real PostgreSQL integration tests (concurrent trace append under REST pagination, SSE reconnect with active writers, terminal replay). | — |
+| `tests/test_structure.py` | Added 6 AST-based architectural invariants: GET trace endpoint cannot write trace events; SSE read endpoint cannot write trace events; Trace API layer does not import broker/queue infrastructure; route handlers do not directly execute ORM/DB queries; `TraceEventResource` does not expose `TraceEvent.id`; redaction is presentation-only and does not mutate persisted objects. | — |
+
+**Implemented Architecture & Behavior.**
+- **REST Trace Retrieval (`GET /runs/{run_id}/trace`):**
+  - Ordered strictly by monotonic sequence `seq ASC`.
+  - Keyset pagination with `since_seq` (inclusive starting cursor, defaults to 1).
+  - Configurable page size `limit` bounded between 1 and 500 (defaults to 100).
+  - Over-fetching `limit + 1` to determine continuation without extra `COUNT(*)` queries:
+    - If `len(raw_events) > limit`: `events = raw_events[:limit]`, `next_seq = events[-1].seq + 1`, `complete = False`.
+    - If `len(raw_events) <= limit`: returns all retrieved events. `complete = True` and `next_seq = None` if the run is in a terminal status; otherwise `complete = False` and `next_seq = (events[-1].seq + 1) if events else since_seq`.
+  - Filter by `kind` (repeatable query parameter, e.g. `?kind=node_entered&kind=node_exited`).
+  - Filter by `severity_min` using hierarchical severity ranking (`DEBUG` < `INFO` < `WARNING` < `ERROR`).
+  - Path parity between `/runs/{run_id}/trace` and `/api/v1/runs/{run_id}/trace`.
+  - Strict RFC 9457 error handling: unknown run returns 404 (`code="not_found"`), invalid parameters return 422 (`code="validation_error"`).
+- **Presentation-Only Redaction & Information Hiding:**
+  - `TraceEventResource` hides internal primary key surrogate `TraceEvent.id` entirely. Public event identity is strictly the monotonic `seq`.
+  - Presentation-only redaction via `redact_payload` on `payload`, `input`, `output`, and `error` dictionaries. Replaces sensitive keys (e.g. `api_key`, `authorization`, `password`, `token`, `secret`) with `"[redacted]"`.
+  - Detached construction in `TraceEventResource.from_row` returns a new resource and never mutates persisted SQLAlchemy ORM instances or database rows.
+- **SSE Live Event Streaming (`GET /runs/{run_id}/events`):**
+  - Emits `text/event-stream` with headers `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`.
+  - SSE `id` field equals durable trace `seq` as a string (`id: 1`, `id: 2`), never internal DB `id`.
+  - SSE `event` field equals event kind (`node_entered`, `plan_created`, `tool_started`, `run_completed`, etc.).
+  - SSE `data` field contains serialized JSON of `TraceEventResource`.
+  - `Last-Event-ID` HTTP header resumes stream strictly after the supplied sequence (`start_seq = int(last_event_id) + 1`).
+  - Query parameter `?since_seq=` acts as fallback when `Last-Event-ID` is omitted. If both are supplied, `Last-Event-ID` takes strict precedence.
+  - Periodic 15-second keepalive heartbeat ping (`: keepalive` comment lines) prevents reverse proxy connection dropouts (e.g. Nginx, Cloudflare).
+  - Zero external brokers: powered by direct PostgreSQL polling with a 500ms backoff loop. No Redis, Celery, RabbitMQ, Kafka, or WebSocket overhead.
+  - Terminal closure: gracefully exits and closes the stream when a terminal event (`run_completed`, `run_failed`, `run_rejected`, `run_expired`, `run_cancelled`) is emitted or when the parent run is observed in a terminal state.
+  - Cooperative client disconnect handling via `await request.is_disconnected()`.
+- **Concurrency & PostgreSQL Integration:**
+  - Real PostgreSQL integration tests verify monotonic seq progression without duplicated or skipped events during concurrent background trace writes.
+  - SSE reconnect with `Last-Event-ID` under active writers guarantees exact resumption without gap or duplicate replay.
+- **Structural Invariants:**
+  - 6 AST-based tests enforce control-plane purity: read-only trace endpoints, no trace creation on read, no queue/broker imports, no direct ORM in route handlers, surrogate ID protection, and immutability of ORM instances under redaction.
+
+**Zero database migrations required.** Utilizes existing PostgreSQL `trace_events` schema and indices (`ix_trace_events_run_id_seq`).
+
+**Test suite: 148 passed, 0 failures** (including 35 trace unit/integration tests and 49 structural tests).
+`ruff check app tests`, `ruff format --check app tests`, `mypy app` (strict, 76 source files) and `alembic check` are clean.

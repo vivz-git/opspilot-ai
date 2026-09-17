@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Final, Self
 
 import sqlalchemy as sa
 from sqlalchemy import select, update
@@ -44,7 +44,7 @@ from app.persistence.models import (
     TraceEventKind,
     TraceEventSeverity,
 )
-from app.persistence.protocols import ApprovalUpsert
+from app.persistence.protocols import ApprovalUpsert, RunListResult
 from app.tools.contracts import RiskLevel, ToolName
 
 __all__ = [
@@ -322,15 +322,72 @@ class SqlAgentRunRepository:
         self,
         *,
         status: RunStatus | None = None,
+        statuses: list[RunStatus] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        parent_run_id: uuid.UUID | None = None,
+        query: str | None = None,
+        cursor_created_at: datetime | None = None,
+        cursor_id: uuid.UUID | None = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[AgentRun]:
-        stmt = select(AgentRun)
+    ) -> RunListResult:
+        conditions: list[Any] = []
         if status is not None:
-            stmt = stmt.where(AgentRun.status == status)
-        stmt = stmt.order_by(AgentRun.created_at.desc()).offset(offset).limit(limit)
+            conditions.append(AgentRun.status == status)
+        elif statuses is not None and len(statuses) > 0:
+            conditions.append(AgentRun.status.in_(statuses))
+
+        if since is not None:
+            conditions.append(AgentRun.created_at >= since)
+        if until is not None:
+            conditions.append(AgentRun.created_at <= until)
+        if parent_run_id is not None:
+            conditions.append(AgentRun.parent_run_id == parent_run_id)
+        if query is not None and query.strip():
+            clean_q = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conditions.append(AgentRun.user_request.ilike(f"%{clean_q}%"))
+
+        # 1. Total estimate count under current filters
+        count_stmt = select(sa.func.count()).select_from(AgentRun)
+        if conditions:
+            count_stmt = count_stmt.where(sa.and_(*conditions))
+        total_res = await self._session.execute(count_stmt)
+        total_estimate = int(total_res.scalar_one() or 0)
+
+        # 2. Main query
+        stmt = select(AgentRun)
+        if conditions:
+            stmt = stmt.where(sa.and_(*conditions))
+
+        # Keyset pagination condition (§13.2)
+        if cursor_created_at is not None and cursor_id is not None:
+            keyset_cond = sa.or_(
+                AgentRun.created_at < cursor_created_at,
+                sa.and_(
+                    AgentRun.created_at == cursor_created_at,
+                    AgentRun.id < cursor_id,
+                ),
+            )
+            stmt = stmt.where(keyset_cond)
+            stmt = stmt.order_by(AgentRun.created_at.desc(), AgentRun.id.desc()).limit(limit + 1)
+            res = await self._session.execute(stmt)
+            rows = list(res.scalars().all())
+            has_more = len(rows) > limit
+            items = rows[:limit]
+            return RunListResult(items=items, has_more=has_more, total_estimate=total_estimate)
+
+        # Offset-based or initial un-cursored query
+        stmt = (
+            stmt.order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
         res = await self._session.execute(stmt)
-        return list(res.scalars().all())
+        rows = list(res.scalars().all())
+        has_more = len(rows) > limit
+        items = rows[:limit]
+        return RunListResult(items=items, has_more=has_more, total_estimate=total_estimate)
 
     async def list_orphaned_runs(self, *, now: datetime, limit: int = 50) -> list[AgentRun]:
         stmt = (
@@ -950,6 +1007,14 @@ class SqlApprovalRepository:
         return list(res.scalars().all())
 
 
+_SEVERITY_RANK: Final[dict[TraceEventSeverity, int]] = {
+    TraceEventSeverity.DEBUG: 1,
+    TraceEventSeverity.INFO: 2,
+    TraceEventSeverity.WARNING: 3,
+    TraceEventSeverity.ERROR: 4,
+}
+
+
 class SqlTraceEventRepository:
     """Async SQLAlchemy implementation of TraceEventRepository (§12.7, DB-002, DB-005)."""
 
@@ -1006,14 +1071,24 @@ class SqlTraceEventRepository:
         return event
 
     async def list_by_run(
-        self, run_id: uuid.UUID, *, after_seq: int = 0, limit: int = 100
+        self,
+        run_id: uuid.UUID,
+        *,
+        after_seq: int = 0,
+        since_seq: int | None = None,
+        limit: int = 100,
+        kinds: list[TraceEventKind] | None = None,
+        severity_min: TraceEventSeverity | None = None,
     ) -> list[TraceEvent]:
-        stmt = (
-            select(TraceEvent)
-            .where(TraceEvent.run_id == run_id, TraceEvent.seq > after_seq)
-            .order_by(TraceEvent.seq.asc())
-            .limit(limit)
-        )
+        start_after = (since_seq - 1) if since_seq is not None else after_seq
+        stmt = select(TraceEvent).where(TraceEvent.run_id == run_id, TraceEvent.seq > start_after)
+        if kinds:
+            stmt = stmt.where(TraceEvent.kind.in_(kinds))
+        if severity_min is not None:
+            min_rank = _SEVERITY_RANK.get(severity_min, 1)
+            allowed_severities = [s for s, rank in _SEVERITY_RANK.items() if rank >= min_rank]
+            stmt = stmt.where(TraceEvent.severity.in_(allowed_severities))
+        stmt = stmt.order_by(TraceEvent.seq.asc()).limit(limit)
         res = await self._session.execute(stmt)
         return list(res.scalars().all())
 

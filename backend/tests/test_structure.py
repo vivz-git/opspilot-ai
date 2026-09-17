@@ -7,6 +7,7 @@ reliably miss.
 from __future__ import annotations
 
 import ast
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -633,6 +634,26 @@ def test_api_layer_delegates_approval_decisions_to_approval_service() -> None:
     assert service_delegated, "decide_approval handler must call service.decide_approval"
 
 
+def test_api_layer_delegates_run_creation_to_run_service() -> None:
+    """§13.2: create_run route handler must delegate to RunService.create_run."""
+    path = APP / "api" / "runs.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    create_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_run":
+            create_fn = node
+            break
+    assert create_fn is not None, "create_run endpoint not found in app/api/runs.py"
+
+    service_delegated = any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "create_run"
+        for n in ast.walk(create_fn)
+    )
+    assert service_delegated, "create_run handler must call service.create_run"
+
+
 # ---------------------------------------------------------------------------
 # HITL-002 — one mint authority, one issuing path, no ORM in the leaf
 # (§9.5, §12, ADR-010)
@@ -960,3 +981,244 @@ def test_verifiers_never_dispatch_tools_or_call_llm() -> None:
         if found:
             offenders[_rel(path)] = found
     assert not offenders, f"verifier calls tools or LLM: {offenders}"
+
+
+def test_api_runs_delegates_to_run_service() -> None:
+    """§13.2: app/api/runs.py delegates run management to RunService and never
+    imports SqlAgentRunRepository."""
+    runs_api_path = APP / "api" / "runs.py"
+    tree = ast.parse(runs_api_path.read_text(encoding="utf-8"), filename=str(runs_api_path))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if "repositories" in node.module:
+                offenders.append(f"import from {node.module} at line {node.lineno}")
+        elif isinstance(node, ast.Name) and node.id == "SqlAgentRunRepository":
+            offenders.append(f"direct use of SqlAgentRunRepository at line {node.lineno}")
+    assert not offenders, f"API runs route directly touches persistence repositories: {offenders}"
+
+
+def test_api_layer_never_modifies_checkpointer_directly() -> None:
+    """§13.2, §2.4: API layer must never directly import or instantiate checkpointer savers."""
+    forbidden_classes = {"AsyncPostgresSaver", "MemorySaver"}
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in forbidden_classes:
+                        found.append(f"import {alias.name} at line {node.lineno}")
+            elif isinstance(node, ast.Name) and node.id in forbidden_classes:
+                found.append(f"use of {node.id} at line {node.lineno}")
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"API layer directly references checkpointer savers: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# API-003 — Run Trace Retrieval & Live Event Streaming Invariants (§13.4, §14)
+# ---------------------------------------------------------------------------
+def test_get_trace_endpoint_cannot_write_trace_events() -> None:
+    """§13.4: GET trace endpoint and underlying service retrieval cannot write trace events."""
+    api_path = APP / "api" / "runs.py"
+    tree = ast.parse(api_path.read_text(encoding="utf-8"), filename=str(api_path))
+    get_trace_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_run_trace":
+            get_trace_fn = node
+            break
+    assert get_trace_fn is not None, "get_run_trace endpoint not found in app/api/runs.py"
+
+    forbidden = {"append", "create", "insert", "delete", "update", "execute", "add"}
+    offenders: list[str] = []
+    for n in ast.walk(get_trace_fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in forbidden
+        ):
+            offenders.append(f"{n.func.attr} called at line {n.lineno}")
+    assert not offenders, f"get_run_trace endpoint contains mutating calls: {offenders}"
+
+    exec_path = APP / "execution" / "runs.py"
+    exec_tree = ast.parse(exec_path.read_text(encoding="utf-8"), filename=str(exec_path))
+    svc_fn = None
+    for node in ast.walk(exec_tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_run_trace":
+            svc_fn = node
+            break
+    assert svc_fn is not None, "get_run_trace method not found in RunService"
+    for n in ast.walk(svc_fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in {"append", "create", "insert", "delete"}
+        ):
+            offenders.append(f"RunService.get_run_trace calls {n.func.attr} at line {n.lineno}")
+    assert not offenders, f"RunService.get_run_trace performs trace writes: {offenders}"
+
+
+def test_sse_read_endpoint_cannot_write_trace_events() -> None:
+    """§13.4: SSE read endpoint and underlying event stream cannot write trace events."""
+    api_path = APP / "api" / "runs.py"
+    tree = ast.parse(api_path.read_text(encoding="utf-8"), filename=str(api_path))
+    stream_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "stream_run_events":
+            stream_fn = node
+            break
+    assert stream_fn is not None, "stream_run_events endpoint not found in app/api/runs.py"
+
+    forbidden = {"append", "create", "insert", "delete", "update", "execute", "add"}
+    offenders: list[str] = []
+    for n in ast.walk(stream_fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in forbidden
+        ):
+            offenders.append(f"{n.func.attr} called at line {n.lineno}")
+    assert not offenders, f"stream_run_events endpoint contains mutating calls: {offenders}"
+
+    exec_path = APP / "execution" / "runs.py"
+    exec_tree = ast.parse(exec_path.read_text(encoding="utf-8"), filename=str(exec_path))
+    svc_fn = None
+    for node in ast.walk(exec_tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "stream_run_events":
+            svc_fn = node
+            break
+    assert svc_fn is not None, "stream_run_events method not found in RunService"
+    for n in ast.walk(svc_fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in {"append", "create", "insert", "delete"}
+        ):
+            offenders.append(f"RunService.stream_run_events calls {n.func.attr} at line {n.lineno}")
+    assert not offenders, f"RunService.stream_run_events performs trace writes: {offenders}"
+
+
+def test_trace_api_layer_does_not_import_broker_or_queue_infrastructure() -> None:
+    """§13.4, §14: Trace and event API layer relies strictly on Postgres polling
+    and never imports external broker/queue infrastructure."""
+    forbidden_modules = {
+        "redis",
+        "aioredis",
+        "celery",
+        "pika",
+        "aiokafka",
+        "kafka",
+        "kombu",
+        "nats",
+        "rabbitmq",
+        "zmq",
+        "queue",
+        "multiprocessing",
+    }
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    pkg = alias.name.split(".")[0]
+                    if pkg in forbidden_modules:
+                        found.append(f"import {alias.name} at line {node.lineno}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                pkg = node.module.split(".")[0]
+                if pkg in forbidden_modules:
+                    found.append(f"from {node.module} import ... at line {node.lineno}")
+        if found:
+            offenders[path.name] = found
+    assert not offenders, f"API layer imports forbidden queue/broker infrastructure: {offenders}"
+
+
+def test_route_handlers_do_not_directly_execute_orm_queries() -> None:
+    """§13.2, §13.4: Route handlers in app/api/runs.py must never directly
+    execute ORM statements or session queries."""
+    runs_api_path = APP / "api" / "runs.py"
+    tree = ast.parse(runs_api_path.read_text(encoding="utf-8"), filename=str(runs_api_path))
+    forbidden_names = {"select", "insert", "delete", "update"}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in forbidden_names:
+                offenders.append(
+                    f"direct query builder call '{node.func.id}' at line {node.lineno}"
+                )
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+                offenders.append(f"direct query execution '.execute()' at line {node.lineno}")
+    assert not offenders, f"Route handlers execute ORM queries directly: {offenders}"
+
+
+def test_trace_event_resource_does_not_expose_trace_event_id() -> None:
+    """§13.4: TraceEventResource public schema must never expose internal surrogate database id."""
+    schemas_path = APP / "api" / "schemas.py"
+    tree = ast.parse(schemas_path.read_text(encoding="utf-8"), filename=str(schemas_path))
+    resource_cls = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "TraceEventResource":
+            resource_cls = node
+            break
+    assert resource_cls is not None, "TraceEventResource class not found in app/api/schemas.py"
+
+    field_names: set[str] = set()
+    for stmt in resource_cls.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            field_names.add(stmt.target.id)
+    assert "id" not in field_names, (
+        f"TraceEventResource must not expose 'id' field; found fields: {field_names}"
+    )
+    assert "seq" in field_names, "TraceEventResource must expose monotonic 'seq' as public identity"
+
+
+def test_trace_redaction_is_presentation_only_and_does_not_mutate_persisted_objects() -> None:
+    """§13.4, §14.4: Trace event redaction is presentation-only
+    and leaves persisted ORM object unmutated."""
+    import uuid
+    from datetime import datetime
+
+    from app.api.schemas import TraceEventResource
+    from app.persistence.models import TraceEvent, TraceEventKind, TraceEventSeverity
+
+    schemas_path = APP / "api" / "schemas.py"
+    tree = ast.parse(schemas_path.read_text(encoding="utf-8"), filename=str(schemas_path))
+    from_row_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "from_row":
+            from_row_fn = node
+            break
+    assert from_row_fn is not None, "from_row method not found in app/api/schemas.py"
+
+    # AST invariant: from_row never assigns to row attributes
+    for node in ast.walk(from_row_fn):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "row"
+                ):
+                    pytest.fail(f"from_row mutates row attribute: {target.attr}")
+
+    raw_payload = {"api_key": "sk-secret-12345", "nested": {"auth_token": "token-xyz"}}
+    raw_input = {"password": "supersecretpassword"}  # noqa: S106
+    event = TraceEvent(
+        run_id=uuid.uuid4(),
+        seq=1,
+        ts=datetime.now(UTC),
+        kind=TraceEventKind.TOOL_SUCCEEDED,
+        severity=TraceEventSeverity.INFO,
+        payload=raw_payload,
+        input=raw_input,
+    )
+    res = TraceEventResource.from_row(event)
+    assert res.payload["api_key"] == "[redacted]"
+    assert res.payload["nested"]["auth_token"] == "[redacted]"  # noqa: S105
+    assert res.input is not None and res.input["password"] == "[redacted]"  # noqa: S105
+    assert event.payload["api_key"] == "sk-secret-12345"
+    assert event.payload["nested"]["auth_token"] == "token-xyz"  # noqa: S105
+    assert event.input["password"] == "supersecretpassword"  # noqa: S105

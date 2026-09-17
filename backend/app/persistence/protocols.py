@@ -9,7 +9,7 @@ sessions or ORM query construction.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -54,11 +54,30 @@ __all__ = [
     "ExecutionStepRepository",
     "LeadRepository",
     "OutreachDraftRepository",
+    "RunListResult",
     "ToolCallRepository",
     "TraceEventRepository",
     "UnitOfWork",
     "UnitOfWorkFactory",
 ]
+
+
+@dataclass(frozen=True)
+class RunListResult:
+    """Paginated result of an agent run query (§13.2)."""
+
+    items: list[AgentRun]
+    has_more: bool
+    total_estimate: int
+
+    def __iter__(self) -> Iterator[AgentRun]:
+        return iter(self.items)
+
+    def __getitem__(self, index: int) -> AgentRun:
+        return self.items[index]
+
+    def __len__(self) -> int:
+        return len(self.items)
 
 
 @runtime_checkable
@@ -213,10 +232,17 @@ class AgentRunRepository(Protocol):
         self,
         *,
         status: RunStatus | None = None,
+        statuses: list[RunStatus] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        parent_run_id: uuid.UUID | None = None,
+        query: str | None = None,
+        cursor_created_at: datetime | None = None,
+        cursor_id: uuid.UUID | None = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[AgentRun]:
-        """List runs with optional status filtering and pagination."""
+    ) -> RunListResult:
+        """List runs with optional filtering and keyset or offset pagination (§13.2)."""
         ...
 
     async def list_orphaned_runs(self, *, now: datetime, limit: int = 50) -> list[AgentRun]:
@@ -538,7 +564,14 @@ class TraceEventRepository(Protocol):
         ...
 
     async def list_by_run(
-        self, run_id: uuid.UUID, *, after_seq: int = 0, limit: int = 100
+        self,
+        run_id: uuid.UUID,
+        *,
+        after_seq: int = 0,
+        since_seq: int | None = None,
+        limit: int = 100,
+        kinds: list[TraceEventKind] | None = None,
+        severity_min: TraceEventSeverity | None = None,
     ) -> list[TraceEvent]:
         """List events for a run ordered by `seq` for SSE streaming or polling."""
         ...

@@ -203,6 +203,30 @@ class RunNotResumableError(LeaseAcquisitionError):
     """Raised when deciding an approval whose agent run is not in a resumable state."""
 
 
+class IdempotencyConflictError(OpsPilotError):
+    """Raised when an Idempotency-Key is reused with a different request body (§13.1, §13.2)."""
+
+    error_class = ErrorClass.POLICY_VIOLATION
+
+
+class RunNotStartableError(OpsPilotError):
+    """Raised when start is attempted on a run not in `created` status (§13.1, §13.2)."""
+
+    error_class = ErrorClass.POLICY_VIOLATION
+
+
+class RunNotCancellableError(OpsPilotError):
+    """Raised when cancellation is attempted on a run in a terminal status (§13.2)."""
+
+    error_class = ErrorClass.POLICY_VIOLATION
+
+
+class RunActiveError(OpsPilotError):
+    """Raised when retry is attempted on an active run (§13.2)."""
+
+    error_class = ErrorClass.POLICY_VIOLATION
+
+
 def is_retryable(error_class: ErrorClass, *, idempotent: bool, nondeterministic: bool) -> bool:
     """Is this class retryable for a tool with these contract properties?"""
     if error_class in TERMINAL_ERRORS:

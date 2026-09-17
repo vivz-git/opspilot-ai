@@ -21,12 +21,14 @@ from app.api.approvals import router as approvals_router
 from app.api.errors import register_error_handlers
 from app.api.health import discover_alembic_head
 from app.api.health import router as health_router
+from app.api.runs import router as runs_router
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
 
 if TYPE_CHECKING:
     from app.execution.approvals import ApprovalService
     from app.execution.recovery import RunDriver
+    from app.execution.runs import RunService
     from app.runtime import Clock
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +38,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     approval_service: ApprovalService | None = None,
+    run_service: RunService | None = None,
     driver: RunDriver | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
@@ -59,6 +62,7 @@ def create_app(
     )
     app.state.alembic_head_revision = discover_alembic_head(BACKEND_ROOT)
     app.state.approval_service = approval_service
+    app.state.run_service = run_service
     app.state.run_driver = driver
     app.state.clock = clock
 
@@ -74,6 +78,9 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(approvals_router)
+    app.include_router(approvals_router, prefix="/api/v1")
+    app.include_router(runs_router)
+    app.include_router(runs_router, prefix="/api/v1")
 
     return app
 
