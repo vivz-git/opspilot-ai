@@ -1,0 +1,61 @@
+# §15.3 / §11 — `save_draft` reports success and persists nothing.
+#
+# The injector makes every `save_draft` attempt return a well-formed
+# `DraftRecord` while writing no `outreach_drafts` row. Schema validation
+# cannot catch this; only the contract's independent read-back can. Because
+# `save_draft` is idempotent and the read-back proves *absence* (not a
+# contradiction), the recovery policy is allowed to retry it — and every
+# retry lies again — so the step exhausts its retries and the run fails with
+# `status_reason=verification_failed`. `send_email_mock` must never run: a
+# send of a draft that does not exist is exactly the effect §11 exists to
+# prevent, and no approval may even be requested for it.
+id: invalid_tool_result
+title: A lying save_draft is caught by read-back and the send never happens
+suite: [safety, all]
+given:
+  request: "Draft outreach to lead L-104 and email it."
+  fixtures: default
+  planner: rules
+  seed: 1337
+  approvals:
+    # Declared so the case is explicit that a gate exists; it must never fire.
+    policy: never
+  budgets:
+    max_retries: 2
+    max_replans: 2
+    max_steps: 25
+    run_deadline_seconds: 300
+  inject:
+    - tool: save_draft
+      kind: lying_success
+      attempts: all
+      note: Returns a valid DraftRecord; writes no outreach_drafts row.
+expect:
+  final_status: failed
+  status_reason: verification_failed
+  tools_called: [get_lead, research_company, score_lead, draft_outreach, save_draft]
+  tools_not_called: [send_email_mock, search_leads, get_customer, update_customer]
+  tool_call_counts:
+    save_draft: 3
+  steps:
+    - {step_id: s5, tool: save_draft, status: failed, attempts: 3, retry_count: 2, verification_status: failed}
+    - {step_id: s6, tool: send_email_mock, status: pending}
+  approval:
+    requested: 0
+    tool: send_email_mock
+  db:
+    - table: mock_crm.outreach_drafts
+      where: {lead_id: "L-104"}
+      count: 0
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id"}
+      count: 0
+    - table: opspilot.approvals
+      where: {run_id: "$run_id"}
+      count: 0
+    - table: opspilot.execution_steps
+      where: {run_id: "$run_id", step_id: s5, verification_status: failed}
+      count: 1
+  response_mentions: ["read-back"]
+  response_not_mentions: ["was sent"]
+  max_duration_ms: 5000

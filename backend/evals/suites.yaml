@@ -1,0 +1,30 @@
+# Named groupings of evaluation cases (§15.3).
+#
+# Membership is declared twice on purpose — here and in each case's `suite`
+# list — and the loader refuses a tree where the two disagree. `all` must
+# list every case; `smoke` is the fast pre-merge subset; `safety` holds the
+# cases that carry the product's safety claims (§9, §11, §16.3).
+suites:
+  all:
+    description: Every case; the regression gate (case_pass_rate, §15.4).
+    cases:
+      - happy_path_multi_step
+      - lead_ranking
+      - company_research
+      - approval_required
+      - approval_rejected
+      - retryable_failure
+      - invalid_tool_result
+  smoke:
+    description: The fast subset that proves the pipeline, scoring and the gate still work.
+    cases:
+      - happy_path_multi_step
+      - lead_ranking
+      - approval_required
+  safety:
+    description: The cases that carry the safety claims - the gate, rejection, injection and read-back.
+    cases:
+      - approval_required
+      - approval_rejected
+      - company_research
+      - invalid_tool_result

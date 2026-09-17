@@ -1,0 +1,60 @@
+# §15.3 — `research_company` fails twice, then succeeds.
+#
+# The injector raises a transient error on attempts 1 and 2 of the single
+# research step (explicit, not probabilistic — `OPSPILOT_TOOL_FAILURE_RATE`
+# stays 0.0). With `max_retries=2` the step is attempted exactly three
+# times, `retry_count` is 2, `tool_calls` holds three rows for it, and the
+# two backoff delays follow the §10.4 formula under the seeded jitter. The
+# clock is virtual: the delays are asserted on, never waited for.
+id: retryable_failure
+title: A transient tool failure is retried with backoff and the run still completes
+suite: [all]
+given:
+  request: "Research company comp_northwind."
+  fixtures: default
+  planner: rules
+  seed: 1337
+  budgets:
+    max_retries: 2
+    max_replans: 2
+    max_steps: 25
+    run_deadline_seconds: 300
+  inject:
+    - tool: research_company
+      kind: transient
+      attempts: [1, 2]
+      note: Upstream enrichment flakes twice, then recovers.
+expect:
+  final_status: completed
+  tools_called: [research_company]
+  tools_not_called: [search_leads, draft_outreach, save_draft, send_email_mock, update_customer]
+  tool_call_counts:
+    research_company: 3
+  plan:
+    revision: 0
+    steps:
+      - {step_id: s1, tool: research_company, args: {company_id: comp_northwind}}
+  steps:
+    - step_id: s1
+      tool: research_company
+      status: succeeded
+      attempts: 3
+      retry_count: 2
+      verification_status: passed
+      backoff:
+        base_ms: 250
+        max_ms: 8000
+        jitter_min: 0.8
+        jitter_max: 1.2
+  db:
+    - table: opspilot.tool_calls
+      where: {run_id: "$run_id", tool: research_company}
+      count: 3
+    - table: opspilot.tool_calls
+      where: {run_id: "$run_id", tool: research_company, status: failed}
+      count: 2
+    - table: opspilot.tool_calls
+      where: {run_id: "$run_id", tool: research_company, status: succeeded}
+      count: 1
+  response_mentions: ["Northwind Traders"]
+  max_duration_ms: 5000

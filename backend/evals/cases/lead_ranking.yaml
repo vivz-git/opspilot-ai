@@ -1,0 +1,53 @@
+# §15.3 — a fixed lead set, deterministic scoring.
+#
+# The three London fintech leads are scored from their company profiles by
+# the pure rule engine (`score_lead`, TOOL-003). The expected scores are the
+# engine's own output on the fixtures: company fit, engagement, signal
+# strength and data quality contributions sum to the score (±1 for rounding).
+# Re-running the case must yield identical numbers — that is what makes a
+# change to the weights or the fixtures visible.
+id: lead_ranking
+title: Deterministic scoring ranks the fixed lead set identically every run
+suite: [smoke, all]
+given:
+  request: "Score the top 3 fintech leads in London."
+  fixtures: default
+  planner: rules
+  seed: 1337
+  inject: []
+expect:
+  final_status: completed
+  tools_called: [search_leads, research_company, score_lead]
+  tools_not_called: [draft_outreach, save_draft, send_email_mock, update_customer]
+  tool_call_counts:
+    search_leads: 1
+    research_company: 3
+    score_lead: 3
+  plan:
+    revision: 0
+    steps:
+      - {step_id: s1, tool: search_leads, args: {industry: fintech, location: London, limit: 3}}
+      - {step_id: s2, tool: research_company}
+      - {step_id: s3, tool: score_lead}
+      - {step_id: s4, tool: score_lead}
+      - {step_id: s5, tool: score_lead}
+  ranking:
+    expected_order: [L-201, L-202, L-203]
+    expected_scores:
+      L-201: 92
+      L-202: 78
+      L-203: 72
+    factors_sum_to_score: true
+    tolerance: 1
+    stable_across_reruns: true
+  tool_outputs:
+    - tool: score_lead
+      required_fields: [lead_id, score, band, factors, rationale, model_version]
+      ranges: {score: [0, 100]}
+      equals: {model_version: rules-v1}
+  db:
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id"}
+      count: 0
+  response_mentions: ["92", "L-201"]
+  max_duration_ms: 5000

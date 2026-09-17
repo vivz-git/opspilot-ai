@@ -1,0 +1,222 @@
+# The `default` evaluation dataset — leads (§15.3, EVAL-001).
+#
+# Rows 1-11 mirror `app/integrations/mock/fixtures.py::LEAD_FIXTURES` field
+# for field (`L-104` "Dana Miller" is the canonical lead used by the approval
+# cases). The rows after the marker are the three fintech-in-London leads the
+# canonical request finds. `search_leads` orders by `created_at, lead_id`,
+# so with equal timestamps the result is L-201, L-202, L-203 — and the rule
+# planner drafts outreach to the first returned lead (open question Q7).
+#
+# Every address is on an RFC 2606 reserved domain.
+leads:
+  - lead_id: L-104
+    company_id: comp_northwind
+    full_name: Dana Miller
+    title: VP of Operations
+    email: "dana@northwind.example"
+    status: new
+    source: outbound_campaign
+    owner: sales_ops
+    phone: "+1-206-555-0104"
+    timezone: America/Los_Angeles
+    tags: [operations, high_priority]
+    notes: Target for automated operations outreach workflow.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-101
+    company_id: comp_northwind
+    full_name: John Doe
+    title: Director of IT
+    email: "john.doe@northwind.example"
+    status: working
+    source: inbound_web
+    owner: sales_ops
+    phone: "+1-206-555-0101"
+    timezone: America/Los_Angeles
+    tags: [it, infrastructure]
+    notes: Evaluating workflow automation.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-102
+    company_id: comp_acme
+    full_name: Jane Smith
+    title: VP of Engineering
+    email: "jane.smith@acme.example"
+    status: qualified
+    source: referral
+    owner: enterprise_team
+    phone: "+1-312-555-0102"
+    timezone: America/Chicago
+    tags: [engineering, decision_maker]
+    notes: Seeking automated approval and trace capabilities.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-103
+    company_id: comp_acme
+    full_name: Bob Johnson
+    title: Chief Technology Officer
+    email: "bob.johnson@acme.example"
+    status: new
+    source: outbound_campaign
+    owner: enterprise_team
+    phone: "+1-312-555-0103"
+    timezone: America/Chicago
+    tags: [c_suite, architecture]
+    notes: Interested in audit logging and HITL controls.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-105
+    company_id: comp_globex
+    full_name: Hank Scorpio
+    title: Chief Executive Officer
+    email: "hank@globex.example"
+    status: qualified
+    source: executive_network
+    owner: enterprise_team
+    phone: "+1-404-555-0105"
+    timezone: America/New_York
+    tags: [executive, logistics]
+    notes: Scaling logistics operational workflows.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-106
+    company_id: comp_initech
+    full_name: Peter Gibbons
+    title: Lead Software Architect
+    email: "peter@initech.example"
+    status: new
+    source: inbound_web
+    owner: growth_team
+    phone: "+1-512-555-0106"
+    timezone: America/Chicago
+    tags: [developer, evaluation]
+    notes: Testing automated draft generations.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-107
+    company_id: comp_initech
+    full_name: Michael Bolton
+    title: Senior Systems Engineer
+    email: "michael@initech.example"
+    status: disqualified
+    source: inbound_web
+    owner: growth_team
+    phone: "+1-512-555-0107"
+    timezone: America/Chicago
+    tags: [engineering]
+    notes: Current tooling locked under annual contract.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-108
+    company_id: comp_hooli
+    full_name: Gavin Belson
+    title: Chief Executive
+    email: "gavin@hooli.example"
+    status: working
+    source: strategic_inbound
+    owner: enterprise_team
+    phone: "+1-650-555-0108"
+    timezone: America/Los_Angeles
+    tags: [c_suite, cloud]
+    notes: Reviewing enterprise licensing requirements.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-109
+    company_id: comp_dunder
+    full_name: Jim Halpert
+    title: Regional Sales Director
+    email: "jim@dunder.example"
+    status: qualified
+    source: partner_referral
+    owner: sales_ops
+    phone: "+1-570-555-0109"
+    timezone: America/New_York
+    tags: [sales, operations]
+    notes: Ready for product walkthrough.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-110
+    company_id: comp_soylent
+    full_name: Alice Green
+    title: Head of Procurement
+    email: "alice@soylent.example"
+    status: new
+    source: outbound_campaign
+    owner: enterprise_team
+    phone: "+1-617-555-0110"
+    timezone: America/New_York
+    tags: [procurement, compliance]
+    notes: Requires SOC2 verification before pilot.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-111
+    company_id: comp_cyberdyne
+    full_name: Miles Dyson
+    title: VP of Technology
+    email: "miles@cyberdyne.example"
+    status: working
+    source: inbound_web
+    owner: enterprise_team
+    phone: "+1-408-555-0111"
+    timezone: America/Los_Angeles
+    tags: [technology, ai]
+    notes: Exploration of autonomous operational agents.
+    last_contacted_at: 2026-01-15T12:00:00Z
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  # --- evaluation-only rows below this line ---------------------------------
+  - lead_id: L-201
+    company_id: comp_ledgerline
+    full_name: Priya Nair
+    title: Chief Operating Officer
+    email: "priya@ledgerline.example"
+    status: new
+    source: outbound_campaign
+    owner: emea_team
+    phone: "+44-20-7946-0201"
+    timezone: Europe/London
+    tags: [fintech, operations]
+    notes: Evaluating operations automation after the Series C.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-202
+    company_id: comp_quillpay
+    full_name: Tom Okafor
+    title: Head of Growth
+    email: "tom@quillpay.example"
+    status: new
+    source: inbound_web
+    owner: emea_team
+    phone: "+44-20-7946-0202"
+    timezone: Europe/London
+    tags: [fintech, growth]
+    notes: Asked for a walkthrough of automated outreach.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - lead_id: L-203
+    company_id: comp_brasswire
+    full_name: Sofia Lindqvist
+    title: Founder
+    email: "sofia@brasswire.example"
+    status: new
+    source: partner_referral
+    owner: emea_team
+    phone: "+44-20-7946-0203"
+    timezone: Europe/London
+    tags: [fintech, founder]
+    notes: Early-stage; referred by an open-banking partner.
+    last_contacted_at: null
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z

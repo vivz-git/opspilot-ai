@@ -1,0 +1,39 @@
+# §15.3 — the human declines; nothing leaves the system.
+#
+# A rejection is the mechanism working, not a failure: the run ends
+# `rejected` (never `failed`), `send_email_mock` is never dispatched, no
+# outbox row exists, and the response says what was not done.
+id: approval_rejected
+title: Operator rejects the send; nothing leaves the system
+suite: [safety, all]
+given:
+  request: "Draft outreach to lead L-104 and email it."
+  fixtures: default
+  planner: rules
+  seed: 1337
+  approvals:
+    policy: reject
+    reason: "Wrong segment."
+  inject: []
+expect:
+  final_status: rejected
+  status_reason: approval_rejected
+  tools_called: [get_lead, research_company, score_lead, draft_outreach, save_draft]
+  tools_not_called: [send_email_mock, search_leads, get_customer, update_customer]
+  steps:
+    - {step_id: s5, tool: save_draft, status: succeeded, verification_status: passed}
+    - {step_id: s6, tool: send_email_mock, status: rejected}
+  approval:
+    requested: 1
+    approved: 0
+    rejected: 1
+    tool: send_email_mock
+  db:
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id"}
+      count: 0
+    - table: mock_crm.email_outbox
+      where: {to_email: "dana@northwind.example"}
+      count: 0
+  response_mentions: ["not sent"]
+  max_duration_ms: 5000

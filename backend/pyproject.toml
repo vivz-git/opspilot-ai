@@ -34,6 +34,8 @@ dependencies = [
   # --- Observability ---
   "structlog>=24.4",
   "tenacity>=9.0",                 # retry/backoff primitives (bounded only)
+  # --- Evaluation definitions (§15.3) ---
+  "pyyaml>=6.0",                   # eval cases/fixtures/suites; safe_load only
 ]
 
 [project.optional-dependencies]
@@ -46,6 +48,7 @@ dev = [
   "ruff>=0.8",
   "mypy>=1.13",
   "types-python-dateutil",
+  "types-pyyaml",
 ]
 
 [tool.hatch.build.targets.wheel]

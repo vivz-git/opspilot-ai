@@ -1,0 +1,81 @@
+# §15.3 — the canonical request (§1.1), approval granted.
+#
+# Protects the whole pipeline end to end: 1 search, 3 researches (a fan-out),
+# 3 scorings, 1 draft, 1 persisted draft, one human approval, one mock send,
+# and a read-back proving the send was recorded. The rule planner emits
+# s1..s8 for this request; the research fan-out expands to s2[0..2].
+id: happy_path_multi_step
+title: Canonical multi-step request completes with exactly one approved send
+suite: [smoke, all]
+given:
+  request: >-
+    Find the top 3 fintech leads in London, research their companies, score
+    them, draft outreach to the best one and email it to them.
+  fixtures: default
+  planner: rules
+  seed: 1337
+  approvals:
+    policy: approve
+    reason: "Looks good."
+  inject: []
+expect:
+  final_status: completed
+  tools_called:
+    - search_leads
+    - research_company
+    - score_lead
+    - draft_outreach
+    - save_draft
+    - send_email_mock
+  tools_not_called: [get_lead, get_customer, update_customer]
+  tool_sequence:
+    - search_leads
+    - research_company
+    - research_company
+    - research_company
+    - score_lead
+    - score_lead
+    - score_lead
+    - draft_outreach
+    - save_draft
+    - send_email_mock
+  tool_call_counts:
+    search_leads: 1
+    research_company: 3
+    score_lead: 3
+    draft_outreach: 1
+    save_draft: 1
+    send_email_mock: 1
+  plan:
+    revision: 0
+    steps:
+      - {step_id: s1, tool: search_leads, args: {industry: fintech, location: London, limit: 3}}
+      - {step_id: s2, tool: research_company}
+      - {step_id: s3, tool: score_lead}
+      - {step_id: s4, tool: score_lead}
+      - {step_id: s5, tool: score_lead}
+      - {step_id: s6, tool: draft_outreach}
+      - {step_id: s7, tool: save_draft}
+      - {step_id: s8, tool: send_email_mock}
+  steps:
+    # Every mutating step verified by an independent read-back (§11).
+    - {step_id: s7, tool: save_draft, status: succeeded, attempts: 1, verification_status: passed}
+    - {step_id: s8, tool: send_email_mock, status: succeeded, attempts: 1, verification_status: passed}
+  approval:
+    requested: 1
+    approved: 1
+    tool: send_email_mock
+    preview_contains: [to_email, subject, body]
+  db:
+    # Exactly one outbox row, and it belongs to this run.
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id"}
+      count: 1
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id", to_email: "priya@ledgerline.example", status: sent}
+      count: 1
+    - table: mock_crm.outreach_drafts
+      where: {lead_id: "L-201"}
+      count: 1
+  response_mentions: ["Priya Nair", "sent"]
+  max_duration_ms: 5000

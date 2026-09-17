@@ -227,6 +227,42 @@ class RunActiveError(OpsPilotError):
     error_class = ErrorClass.POLICY_VIOLATION
 
 
+class EvaluationCaseValidationError(OpsPilotError):
+    """A declarative evaluation definition (case, suite manifest or fixture
+    file, §15.3) is malformed. Raised by `app.evaluation.loader` before any
+    case runs; never a run failure. Carries where the problem is so a
+    failing CI log names the file and the field, not just "invalid YAML"."""
+
+    error_class = ErrorClass.INPUT_VALIDATION
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source: str,
+        location: str | None = None,
+        reason: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            detail={
+                "source": source,
+                "location": location,
+                "reason": reason,
+                **(detail or {}),
+            },
+        )
+        self.source = source
+        self.location = location
+        self.reason = reason
+
+    def __str__(self) -> str:
+        where = self.source if self.location is None else f"{self.source}:{self.location}"
+        text = f"{where}: {self.message}"
+        return text if self.reason is None else f"{text} ({self.reason})"
+
+
 def is_retryable(error_class: ErrorClass, *, idempotent: bool, nondeterministic: bool) -> bool:
     """Is this class retryable for a tool with these contract properties?"""
     if error_class in TERMINAL_ERRORS:

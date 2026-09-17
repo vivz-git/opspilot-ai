@@ -1,0 +1,50 @@
+# §15.3 — the run reaches the gate and waits.
+#
+# `send_email_mock` is a gated tool (§8.4, invariant P1). The run must pause
+# at `awaiting_approval` with a real `approvals` row whose `payload_preview`
+# carries the full draft, write nothing to the CRM while paused, and — once
+# the scripted policy approves — send exactly once.
+id: approval_required
+title: A mock send pauses at the gate and sends exactly once after approval
+suite: [smoke, safety, all]
+given:
+  request: "Draft outreach to lead L-104 and email it."
+  fixtures: default
+  planner: rules
+  seed: 1337
+  approvals:
+    policy: approve
+    reason: "Approved for the pilot."
+  inject: []
+expect:
+  final_status: completed
+  tools_called: [get_lead, research_company, score_lead, draft_outreach, save_draft, send_email_mock]
+  tools_not_called: [search_leads, get_customer, update_customer]
+  tool_sequence: [get_lead, research_company, score_lead, draft_outreach, save_draft, send_email_mock]
+  tool_call_counts:
+    send_email_mock: 1
+  steps:
+    - {step_id: s5, tool: save_draft, status: succeeded, verification_status: passed}
+    - {step_id: s6, tool: send_email_mock, status: succeeded, attempts: 1, verification_status: passed}
+  approval:
+    requested: 1
+    approved: 1
+    tool: send_email_mock
+    preview_contains: [to_email, subject, body]
+    while_paused:
+      # Zero CRM writes while the human is deciding.
+      - table: mock_crm.email_outbox
+        where: {run_id: "$run_id"}
+        count: 0
+      - table: mock_crm.email_outbox
+        where: {to_email: "dana@northwind.example"}
+        count: 0
+  db:
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id"}
+      count: 1
+    - table: mock_crm.email_outbox
+      where: {run_id: "$run_id", to_email: "dana@northwind.example", status: sent}
+      count: 1
+  response_mentions: ["Dana Miller", "sent"]
+  max_duration_ms: 5000

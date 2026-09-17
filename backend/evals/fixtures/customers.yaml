@@ -1,0 +1,73 @@
+# The `default` evaluation dataset — customers (§15.3, EVAL-001).
+#
+# Mirrors `app/integrations/mock/fixtures.py::CUSTOMER_FIXTURES` field for
+# field. `mrr` is quoted so it loads as an exact decimal, as the column is
+# `numeric(12, 2)`. No evaluation-only rows: none of the seven cases touches a
+# customer, and the global invariant 2 (§15.6) is asserted over this table
+# exactly as seeded.
+customers:
+  - customer_id: cust_1
+    account_name: Northwind Traders
+    primary_contact: Dana Miller
+    email: "dana@northwind.example"
+    phone: "+1-206-555-0104"
+    status: active
+    plan: enterprise
+    mrr: "5000.00"
+    owner: sales_ops
+    notes: Key enterprise customer in Pacific Northwest.
+    version: 1
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - customer_id: cust_2
+    account_name: Acme Corporation
+    primary_contact: Jane Smith
+    email: "jane.smith@acme.example"
+    phone: "+1-312-555-0102"
+    status: prospect
+    plan: starter
+    mrr: "500.00"
+    owner: enterprise_team
+    notes: Piloting automation on logistics workflows.
+    version: 1
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - customer_id: cust_3
+    account_name: Initech Software
+    primary_contact: Peter Gibbons
+    email: "peter@initech.example"
+    phone: "+1-512-555-0106"
+    status: active
+    plan: growth
+    mrr: "2200.00"
+    owner: growth_team
+    notes: Automated compliance customer.
+    version: 1
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - customer_id: cust_4
+    account_name: Globex Logistics
+    primary_contact: Hank Scorpio
+    email: "hank@globex.example"
+    phone: "+1-404-555-0105"
+    status: prospect
+    plan: null
+    mrr: null
+    owner: enterprise_team
+    notes: Discovery stage for regional distribution hubs.
+    version: 1
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
+  - customer_id: cust_5
+    account_name: Dunder Supply
+    primary_contact: Jim Halpert
+    email: "jim@dunder.example"
+    phone: "+1-570-555-0109"
+    status: churned
+    plan: starter
+    mrr: "0.00"
+    owner: sales_ops
+    notes: Account transitioned during supplier consolidation.
+    version: 1
+    created_at: 2026-01-15T12:00:00Z
+    updated_at: 2026-01-15T12:00:00Z
