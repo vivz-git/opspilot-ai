@@ -8,7 +8,7 @@ Covers:
 5. Reject with correct args_hash and reason -> succeeds (200) with status="rejected".
 6. Reject without reason -> 422 Problem Details with code="validation_error".
 7. Malformed decision -> 422 Problem Details with code="validation_error".
-8. Missing args_hash -> 422 Problem Details with code="validation_error".
+8. Omitted args_hash is accepted (§13.5: optional); the response echoes the persisted hash.
 9. Extra fields in request -> 422 Problem Details with code="validation_error".
 10. Wrong args_hash -> 409 Problem Details with code="approval_superseded".
 11. Idempotent same decision repeated -> 200, resume called once.
@@ -20,6 +20,15 @@ Covers:
 17. Sensitive fields (tokens, secrets, db credentials) are never exposed; payload_preview redacted.
 18. Endpoint delegates to ApprovalService and does not directly mutate repositories.
 19. Integration test against real PostgreSQL asserting atomic state handoff and trace events.
+
+API-004 (the conflict family, each driven through the real service over PostgreSQL):
+20. approval_expired for a swept row and for a pending row past its TTL; state untouched.
+21. approval_superseded for a genuinely superseded row; state untouched.
+22. run_not_resumable for a pending approval on a terminal run; approval stays pending.
+23. A same-decision replay never steals a live lease and never resumes a run that has
+    moved on to a later, undecided approval.
+24. A concurrent race records exactly one approval_granted event.
+25. The response never carries persistence internals (superseded_by, lease fields).
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from app.agent.state import ApprovalDecisionKind, ApprovalStatus
+from app.agent.state import ApprovalDecisionKind, ApprovalStatus, RunStatus
 from app.api.dependencies import get_approval_service
 from app.config import Settings
 from app.errors import (
@@ -59,6 +68,7 @@ from recovery_harness import (
     Harness,
     create_run,
     migrate_to_head,
+    read_run,
     require_database,
     uow_factory_for,
 )
@@ -129,6 +139,50 @@ class TestApprovalApiUnit:
         assert item["payload_preview"]["api_key"] == "[redacted]"
         assert "password" not in item
         assert "token" not in item
+
+    def test_response_carries_only_the_public_field_set(self) -> None:
+        """The resource is the redaction boundary: no `superseded_by`, no lease or
+        checkpoint fields, no token, and secrets inside the preview are masked."""
+        app = create_app(settings=Settings(_env_file=None))
+        mock_service = AsyncMock(spec=ApprovalService)
+        row = _make_sample_row(
+            status=ApprovalStatus.SUPERSEDED,
+            payload_preview={"to_email": "dana@northwind.example", "token": "tok-1", "n": 1},
+        )
+        row.superseded_by = uuid.uuid4()
+        mock_service.get_approval.return_value = row
+        app.dependency_overrides[get_approval_service] = lambda: mock_service
+
+        with TestClient(app) as client:
+            resp = client.get(f"/approvals/{row.id}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == {
+            "approval_id",
+            "run_id",
+            "step_id",
+            "tool",
+            "risk",
+            "title",
+            "summary",
+            "status",
+            "args_hash",
+            "payload_preview",
+            "created_at",
+            "requested_at",
+            "expires_at",
+            "decided_at",
+            "decided_by",
+            "reason",
+        }
+        assert body["payload_preview"] == {
+            "to_email": "dana@northwind.example",
+            "token": "[redacted]",
+            "n": 1,
+        }
+        assert "tok-1" not in resp.text
+        assert str(row.superseded_by) not in resp.text
 
     def test_get_single_approval_success(self) -> None:
         app = create_app(settings=Settings(_env_file=None))
@@ -281,19 +335,64 @@ class TestApprovalApiUnit:
         body = resp.json()
         assert body["code"] == "validation_error"
 
-    def test_missing_args_hash_returns_422_validation_error(self) -> None:
+    def test_omitted_args_hash_is_accepted_and_response_echoes_persisted_hash(self) -> None:
+        """§13.5: `args_hash` is optional. Omitting it passes `None` to the service
+        unchanged (no hash is invented on the caller's behalf) and the 200 body
+        echoes the hash the decision was actually bound to."""
         app = create_app(settings=Settings(_env_file=None))
+        mock_service = AsyncMock(spec=ApprovalService)
+        approval_id = uuid.uuid4()
+        row_approved = _make_sample_row(
+            approval_id=approval_id,
+            status=ApprovalStatus.APPROVED,
+            decided_at=datetime.now(UTC),
+            decided_by="operator@example.com",
+        )
+        mock_service.decide_approval.return_value = DecideApprovalResult(
+            approval=row_approved, is_winner=True, inspection=None
+        )
+        app.dependency_overrides[get_approval_service] = lambda: mock_service
+
+        with TestClient(app) as client:
+            resp = client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "decided_by": "operator@example.com"},
+            )
+
+        assert resp.status_code == 200
+        mock_service.decide_approval.assert_awaited_once_with(
+            approval_id,
+            decision=ApprovalDecisionKind.APPROVE,
+            args_hash=None,
+            decided_by="operator@example.com",
+            reason=None,
+        )
+        assert resp.json()["args_hash"] == "hash-1234"
+
+    @pytest.mark.parametrize("bad_hash", ["", None])
+    def test_explicit_empty_or_null_args_hash(self, bad_hash: str | None) -> None:
+        """An empty string is a malformed echo (422); an explicit null is the same
+        as omitting the field."""
+        app = create_app(settings=Settings(_env_file=None))
+        mock_service = AsyncMock(spec=ApprovalService)
+        mock_service.decide_approval.return_value = DecideApprovalResult(
+            approval=_make_sample_row(status=ApprovalStatus.APPROVED), is_winner=True
+        )
+        app.dependency_overrides[get_approval_service] = lambda: mock_service
+
         with TestClient(app) as client:
             resp = client.post(
                 f"/approvals/{uuid.uuid4()}/decision",
-                json={
-                    "decision": "approve",
-                },
+                json={"decision": "approve", "args_hash": bad_hash},
             )
 
-        assert resp.status_code == 422
-        body = resp.json()
-        assert body["code"] == "validation_error"
+        if bad_hash == "":
+            assert resp.status_code == 422
+            assert resp.json()["code"] == "validation_error"
+            mock_service.decide_approval.assert_not_awaited()
+        else:
+            assert resp.status_code == 200
+            assert mock_service.decide_approval.await_args.kwargs["args_hash"] is None
 
     def test_extra_fields_forbidden_returns_422_validation_error(self) -> None:
         app = create_app(settings=Settings(_env_file=None))
@@ -476,6 +575,16 @@ class TestApprovalApiUnit:
             resp = client.get("/approvals/queue")
             assert resp.status_code == 401
             assert resp.json()["code"] == "policy_violation"
+
+            # The decision route is behind the same boundary; nothing reaches the service
+            denied = client.post(
+                f"/approvals/{uuid.uuid4()}/decision",
+                json={"decision": "approve", "args_hash": "hash-1234"},
+            )
+            assert denied.status_code == 401
+            assert denied.headers["content-type"].startswith("application/problem+json")
+            assert denied.json()["code"] == "policy_violation"
+            mock_service.decide_approval.assert_not_awaited()
 
             # Request with authorization header succeeds
             mock_service.list_pending_queue.return_value = []
@@ -680,3 +789,445 @@ class TestApprovalApiPostgresIntegration:
         conflict_resp = r1 if r1.status_code == 409 else r2
         assert conflict_resp.headers["content-type"].startswith("application/problem+json")
         assert conflict_resp.json()["code"] == "approval_not_pending"
+
+        # Exactly one resume and exactly one decision event: the loser's transaction
+        # rolled back and its trace append with it.
+        assert harness.calls(run_id)["finish"] == 1
+        async with uow_factory() as uow:
+            events = await uow.trace_events.list_by_run(run_id)
+            await uow.commit()
+        grants = [e for e in events if e.kind == TraceEventKind.APPROVAL_GRANTED]
+        assert len(grants) == 1
+        assert grants[0].payload["approval_id"] == str(approval_id)
+
+
+# ---------------------------------------------------------------------------
+# API-004: the conflict family, each for its exact persisted condition
+# ---------------------------------------------------------------------------
+async def _approval_events(uow_factory: Any, run_id: uuid.UUID) -> list[Any]:
+    async with uow_factory() as uow:
+        events = await uow.trace_events.list_by_run(run_id)
+        await uow.commit()
+    return [
+        e
+        for e in events
+        if e.kind in (TraceEventKind.APPROVAL_GRANTED, TraceEventKind.APPROVAL_REJECTED)
+    ]
+
+
+async def _approval_status(uow_factory: Any, approval_id: uuid.UUID) -> ApprovalStatus:
+    async with uow_factory() as uow:
+        row = await uow.approvals.get(approval_id, fresh=True)
+        assert row is not None
+        await uow.commit()
+        return row.status
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("_database")
+class TestApprovalConflictFamilyPostgres:
+    """Each 409 in §9.8/§13.1 is produced by the real `ApprovalService` over a
+    persisted row in the named state, reaches the client as RFC 9457
+    problem+json with its own `code`, and changes nothing: no approval
+    transition, no decision event, no resume, no lease."""
+
+    @pytest.fixture(scope="class")
+    def _database(self) -> None:
+        require_database()
+        migrate_to_head()
+
+    @pytest.fixture
+    async def engine(self) -> AsyncIterator[AsyncEngine]:
+        eng = create_async_engine(
+            harness_settings().database_url.get_secret_value(),
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=10,
+        )
+        try:
+            yield eng
+        finally:
+            await eng.dispose()
+
+    @pytest.fixture
+    async def checkpointer(self) -> AsyncIterator[AsyncPostgresSaver]:
+        async with open_checkpointer(harness_settings()) as saver:
+            yield saver
+
+    async def _paused(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver, clock: FixedClock
+    ) -> tuple[Any, Harness, uuid.UUID, uuid.UUID, AsyncClient]:
+        uow_factory = uow_factory_for(engine)
+        run_id = await create_run(uow_factory)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        approval_id = await _pause_run_for_approval(
+            engine, graph, run_id, clock, step_id="s1", args_hash="hash-s1"
+        )
+        service = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="api-004-worker",
+        )
+        app = create_app(settings=harness_settings(), approval_service=service, clock=clock)
+        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+        return uow_factory, harness, run_id, approval_id, client
+
+    @staticmethod
+    def _assert_problem(resp: Any, code: str, approval_id: uuid.UUID) -> dict[str, Any]:
+        assert resp.status_code == 409
+        assert resp.headers["content-type"].startswith("application/problem+json")
+        body = resp.json()
+        assert body["code"] == code
+        assert body["status"] == 409
+        assert body["type"] == f"https://opspilot.dev/errors/{code.replace('_', '-')}"
+        assert body["title"]
+        assert body["instance"] == f"/approvals/{approval_id}/decision"
+        assert body["errors"] == []
+        return body
+
+    async def _assert_untouched(
+        self,
+        uow_factory: Any,
+        harness: Harness,
+        run_id: uuid.UUID,
+        approval_id: uuid.UUID,
+        *,
+        approval_status: ApprovalStatus,
+        run_status: RunStatus = RunStatus.AWAITING_APPROVAL,
+    ) -> None:
+        assert await _approval_status(uow_factory, approval_id) is approval_status
+        run = await read_run(uow_factory, run_id)
+        assert run.status is run_status
+        assert run.lease_owner is None
+        assert await _approval_events(uow_factory, run_id) == []
+        assert harness.calls(run_id)["finish"] == 0
+
+    async def test_swept_expired_row_returns_approval_expired(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        clock = FixedClock(T0)
+        uow_factory, harness, run_id, approval_id, client = await self._paused(
+            engine, checkpointer, clock
+        )
+        async with uow_factory() as uow:
+            # What the sweeper writes (§9.8): the conditional transition off `pending`.
+            swept = await uow.approvals.decide(
+                approval_id, status=ApprovalStatus.EXPIRED, decided_at=clock.now()
+            )
+            assert swept is not None
+            await uow.commit()
+
+        async with client:
+            resp = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "args_hash": "hash-s1"},
+            )
+        body = self._assert_problem(resp, "approval_expired", approval_id)
+        assert str(approval_id) in body["detail"]
+        await self._assert_untouched(
+            uow_factory, harness, run_id, approval_id, approval_status=ApprovalStatus.EXPIRED
+        )
+
+    async def test_pending_row_past_its_ttl_returns_approval_expired(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """The sweeper has not run yet, but the TTL has elapsed: the decision is
+        refused (§9.8) and the row is left for the sweeper, not silently decided."""
+        clock = FixedClock(T0)
+        uow_factory, harness, run_id, approval_id, client = await self._paused(
+            engine, checkpointer, clock
+        )
+        clock.advance(seconds=timedelta(days=1).total_seconds())
+
+        async with client:
+            for decision in ("approve", "reject"):
+                resp = await client.post(
+                    f"/approvals/{approval_id}/decision",
+                    json={"decision": decision, "args_hash": "hash-s1", "reason": "late"},
+                )
+                self._assert_problem(resp, "approval_expired", approval_id)
+        await self._assert_untouched(
+            uow_factory, harness, run_id, approval_id, approval_status=ApprovalStatus.PENDING
+        )
+
+    async def test_superseded_row_returns_approval_superseded(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        clock = FixedClock(T0)
+        uow_factory, harness, run_id, approval_id, client = await self._paused(
+            engine, checkpointer, clock
+        )
+        async with uow_factory() as uow:
+            # What a replan does (§9.3, HITL-003): the same step re-requested for
+            # revised arguments supersedes the open request and chains it forward.
+            revised = await uow.approvals.upsert_request(
+                run_id=run_id,
+                step_id="s1",
+                tool=ToolName.SEND_EMAIL_MOCK,
+                risk=RiskLevel.HIGH,
+                title="Send email",
+                summary="Send outreach email (revised)",
+                payload_preview={"draft_id": "d2"},
+                args_hash="hash-s1-revised",
+                requested_at=clock.now(),
+                expires_at=clock.now() + timedelta(days=1),
+            )
+            assert revised.created is True
+            successor_id = revised.row.id
+            await uow.commit()
+        assert successor_id != approval_id
+
+        async with client:
+            resp = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "args_hash": "hash-s1"},
+            )
+        body = self._assert_problem(resp, "approval_superseded", approval_id)
+        # The chain pointer is a persistence internal; the client learns the code only.
+        assert str(successor_id) not in resp.text
+        assert "superseded_by" not in body
+        await self._assert_untouched(
+            uow_factory, harness, run_id, approval_id, approval_status=ApprovalStatus.SUPERSEDED
+        )
+        assert await _approval_status(uow_factory, successor_id) is ApprovalStatus.PENDING
+
+    async def test_pending_approval_on_a_terminal_run_returns_run_not_resumable(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """The conditional decision update succeeds, the lease claim on the terminal
+        run does not, and the whole transaction rolls back: the approval is still
+        pending afterwards and no decision event was recorded."""
+        clock = FixedClock(T0)
+        uow_factory, harness, run_id, approval_id, client = await self._paused(
+            engine, checkpointer, clock
+        )
+        async with uow_factory() as uow:
+            moved = await uow.agent_runs.transition_status(
+                run_id,
+                expected=(RunStatus.AWAITING_APPROVAL,),
+                status=RunStatus.FAILED,
+                status_reason="budget_exhausted",
+                finished_at=clock.now(),
+            )
+            assert moved is not None
+            await uow.commit()
+
+        async with client:
+            resp = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "args_hash": "hash-s1"},
+            )
+        body = self._assert_problem(resp, "run_not_resumable", approval_id)
+        assert str(run_id) in body["detail"]
+        await self._assert_untouched(
+            uow_factory,
+            harness,
+            run_id,
+            approval_id,
+            approval_status=ApprovalStatus.PENDING,
+            run_status=RunStatus.FAILED,
+        )
+
+    async def test_omitted_args_hash_decides_against_the_persisted_binding(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """§13.5: the echo is optional. Without it the decision binds to the row's
+        own hash, which the 200 body echoes; a wrong echo is still refused."""
+        clock = FixedClock(T0)
+        uow_factory, harness, run_id, approval_id, client = await self._paused(
+            engine, checkpointer, clock
+        )
+        async with client:
+            wrong = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "args_hash": "hash-s1-stale"},
+            )
+            self._assert_problem(wrong, "approval_superseded", approval_id)
+            assert await _approval_status(uow_factory, approval_id) is ApprovalStatus.PENDING
+
+            ok = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "decided_by": "operator@opspilot.dev"},
+            )
+        assert ok.status_code == 200
+        assert ok.json()["args_hash"] == "hash-s1"
+        assert ok.json()["status"] == "approved"
+        assert await _approval_status(uow_factory, approval_id) is ApprovalStatus.APPROVED
+        assert harness.calls(run_id)["finish"] == 1
+        assert (await read_run(uow_factory, run_id)).status is RunStatus.COMPLETED
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("_database")
+class TestSameDecisionReplayPostgres:
+    """§9.8, §13.8: a repeated decision is idempotent by design. It records
+    nothing twice and — the part a naive retry gets wrong — never hands the
+    run to a second resume: not by stealing a live lease (HITL-004) and not
+    by re-entering a run that has since paused on a *later* approval."""
+
+    @pytest.fixture(scope="class")
+    def _database(self) -> None:
+        require_database()
+        migrate_to_head()
+
+    @pytest.fixture
+    async def engine(self) -> AsyncIterator[AsyncEngine]:
+        eng = create_async_engine(
+            harness_settings().database_url.get_secret_value(),
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=10,
+        )
+        try:
+            yield eng
+        finally:
+            await eng.dispose()
+
+    @pytest.fixture
+    async def checkpointer(self) -> AsyncIterator[AsyncPostgresSaver]:
+        async with open_checkpointer(harness_settings()) as saver:
+            yield saver
+
+    async def test_replay_never_resumes_a_run_paused_on_a_later_approval(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """Approval #1 was approved and the run has since paused on approval #2.
+        A stale retry of #1 (same decision, same hash) must be a 200 no-op: the
+        graph is not resumed with a decision #2 never received, #2 stays pending,
+        the run stays awaiting approval with no lease, and no second
+        `approval_granted` is recorded."""
+        clock = FixedClock(T0)
+        uow_factory = uow_factory_for(engine)
+        run_id = await create_run(uow_factory)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        first_id = await _pause_run_for_approval(
+            engine, graph, run_id, clock, step_id="s1", args_hash="hash-s1"
+        )
+        second_id = uuid.uuid4()
+        async with uow_factory() as uow:
+            # What the winner's transaction wrote for #1 …
+            decided = await uow.approvals.decide(
+                first_id,
+                status=ApprovalStatus.APPROVED,
+                decided_by="operator-1",
+                decided_at=clock.now(),
+            )
+            assert decided is not None
+            await uow.trace_events.append(
+                run_id=run_id,
+                kind=TraceEventKind.APPROVAL_GRANTED,
+                status=ApprovalStatus.APPROVED.value,
+                step_id="s1",
+                payload={"approval_id": str(first_id), "decision": "approve"},
+            )
+            # … and the state the resumed graph left behind: paused again on s2,
+            # settled to AWAITING_APPROVAL with the lease released.
+            await uow.approvals.create_request(
+                id=second_id,
+                run_id=run_id,
+                step_id="s2",
+                tool=ToolName.UPDATE_CUSTOMER,
+                risk=RiskLevel.HIGH,
+                title="Update customer",
+                summary="Change the account owner",
+                payload_preview={"customer_id": "c1"},
+                args_hash="hash-s2",
+                requested_at=clock.now(),
+                expires_at=clock.now() + timedelta(days=1),
+            )
+            await uow.commit()
+
+        service = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="api-004-replayer",
+        )
+        app = create_app(settings=harness_settings(), approval_service=service, clock=clock)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for _ in range(2):
+                resp = await client.post(
+                    f"/approvals/{first_id}/decision",
+                    json={"decision": "approve", "args_hash": "hash-s1"},
+                )
+                assert resp.status_code == 200
+                assert resp.json()["status"] == "approved"
+                assert resp.json()["args_hash"] == "hash-s1"
+
+        assert harness.calls(run_id)["finish"] == 0, "a stale replay resumed the graph"
+        run = await read_run(uow_factory, run_id)
+        assert run.status is RunStatus.AWAITING_APPROVAL
+        assert run.lease_owner is None
+        assert await _approval_status(uow_factory, first_id) is ApprovalStatus.APPROVED
+        assert await _approval_status(uow_factory, second_id) is ApprovalStatus.PENDING
+        assert len(await _approval_events(uow_factory, run_id)) == 1
+
+    async def test_replay_while_another_worker_holds_the_lease_is_a_no_op(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """Over HTTP: the winner is still running under its lease; the replay is
+        200 with the recorded decision and touches neither lease nor graph."""
+        clock = FixedClock(T0)
+        uow_factory = uow_factory_for(engine)
+        run_id = await create_run(uow_factory)
+        harness = Harness()
+        graph = harness.build(checkpointer)
+        approval_id = await _pause_run_for_approval(
+            engine, graph, run_id, clock, step_id="s1", args_hash="hash-s1"
+        )
+        async with uow_factory() as uow:
+            decided = await uow.approvals.decide(
+                approval_id,
+                status=ApprovalStatus.REJECTED,
+                decided_by="operator-1",
+                decision_reason="not this draft",
+                decided_at=clock.now(),
+            )
+            assert decided is not None
+            claimed = await uow.agent_runs.acquire_lease(
+                run_id,
+                owner="live-winner",
+                now=clock.now(),
+                ttl=LEASE.ttl,
+                expected=(RunStatus.AWAITING_APPROVAL,),
+                status=RunStatus.RUNNING,
+            )
+            assert claimed is not None
+            await uow.commit()
+
+        service = ApprovalService(
+            uow_factory=uow_factory,
+            driver=LangGraphRunDriver(graph),
+            clock=clock,
+            lease=LEASE,
+            owner="api-004-replayer",
+        )
+        app = create_app(settings=harness_settings(), approval_service=service, clock=clock)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "reject", "args_hash": "hash-s1", "reason": "retry"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "rejected"
+            assert resp.json()["reason"] == "not this draft"
+
+            # The opposite decision is still a conflict, and still records nothing.
+            flip = await client.post(
+                f"/approvals/{approval_id}/decision",
+                json={"decision": "approve", "args_hash": "hash-s1"},
+            )
+            assert flip.status_code == 409
+            assert flip.json()["code"] == "approval_not_pending"
+
+        assert harness.calls(run_id)["finish"] == 0
+        run = await read_run(uow_factory, run_id)
+        assert run.status is RunStatus.RUNNING
+        assert run.lease_owner == "live-winner"
+        assert await _approval_status(uow_factory, approval_id) is ApprovalStatus.REJECTED
+        assert await _approval_events(uow_factory, run_id) == []

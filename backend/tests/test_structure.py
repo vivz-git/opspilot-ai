@@ -916,6 +916,22 @@ def test_api_layer_is_uninvolved_in_token_minting() -> None:
     assert not offenders, f"API layer touches the token: {offenders}"
 
 
+def test_api_layer_never_writes_approval_rows_or_decision_events() -> None:
+    """§13.5, API-004: a route handler records a human's decision by delegating
+    to `ApprovalService`; it never reaches `ApprovalRepository`'s writers
+    (`decide`, `supersede`, `upsert_request`, `create_request`) nor names an
+    approval trace event, so the conditional update that arbitrates races and
+    the single decision event it justifies cannot be reproduced — or
+    duplicated — from the HTTP layer."""
+    offenders: dict[str, list[str]] = {}
+    for path in python_files(APP / "api"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = [f"{what} at line {line}" for line, what in _approval_mutations(tree)]
+        if found:
+            offenders[_rel(path)] = found
+    assert not offenders, f"API layer mutates approval state directly: {offenders}"
+
+
 def test_node_handlers_accept_no_token_or_gate_injection() -> None:
     """The one issuing path cannot be swapped out from the outside: no
     constructor parameter of `NodeHandlers` or `create_agent_graph` names a

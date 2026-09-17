@@ -1,7 +1,8 @@
 """Human-in-the-loop approval service (§9.6, §12.6, ADR-007, ADR-023).
 
 Coordinates the durable approval decision and graph resumption lifecycle:
-1. Validates caller-supplied `args_hash` matches persisted `approval.args_hash`.
+1. Validates a caller-supplied `args_hash` matches persisted `approval.args_hash`
+   exactly (§13.5: optional, but a mismatch is a stale screen -> superseded).
 2. In a single atomic database transaction:
    - Conditionally transitions approval from PENDING to APPROVED/REJECTED.
    - Claims/transitions the agent run from AWAITING_APPROVAL to RUNNING under worker lease.
@@ -98,7 +99,7 @@ class ApprovalService:
         approval_id: uuid.UUID,
         *,
         decision: ApprovalDecisionKind | str,
-        args_hash: str,
+        args_hash: str | None = None,
         decided_by: str | None = None,
         reason: str | None = None,
         owner: str | None = None,
@@ -125,8 +126,10 @@ class ApprovalService:
             if approval is None:
                 raise NotFoundError(f"Approval {approval_id} not found")
 
-            # 2. Validate exact args_hash binding
-            if approval.args_hash != args_hash:
+            # 2. Validate exact args_hash binding when the caller echoed one (§13.5).
+            #    The authorising binding is the row's own hash against the resolved
+            #    arguments at execute time (§9.5); this check only catches a stale screen.
+            if args_hash is not None and approval.args_hash != args_hash:
                 raise PolicyViolation(
                     f"Approval args_hash mismatch: expected {approval.args_hash}, got {args_hash}",
                     detail={"approval_id": str(approval_id), "step_id": approval.step_id},
@@ -166,13 +169,15 @@ class ApprovalService:
                         },
                     )
 
-                # Same decision: check run state to determine if resume retry is needed
+                # Same decision: check run state to determine if resume retry is needed.
+                # The decision transaction leaves the run RUNNING under the winner's
+                # lease, so RUNNING with a lapsed lease is the only state a crashed
+                # winner can leave behind (HITL-004). AWAITING_APPROVAL means the run
+                # has moved on and is paused on an *undecided* approval: a stale
+                # replay of this one must not resume it with a decision it never had.
                 run = await uow.agent_runs.get(approval.run_id)
-                if run is None or run.status not in (
-                    RunStatus.AWAITING_APPROVAL,
-                    RunStatus.RUNNING,
-                ):
-                    # Run is terminal or not in a leasable status: return idempotent duplicate
+                if run is None or run.status is not RunStatus.RUNNING:
+                    # Terminal, or paused on a later approval: idempotent duplicate
                     await uow.commit()
                     return DecideApprovalResult(approval=approval, is_winner=False, inspection=None)
 
@@ -192,7 +197,7 @@ class ApprovalService:
                     owner=worker_owner,
                     now=now,
                     ttl=self._lease.ttl,
-                    expected=(RunStatus.AWAITING_APPROVAL, RunStatus.RUNNING),
+                    expected=(RunStatus.RUNNING,),
                     status=RunStatus.RUNNING,
                 )
                 if claimed is None:

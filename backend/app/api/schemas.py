@@ -53,7 +53,15 @@ class ApprovalDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: ApprovalDecisionKind
-    args_hash: str = Field(..., min_length=1, max_length=128, description="Canonical SHA-256 hash.")
+    args_hash: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Canonical SHA-256 hash the operator saw (§13.5). Optional but recommended: "
+            "when supplied it must equal the persisted hash exactly, else 409 approval_superseded."
+        ),
+    )
     decided_by: str | None = Field(default=None, max_length=255, description="Client attribution.")
     reason: str | None = Field(default=None, max_length=500, description="Operator reason.")
 
