@@ -19,6 +19,16 @@ from app.evaluation.loader import (
     load_registry,
     load_suites,
 )
+from app.evaluation.metrics import (
+    CaseMetricInput,
+    SuiteRunResult,
+    calculate_agent_duration_ms,
+    calculate_approval_wait_ms,
+    calculate_case_pass_rate,
+    calculate_task_success_rate,
+    compute_evaluation_metrics,
+    compute_evaluation_metrics_from_results,
+)
 from app.evaluation.registry import EvaluationRegistry
 from app.evaluation.schemas import (
     REQUIRED_CASE_IDS,
@@ -34,12 +44,20 @@ __all__ = [
     "DEFAULT_EVALS_ROOT",
     "REQUIRED_CASE_IDS",
     "REQUIRED_SUITES",
+    "CaseMetricInput",
     "EvalCase",
     "EvaluationRegistry",
     "ExpectSpec",
     "FixtureDataset",
     "GivenSpec",
+    "SuiteRunResult",
     "SuitesManifest",
+    "calculate_agent_duration_ms",
+    "calculate_approval_wait_ms",
+    "calculate_case_pass_rate",
+    "calculate_task_success_rate",
+    "compute_evaluation_metrics",
+    "compute_evaluation_metrics_from_results",
     "load_case",
     "load_cases",
     "load_fixtures",

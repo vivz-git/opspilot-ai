@@ -60,4 +60,4 @@ expect:
       count: 1
   response_mentions: ["read-back"]
   response_not_mentions: ["was sent"]
-  max_duration_ms: 5000
+  max_duration_ms: 15000

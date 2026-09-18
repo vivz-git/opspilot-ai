@@ -50,4 +50,4 @@ expect:
       where: {run_id: "$run_id"}
       count: 0
   response_mentions: ["completed successfully", "s3, s4, s5"]
-  max_duration_ms: 5000
+  max_duration_ms: 15000

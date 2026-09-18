@@ -46,6 +46,12 @@ from app.agent.state import (
 )
 from app.config import PlannerMode, Settings
 from app.errors import ConfigurationError, RateLimitedError, TransientToolError
+from app.evaluation.metrics import (
+    SuiteRunResult,
+    calculate_agent_duration_ms,
+    calculate_approval_wait_ms,
+    compute_evaluation_metrics_from_results,
+)
 from app.evaluation.registry import EvaluationRegistry
 from app.evaluation.schemas import (
     RUN_ID_PLACEHOLDER,
@@ -63,10 +69,24 @@ from app.execution.leases import LeaseConfig, new_worker_id
 from app.execution.recovery import LangGraphRunDriver
 from app.execution.runs import RunService
 from app.execution.runtime import build_driver
-from app.persistence.models import AgentRun, ApprovalRow, ToolCallRow, TraceEvent, TraceEventKind
+from app.persistence.models import (
+    AgentRun,
+    ApprovalRow,
+    EvaluationRunStatus,
+    ToolCallRow,
+    TraceEvent,
+    TraceEventKind,
+)
 from app.persistence.protocols import UnitOfWorkFactory
 from app.persistence.session import unit_of_work
-from app.runtime import FixedClock, InMemoryCancellationSource, UuidIdGenerator
+from app.runtime import (
+    Clock,
+    FixedClock,
+    IdGenerator,
+    InMemoryCancellationSource,
+    SystemClock,
+    UuidIdGenerator,
+)
 from app.tools.contracts import ToolName
 from app.tools.registry import (
     ToolContext,
@@ -83,6 +103,7 @@ __all__ = [
     "CaseResult",
     "EvaluationRunner",
     "FailureInjector",
+    "SuiteRunResult",
 ]
 
 #: The frozen wall clock every case starts from (§15.2).
@@ -202,6 +223,8 @@ class CaseResult:
     tool_calls_count: int
     retry_count: int
     approval_outcome: str | None
+    agent_duration_ms: int = 0
+    approval_wait_ms: int = 0
 
     @property
     def failures(self) -> tuple[AssertionOutcome, ...]:
@@ -228,21 +251,56 @@ class EvaluationRunner:
         session_factory: async_sessionmaker[AsyncSession],
         checkpointer: BaseCheckpointSaver[Any],
         registry: EvaluationRegistry,
+        clock: Clock | None = None,
+        ids: IdGenerator | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._uow_factory: UnitOfWorkFactory = partial(unit_of_work, session_factory)
         self._checkpointer = checkpointer
         self._registry = registry
-        self._ids = UuidIdGenerator()
+        self._clock = clock or SystemClock()
+        self._ids = ids or UuidIdGenerator()
 
     async def run_suite(
         self, suite: str, *, evaluation_run_id: uuid.UUID | None = None
-    ) -> list[CaseResult]:
-        return [
-            await self.run_case(case, evaluation_run_id=evaluation_run_id)
-            for case in self._registry.suite_cases(suite)
-        ]
+    ) -> SuiteRunResult:
+        cases = self._registry.suite_cases(suite)
+        if evaluation_run_id is None:
+            async with self._uow_factory() as uow:
+                eval_run = await uow.evaluations.create_run(
+                    suite=suite,
+                    planner_kind=PlannerKind.RULES,
+                )
+                await uow.commit()
+                evaluation_run_id = eval_run.id
+
+        results: list[CaseResult] = []
+        for case in cases:
+            res = await self.run_case(case, evaluation_run_id=evaluation_run_id)
+            results.append(res)
+
+        metrics = compute_evaluation_metrics_from_results(cases, results)
+
+        async with self._uow_factory() as uow:
+            passed_count = sum(1 for r in results if r.passed)
+            failed_count = len(results) - passed_count
+            await uow.evaluations.complete_run(
+                evaluation_run_id,
+                status=EvaluationRunStatus.COMPLETED,
+                finished_at=self._clock.now(),
+                case_count=len(results),
+                passed=passed_count,
+                failed=failed_count,
+                metrics=metrics,
+            )
+            await uow.commit()
+
+        return SuiteRunResult(
+            results,
+            evaluation_run_id=evaluation_run_id,
+            metrics=metrics,
+        )
 
     async def run_case(
         self, case: EvalCase, *, evaluation_run_id: uuid.UUID | None = None
@@ -323,10 +381,42 @@ class EvaluationRunner:
         outcomes.extend(_evaluate(case, evidence, duration_ms))
         outcomes.extend(await self._check_db(case.expect.db, run_id, "db"))
         approvals_rows = evidence.approvals
+
+        approval_wait_ms = calculate_approval_wait_ms(evidence.approvals, run=evidence.run)
+        effective_run_duration_ms = (
+            evidence.run.duration_ms
+            if evidence.run.duration_ms is not None and evidence.run.duration_ms > 0
+            else duration_ms
+        )
+        agent_duration_ms = calculate_agent_duration_ms(effective_run_duration_ms, approval_wait_ms)
+        passed = all(o.passed for o in outcomes)
+
+        if evaluation_run_id is not None:
+            failure_reason = None
+            if not passed:
+                failed_assertion = next((o for o in outcomes if not o.passed), None)
+                failure_reason = failed_assertion.detail if failed_assertion else "assertion_failed"
+            async with self._uow_factory() as uow:
+                await uow.evaluations.record_result(
+                    evaluation_run_id=evaluation_run_id,
+                    case_id=case.id,
+                    run_id=run_id,
+                    passed=passed,
+                    assertions=[
+                        {"name": a.name, "passed": a.passed, "detail": a.detail} for a in outcomes
+                    ],
+                    duration_ms=agent_duration_ms,
+                    retry_count=sum(_retry_counts(evidence.state).values()),
+                    tool_calls_count=len(evidence.tool_calls),
+                    approval_outcome=approvals_rows[-1].status.value if approvals_rows else None,
+                    failure_reason=failure_reason,
+                )
+                await uow.commit()
+
         return CaseResult(
             case_id=case.id,
             run_id=run_id,
-            passed=all(o.passed for o in outcomes),
+            passed=passed,
             assertions=tuple(outcomes),
             duration_ms=duration_ms,
             final_status=run.status,
@@ -334,6 +424,8 @@ class EvaluationRunner:
             tool_calls_count=len(evidence.tool_calls),
             retry_count=sum(_retry_counts(evidence.state).values()),
             approval_outcome=approvals_rows[-1].status.value if approvals_rows else None,
+            agent_duration_ms=agent_duration_ms,
+            approval_wait_ms=approval_wait_ms,
         )
 
     # -- per-case plumbing --------------------------------------------------
