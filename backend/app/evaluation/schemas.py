@@ -416,7 +416,8 @@ class ApprovalExpectation(EvalModel):
 
 
 class ToolOutputExpectation(EvalModel):
-    """Shape checks on a tool's validated output."""
+    """Shape checks on a tool's validated output. Field names are dotted
+    paths into the output (`profile.confidence`)."""
 
     tool: ToolName
     step_id: str | None = Field(default=None, pattern=_STEP_ID_PATTERN)

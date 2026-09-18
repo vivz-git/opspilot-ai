@@ -28,7 +28,7 @@ verification   ██████████████░░░░░░  VER
 api            ███████████░░░░░░░░░  API-001, 002, 003, 007 done; API-004..006 outstanding
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
 frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
-evaluation     ░░░░░░░░░░░░░░░░░░░░  EVAL-001..005
+evaluation     ████████░░░░░░░░░░░░  EVAL-001, 002 done; 003..005 outstanding
 ```
 
 ---
@@ -1731,3 +1731,74 @@ recovery.
 - Start-up reconciliation is the existing query: `awaiting_approval` and terminal runs are never candidates; a live lease is never stolen; a second start finds nothing.
 
 **Test suite:** `tests/test_executor.py` — 24 tests over real PostgreSQL and the real saver. Full suite green (with `DATABASE_URL` at a reachable Postgres); `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check` clean.
+
+## EVAL-002 — the evaluation runner over the real service path — 2026-09-18
+
+`app/evaluation/runner.py` runs a case exactly the way the HTTP API would run
+the same request. `EvaluationRunner.run_case` resets `mock_crm` from the
+case's YAML fixture set, pins `Settings` (rules planner, the case seed, its
+budgets, `tool_failure_rate=0`), composes the production graph through
+`build_driver` — the function `wire_runtime` now calls too, so there is one
+composition root — wraps the real tool bindings in the `FailureInjector`,
+and drives the run through `RunService.create_run` → `start_run` →
+`Executor`. On every pause the `ApprovalPolicy` posts its scripted decision
+through `ApprovalService.decide_approval`: the approval is a real row, the
+token is minted by `execute_tool` from that row, and a `never` policy leaves
+the run `awaiting_approval` with nothing sent (tested). The clock is a
+`FixedClock`; backoff is virtual. Evidence: the run row, the checkpoint
+(`LangGraphRunDriver.state`), `tool_calls`, `approvals`, `trace_events`,
+and `UnitOfWork.count_rows` for `expect.db`. All seven cases pass in ~17 s.
+
+| File | Change |
+|---|---|
+| `app/evaluation/runner.py` | New: `ApprovalPolicy`, `FailureInjector`, `EvaluationRunner`, `CaseResult`/`AssertionOutcome`, the `expect` evaluator |
+| `app/execution/runtime.py` | New: `build_driver`, the graph composition extracted from `wire_runtime`, with an `implementations` override for the injector |
+| `app/api/dependencies.py` | `wire_runtime` delegates the graph to `build_driver`; everything else unchanged |
+| `app/execution/recovery.py` | `LangGraphRunDriver.state(run_id)`: the checkpointed channel values |
+| `app/execution/runs.py` | `create_run(seed=, evaluation_run_id=, eval_case_id=)` populate the columns §12.3 already had |
+| `app/persistence/protocols.py`, `repositories.py` | `UnitOfWork.reset_mock_crm(companies=, leads=, customers=)` (truncate + load plain rows, one transaction) and `UnitOfWork.count_rows(table, where)` (parameterised, `Base.metadata` lookup, `KeyError` on unknown names) |
+| `app/integrations/mock/seed.py` | `reset=True` goes through `uow.reset_mock_crm`; no raw session, no ORM rows for the reset path |
+| `app/agent/normalizer.py` | Lead ids of the CRM's own shape (`L-104`) are extracted; "email it/them" is a send for the draft-outreach intent |
+| `backend/evals/cases/*.yaml` | Corrected against the shipped code (below) |
+| `tests/test_evaluation_runner.py`, `tests/test_evaluation_cases.py` | 12 new tests; the EVAL-001 "no runner yet" pins retired, the declarative check scoped to the definition modules |
+
+**The two EVAL-001 divergences, resolved where they belong.**
+1. *Canonical requests vs `RuleTaskNormalizer`.* `"Draft outreach to lead L-104
+   and email it."` extracted no `lead_id` (the normalizer knew `lead-101` /
+   `lead_202` / `lead 303`, never the CRM's `L-104`) and read no send in
+   "email it" (unlike the lead-search intent, which already counted "email"),
+   so the rule planner fell into the search pipeline and raised before any
+   run existed. Fixed in the normalizer, not in the cases: the id pattern
+   admits `L-<digits>`, and the draft intent's send signals include
+   "email it/them". Existing normalizer tests unchanged and green.
+2. *Fixture seeding vs the ORM boundary.* The only reset took a raw
+   `AsyncSession`, the only seeder lived in `app.integrations.mock` (which
+   nothing outside `app/integrations` may import) and read the Python
+   fixtures, and the runner may not build queries. The boundary is now the
+   `UnitOfWork`: `reset_mock_crm` takes plain rows and `count_rows` answers
+   `expect.db`; `seed.py` and the runner are both callers.
+
+**Case corrections** (the cases were written before the code they assert
+on could be run): `research_company` wraps the enrichment in `profile`, so
+`company_research`'s output paths are dotted (`profile.confidence`); the
+deterministic responder names step ids, not leads, so `response_mentions`
+assert on what §7's `complete` actually says (`"Not done: s6"`,
+`"completed successfully"`); the graph never marks a plan step `failed` —
+a step that lost its read-back stays `running` and the verdict lives in
+`verification_status` — so `invalid_tool_result` asserts attempts, retries
+and the verdict, not a status the lifecycle does not produce;
+the three pause-and-resume cases (`happy_path_multi_step`,
+`approval_required`, `approval_rejected` — six to ten dispatches, every
+checkpoint synchronous) get 15 s of wall clock instead of 5, which a loaded
+machine was missing by tens of milliseconds.
+
+**Findings not changed here.** `ApprovalService.decide_approval` settles a
+finished resume without a terminal trace event (`run_completed` /
+`run_rejected`), where the `Executor` writes one — `stream_run_events`
+closes on the row status instead. Seeded ids were not wired: a seeded
+generator repeats across suite runs and would collide on `agent_runs.id`;
+TEST-005 should normalise ids like timestamps.
+
+**Test suite:** 12 tests in `tests/test_evaluation_runner.py` (real
+PostgreSQL, real saver, production graph); full suite 1679 passed, 1 skipped. `ruff check .`, `ruff format
+--check .`, `mypy app` (strict) and `alembic check` clean.

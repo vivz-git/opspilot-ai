@@ -171,6 +171,13 @@ class LangGraphRunDriver:
         snapshot = await self._graph.aget_state(thread_config(run_id))
         return classify_snapshot(snapshot)
 
+    async def state(self, run_id: uuid.UUID) -> dict[str, Any]:
+        """The checkpointed channel values as last written — `{}` when the
+        thread has no checkpoint. A read of the same checkpoint `inspect`
+        classifies; the evaluation runner's view of plan, retries and results."""
+        snapshot = await self._graph.aget_state(thread_config(run_id))
+        return dict(snapshot.values) if isinstance(snapshot.values, dict) else {}
+
     async def resume(
         self, run_id: uuid.UUID, resume_value: str | None = None
     ) -> CheckpointInspection:

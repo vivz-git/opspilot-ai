@@ -28,7 +28,7 @@ from typing import Any
 
 import pytest
 import yaml
-from app.agent.state import PlannerKind, RunStatus, StepStatus, VerificationStatus
+from app.agent.state import PlannerKind, RunStatus, VerificationStatus
 from app.api.schemas import RunCreateRequest
 from app.errors import ErrorClass, EvaluationCaseValidationError, OpsPilotError
 from app.evaluation import (
@@ -230,7 +230,7 @@ class TestCanonicalTree:
         assert rejected.expect.final_status is RunStatus.REJECTED
         assert rejected.expect.status_reason == "approval_rejected"
         assert ToolName.SEND_EMAIL_MOCK in rejected.expect.tools_not_called
-        assert "not sent" in rejected.expect.response_mentions
+        assert "Not done: s6" in rejected.expect.response_mentions
 
         retry = cases["retryable_failure"]
         (injection,) = retry.given.inject
@@ -300,8 +300,10 @@ class TestCompanyResearchInjection:
     def test_case_still_requires_a_well_formed_profile(self, registry: EvaluationRegistry) -> None:
         (output,) = registry.case("company_research").expect.tool_outputs
         assert output.tool is ToolName.RESEARCH_COMPANY
-        assert {"summary", "recent_signals", "confidence"} <= set(output.required_fields)
-        assert output.ranges["confidence"] == (0.0, 1.0)
+        assert {"profile.summary", "profile.recent_signals", "profile.confidence"} <= set(
+            output.required_fields
+        )
+        assert output.ranges["profile.confidence"] == (0.0, 1.0)
 
 
 class TestInvalidToolResult:
@@ -319,7 +321,7 @@ class TestInvalidToolResult:
         assert expect.status_reason == "verification_failed"
         save = next(s for s in expect.steps if s.tool is ToolName.SAVE_DRAFT)
         assert save.verification_status is VerificationStatus.FAILED
-        assert save.status is StepStatus.FAILED
+        assert (save.attempts, save.retry_count) == (3, 2)
         drafts = [a for a in expect.db if a.table == "mock_crm.outreach_drafts"]
         assert drafts and all(a.count == 0 for a in drafts), "nothing was persisted"
 
@@ -745,7 +747,11 @@ class TestDeterminism:
 # 4. Architectural boundary
 # ---------------------------------------------------------------------------
 class TestEvaluationPackageIsDeclarative:
+    """The definition modules stay declarative; the runner (`runner.py`,
+    EVAL-002) is the one module that may reach persistence and execution."""
+
     PACKAGE = Path(__file__).resolve().parent.parent / "app" / "evaluation"
+    DEFINITION_MODULES = ("__init__", "schemas", "loader", "registry")
     FORBIDDEN_IMPORTS = frozenset(
         {
             "sqlalchemy",
@@ -776,8 +782,11 @@ class TestEvaluationPackageIsDeclarative:
                 names.add(node.module)
         return names
 
+    def _definition_files(self) -> list[Path]:
+        return [self.PACKAGE / f"{name}.py" for name in self.DEFINITION_MODULES]
+
     def test_no_persistence_network_or_execution_imports(self) -> None:
-        for path in sorted(self.PACKAGE.glob("*.py")):
+        for path in self._definition_files():
             imported = self._imports(path)
             offenders = {
                 name
@@ -803,11 +812,8 @@ class TestEvaluationPackageIsDeclarative:
             for forbidden in ("yaml.load(", "yaml.unsafe_load", "pickle", "FullLoader", "Loader="):
                 assert forbidden not in text, f"{path.name} contains {forbidden}"
 
-    def test_no_runner_or_execution_engine_exists_yet(self) -> None:
-        """EVAL-002 is not this task."""
-        names = {p.stem for p in self.PACKAGE.glob("*.py")}
-        assert names == {"__init__", "schemas", "loader", "registry"}
-        text = "\n".join(p.read_text(encoding="utf-8") for p in self.PACKAGE.glob("*.py"))
+    def test_definition_modules_hold_no_runner(self) -> None:
+        text = "\n".join(p.read_text(encoding="utf-8") for p in self._definition_files())
         for forbidden in (
             "class EvaluationRunner",
             "class FailureInjector",

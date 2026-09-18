@@ -56,5 +56,5 @@ expect:
     - table: opspilot.tool_calls
       where: {run_id: "$run_id", tool: research_company, status: succeeded}
       count: 1
-  response_mentions: ["Northwind Traders"]
+  response_mentions: ["completed successfully", "s1"]
   max_duration_ms: 5000

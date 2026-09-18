@@ -97,7 +97,9 @@ _LOCATIONS: dict[str, str] = {
 }
 
 _EMAIL_PATTERN = re.compile(r"\b([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b")
-_LEAD_ID_PATTERN = re.compile(r"\b(lead[-_][a-zA-Z0-9_-]+)\b", re.IGNORECASE)
+#: `L-104` is the CRM's own lead id shape (`mock_crm.leads`, TOOL-001); the
+#: `lead-…`/`lead_…` forms are the spoken ones.
+_LEAD_ID_PATTERN = re.compile(r"\b(lead[-_][a-zA-Z0-9_-]+|(?-i:L-[0-9]+))\b", re.IGNORECASE)
 _LEAD_NUM_PATTERN = re.compile(r"\blead\s+(?:id\s+)?(?:#|is\s+)?(\d+)\b", re.IGNORECASE)
 
 _COMPANY_ID_PATTERN = re.compile(
@@ -360,7 +362,9 @@ class RuleTaskNormalizer:
 
         # D. Draft outreach
         if has_outreach and not has_search:
-            requires_mut = any(w in lower for w in ("send", "save", "persist"))
+            requires_mut = any(
+                w in lower for w in ("send", "save", "persist", "email it", "email them")
+            )
             return NormalizedTask(
                 intent=CanonicalIntent.DRAFT_OUTREACH,
                 entities=entities,

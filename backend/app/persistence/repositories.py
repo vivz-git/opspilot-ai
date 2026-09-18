@@ -8,7 +8,7 @@ construction escapes this module.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import joinedload
 
 from app.agent.state import ApprovalStatus, PlannerKind, RunStatus, StepStatus, VerificationStatus
+from app.persistence.base import Base
 from app.persistence.mock_crm import (
     Company,
     Customer,
@@ -30,6 +31,7 @@ from app.persistence.mock_crm import (
     LeadStatus,
     OutreachDraft,
     OutreachDraftStatus,
+    reset_mock_crm,
 )
 from app.persistence.models import (
     AgentRun,
@@ -1522,6 +1524,31 @@ class SqlUnitOfWork:
         self.outreach_drafts = SqlOutreachDraftRepository(self._session)
         self.email_outbox = SqlEmailOutboxRepository(self._session)
         return self
+
+    async def reset_mock_crm(
+        self,
+        *,
+        companies: Iterable[Mapping[str, Any]] = (),
+        leads: Iterable[Mapping[str, Any]] = (),
+        customers: Iterable[Mapping[str, Any]] = (),
+    ) -> None:
+        if self._session is None:
+            raise RuntimeError("UnitOfWork transaction is not active")
+        await reset_mock_crm(self._session)
+        self._session.add_all([Company(**dict(row)) for row in companies])
+        await self._session.flush()
+        self._session.add_all([Lead(**dict(row)) for row in leads])
+        self._session.add_all([Customer(**dict(row)) for row in customers])
+        await self._session.flush()
+
+    async def count_rows(self, table: str, where: Mapping[str, Any]) -> int:
+        if self._session is None:
+            raise RuntimeError("UnitOfWork transaction is not active")
+        mapped = Base.metadata.tables[table]
+        stmt = select(sa.func.count()).select_from(mapped)
+        for column, value in where.items():
+            stmt = stmt.where(mapped.c[column] == value)
+        return int((await self._session.execute(stmt)).scalar_one())
 
     async def commit(self) -> None:
         if self._session is None:

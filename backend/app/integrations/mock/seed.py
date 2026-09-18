@@ -19,7 +19,7 @@ from app.integrations.mock.fixtures import (
     CUSTOMER_FIXTURES,
     LEAD_FIXTURES,
 )
-from app.persistence.mock_crm import Company, Customer, Lead, reset_mock_crm
+from app.persistence.mock_crm import Company, Customer, Lead
 from app.persistence.session import create_session_factory, unit_of_work
 
 __all__ = ["seed_database"]
@@ -41,9 +41,16 @@ async def seed_database(
         Dictionary containing counts of inserted/loaded records by table.
     """
     if reset:
-        async with session_factory() as session:
-            await reset_mock_crm(session)
-            await session.commit()
+        async with unit_of_work(session_factory) as uow:
+            await uow.reset_mock_crm(
+                companies=COMPANY_FIXTURES, leads=LEAD_FIXTURES, customers=CUSTOMER_FIXTURES
+            )
+            await uow.commit()
+        return {
+            "companies": len(COMPANY_FIXTURES),
+            "leads": len(LEAD_FIXTURES),
+            "customers": len(CUSTOMER_FIXTURES),
+        }
 
     companies_seeded = 0
     leads_seeded = 0
@@ -53,10 +60,9 @@ async def seed_database(
         # 1. Companies
         for comp_data in COMPANY_FIXTURES:
             comp_id = str(comp_data["company_id"])
-            if not reset:
-                existing_comp = await uow.companies.get(comp_id)
-                if existing_comp is not None:
-                    continue
+            existing_comp = await uow.companies.get(comp_id)
+            if existing_comp is not None:
+                continue
             comp = Company(**comp_data)
             await uow.companies.create(comp)
             companies_seeded += 1
@@ -64,10 +70,9 @@ async def seed_database(
         # 2. Leads (depend on companies)
         for lead_data in LEAD_FIXTURES:
             lead_id = str(lead_data["lead_id"])
-            if not reset:
-                existing_lead = await uow.leads.get(lead_id)
-                if existing_lead is not None:
-                    continue
+            existing_lead = await uow.leads.get(lead_id)
+            if existing_lead is not None:
+                continue
             lead = Lead(**lead_data)
             await uow.leads.create(lead)
             leads_seeded += 1
@@ -75,10 +80,9 @@ async def seed_database(
         # 3. Customers
         for cust_data in CUSTOMER_FIXTURES:
             cust_id = str(cust_data["customer_id"])
-            if not reset:
-                existing_cust = await uow.customers.get(cust_id)
-                if existing_cust is not None:
-                    continue
+            existing_cust = await uow.customers.get(cust_id)
+            if existing_cust is not None:
+                continue
             cust = Customer(**cust_data)
             await uow.customers.create(cust)
             customers_seeded += 1

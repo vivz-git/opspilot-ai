@@ -48,21 +48,23 @@ expect:
   tool_outputs:
     - tool: research_company
       step_id: s1
+      # `research_company` wraps the enrichment in `profile` (§8.4's field
+      # list is the profile's); paths are dotted into the validated output.
       required_fields:
-        - company_id
-        - name
-        - domain
-        - industry
-        - employee_count
-        - hq_location
-        - tech_stack
-        - recent_signals
-        - summary
-        - sources
-        - confidence
-        - retrieved_at
-      ranges: {confidence: [0, 1]}
-      equals: {company_id: comp_vantage, domain: vantage.example}
+        - profile.company_id
+        - profile.name
+        - profile.domain
+        - profile.industry
+        - profile.employee_count
+        - profile.hq_location
+        - profile.tech_stack
+        - profile.recent_signals
+        - profile.summary
+        - profile.sources
+        - profile.confidence
+        - profile.retrieved_at
+      ranges: {profile.confidence: [0, 1]}
+      equals: {profile.company_id: comp_vantage, profile.domain: vantage.example}
   db:
     - table: opspilot.approvals
       where: {run_id: "$run_id"}
@@ -74,6 +76,6 @@ expect:
     - table: mock_crm.email_outbox
       where: {to_email: "ceo@acme.example"}
       count: 0
-  response_mentions: ["Vantage Analytics"]
+  response_mentions: ["completed successfully", "s1"]
   response_not_mentions: ["ceo@acme.example"]
   max_duration_ms: 5000

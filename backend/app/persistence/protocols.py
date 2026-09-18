@@ -9,7 +9,7 @@ sessions or ORM query construction.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -856,6 +856,26 @@ class UnitOfWork(Protocol):
 
     @property
     def email_outbox(self) -> EmailOutboxRepository: ...
+
+    async def reset_mock_crm(
+        self,
+        *,
+        companies: Iterable[Mapping[str, Any]] = (),
+        leads: Iterable[Mapping[str, Any]] = (),
+        customers: Iterable[Mapping[str, Any]] = (),
+    ) -> None:
+        """Truncate every `mock_crm` table and load the given rows (plain
+        column mappings), all inside this transaction. The one seeding path
+        for `make seed` and for the evaluation runner's per-case reset (§15.2),
+        so neither builds ORM rows or holds a session."""
+        ...
+
+    async def count_rows(self, table: str, where: Mapping[str, Any]) -> int:
+        """`SELECT count(*)` over one mapped table, named `schema.table`, with
+        column-equality filters — parameterised, never interpolated. Unknown
+        table or column raises `KeyError`. The evaluation runner's read path
+        for `expect.db` (§15.3); nothing above persistence builds the query."""
+        ...
 
     async def __aenter__(self) -> Self: ...
 

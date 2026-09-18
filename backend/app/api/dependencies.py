@@ -19,7 +19,6 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.graph import create_agent_graph
-from app.agent.planner.factory import build_planner
 from app.config import Settings
 from app.errors import PolicyViolation
 from app.execution.approvals import ApprovalService
@@ -27,20 +26,18 @@ from app.execution.executor import Executor
 from app.execution.leases import LeaseConfig, new_worker_id
 from app.execution.recovery import LangGraphRunDriver, Reconciler, RunDriver
 from app.execution.runs import RunService
-from app.integrations import build_adapters
+from app.execution.runtime import build_driver
 from app.persistence.protocols import UnitOfWorkFactory
 from app.persistence.repositories import SqlUnitOfWork
 from app.persistence.session import create_session_factory
 from app.runtime import (
     CancellationSource,
     Clock,
-    DeterministicRandom,
     IdGenerator,
     InMemoryCancellationSource,
     SystemClock,
     UuidIdGenerator,
 )
-from app.tools.registry import ToolRegistry
 
 __all__ = [
     "get_approval_service",
@@ -94,28 +91,15 @@ def wire_runtime(app: FastAPI, *, checkpointer: BaseCheckpointSaver[Any]) -> Non
 
     driver: RunDriver | None = getattr(app.state, "run_driver", None)
     if driver is None:
-        adapters = build_adapters(
+        driver = build_driver(
             settings,
-            _session_factory(app),
-            clock,
-            ids,
-            DeterministicRandom(settings.seed),
-            failure_rate=settings.tool_failure_rate,
-        )
-        graph = create_agent_graph(
-            checkpointer,
-            registry=ToolRegistry(adapters=adapters, uow_factory=uow_factory, clock=clock),
+            session_factory=_session_factory(app),
             uow_factory=uow_factory,
+            checkpointer=checkpointer,
             clock=clock,
-            id_gen=ids,
-            planner=build_planner(settings),
-            retry_base_delay_ms=settings.retry_base_delay_ms,
-            retry_max_delay_ms=settings.retry_max_delay_ms,
-            seeded_random=DeterministicRandom(settings.seed),
+            ids=ids,
             cancellation_source=cancellation_source,
-            approval_ttl=settings.approval_ttl,
         )
-        driver = LangGraphRunDriver(graph)
         app.state.run_driver = driver
 
     executor: Executor | None = getattr(app.state, "executor", None)

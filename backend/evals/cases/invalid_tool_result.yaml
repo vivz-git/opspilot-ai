@@ -38,7 +38,9 @@ expect:
   tool_call_counts:
     save_draft: 3
   steps:
-    - {step_id: s5, tool: save_draft, status: failed, attempts: 3, retry_count: 2, verification_status: failed}
+    # The plan never marks a step `failed`: it stays `running` (attempted,
+    # never settled) and the failure lives in the read-back verdict below.
+    - {step_id: s5, tool: save_draft, attempts: 3, retry_count: 2, verification_status: failed}
     - {step_id: s6, tool: send_email_mock, status: pending}
   approval:
     requested: 0

@@ -129,6 +129,9 @@ class RunService:
         auto_start: bool = False,
         planner_kind: PlannerKind | None = None,
         actor_id: str | None = None,
+        seed: int | None = None,
+        evaluation_run_id: uuid.UUID | None = None,
+        eval_case_id: str | None = None,
     ) -> RunCreateResult:
         """Create a new durable run or return the existing run on idempotent replay."""
         clean_request = user_request.strip()
@@ -176,6 +179,9 @@ class RunService:
                 status=initial_status,
                 idempotency_key=idempotency_key,
                 actor_id=actor_id,
+                seed=seed,
+                evaluation_run_id=evaluation_run_id,
+                eval_case_id=eval_case_id,
                 metadata=metadata or {},
             )
 

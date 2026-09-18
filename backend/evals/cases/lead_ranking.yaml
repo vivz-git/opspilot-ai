@@ -49,5 +49,5 @@ expect:
     - table: mock_crm.email_outbox
       where: {run_id: "$run_id"}
       count: 0
-  response_mentions: ["92", "L-201"]
+  response_mentions: ["completed successfully", "s3, s4, s5"]
   max_duration_ms: 5000

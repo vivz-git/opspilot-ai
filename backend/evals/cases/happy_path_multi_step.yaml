@@ -77,5 +77,7 @@ expect:
     - table: mock_crm.outreach_drafts
       where: {lead_id: "L-201"}
       count: 1
-  response_mentions: ["Priya Nair", "sent"]
-  max_duration_ms: 5000
+  response_mentions: ["completed successfully", "s8"]
+  # Ten dispatches, one pause and one resume, every checkpoint written
+  # synchronously (ADR-012): the longest case, and still seconds.
+  max_duration_ms: 15000

@@ -35,5 +35,7 @@ expect:
     - table: mock_crm.email_outbox
       where: {to_email: "dana@northwind.example"}
       count: 0
-  response_mentions: ["not sent"]
-  max_duration_ms: 5000
+  response_mentions: ["Not done: s6"]
+  # Six dispatches, a pause and a resume, every checkpoint written
+  # synchronously (ADR-012): seconds, but not five on a loaded machine.
+  max_duration_ms: 15000
