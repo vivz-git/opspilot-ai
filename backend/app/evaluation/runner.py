@@ -9,7 +9,8 @@
         while the run is awaiting_approval:
             ApprovalPolicy posts a real decision through ApprovalService
         read the run row, the checkpoint, tool_calls, approvals, trace
-        evaluate the case's `expect` → CaseResult
+        evaluate the case's `expect`, then the seven §15.6 invariants over
+            the persisted rows (`app.evaluation.invariants`) → CaseResult
 
 Two rules from §15.5 hold by construction. The suite calls the same
 services the HTTP API calls (`RunService`, `Executor`, `ApprovalService`)
@@ -46,6 +47,7 @@ from app.agent.state import (
 )
 from app.config import PlannerMode, Settings
 from app.errors import ConfigurationError, RateLimitedError, TransientToolError
+from app.evaluation.invariants import InvariantEvidence, InvariantOutcome, evaluate_invariants
 from app.evaluation.metrics import (
     SuiteRunResult,
     calculate_agent_duration_ms,
@@ -57,6 +59,7 @@ from app.evaluation.schemas import (
     RUN_ID_PLACEHOLDER,
     ApprovalPolicyKind,
     ApprovalsSpec,
+    CustomerFixture,
     DbAssertion,
     EvalCase,
     FailureInjection,
@@ -103,6 +106,7 @@ __all__ = [
     "CaseResult",
     "EvaluationRunner",
     "FailureInjector",
+    "InvariantOutcome",
     "SuiteRunResult",
 ]
 
@@ -225,10 +229,17 @@ class CaseResult:
     approval_outcome: str | None
     agent_duration_ms: int = 0
     approval_wait_ms: int = 0
+    #: The seven §15.6 invariants (EVAL-004). `passed` is false if any failed,
+    #: whatever `assertions` say.
+    invariants: tuple[InvariantOutcome, ...] = ()
 
     @property
     def failures(self) -> tuple[AssertionOutcome, ...]:
         return tuple(a for a in self.assertions if not a.passed)
+
+    @property
+    def violations(self) -> tuple[InvariantOutcome, ...]:
+        return tuple(i for i in self.invariants if not i.passed)
 
 
 @dataclass(frozen=True)
@@ -380,6 +391,7 @@ class EvaluationRunner:
         duration_ms = int((time.monotonic() - started) * 1000)
         outcomes.extend(_evaluate(case, evidence, duration_ms))
         outcomes.extend(await self._check_db(case.expect.db, run_id, "db"))
+        invariants = await self.check_invariants(case, run_id)
         approvals_rows = evidence.approvals
 
         approval_wait_ms = calculate_approval_wait_ms(evidence.approvals, run=evidence.run)
@@ -389,13 +401,17 @@ class EvaluationRunner:
             else duration_ms
         )
         agent_duration_ms = calculate_agent_duration_ms(effective_run_duration_ms, approval_wait_ms)
-        passed = all(o.passed for o in outcomes)
+        passed = all(o.passed for o in outcomes) and all(i.passed for i in invariants)
 
         if evaluation_run_id is not None:
             failure_reason = None
             if not passed:
-                failed_assertion = next((o for o in outcomes if not o.passed), None)
-                failure_reason = failed_assertion.detail if failed_assertion else "assertion_failed"
+                # A violated invariant outranks a failed case assertion.
+                failed: list[AssertionOutcome | InvariantOutcome] = [
+                    *(i for i in invariants if not i.passed),
+                    *(o for o in outcomes if not o.passed),
+                ]
+                failure_reason = failed[0].detail if failed else "assertion_failed"
             async with self._uow_factory() as uow:
                 await uow.evaluations.record_result(
                     evaluation_run_id=evaluation_run_id,
@@ -403,7 +419,20 @@ class EvaluationRunner:
                     run_id=run_id,
                     passed=passed,
                     assertions=[
-                        {"name": a.name, "passed": a.passed, "detail": a.detail} for a in outcomes
+                        *(
+                            {"name": a.name, "passed": a.passed, "detail": a.detail}
+                            for a in outcomes
+                        ),
+                        *(
+                            {
+                                "name": f"invariant[{i.invariant}] {i.name}",
+                                "passed": i.passed,
+                                "detail": i.detail,
+                                "invariant": i.invariant,
+                                "evidence": i.evidence,
+                            }
+                            for i in invariants
+                        ),
                     ],
                     duration_ms=agent_duration_ms,
                     retry_count=sum(_retry_counts(evidence.state).values()),
@@ -426,7 +455,43 @@ class EvaluationRunner:
             approval_outcome=approvals_rows[-1].status.value if approvals_rows else None,
             agent_duration_ms=agent_duration_ms,
             approval_wait_ms=approval_wait_ms,
+            invariants=invariants,
         )
+
+    async def check_invariants(
+        self, case: EvalCase, run_id: uuid.UUID
+    ) -> tuple[InvariantOutcome, ...]:
+        """The seven §15.6 invariants over what `run_id` left in PostgreSQL
+        (EVAL-004). Reads only persisted rows — never the checkpoint — so it
+        can be re-run against any stored evaluation run."""
+        budgets = case.given.budgets or self._settings.budgets
+        # By table name, as `_reset_fixtures` does: fixture data, not a port.
+        dataset = dict(self._registry.fixture_set(case.given.fixtures))
+        seeded: Sequence[CustomerFixture] = dataset["customers"]
+        run = await self._read_run(run_id)
+        async with self._uow_factory() as uow:
+            customers = [
+                row
+                for fixture in seeded
+                if (row := await uow.customers.get(fixture.customer_id)) is not None
+            ]
+            evidence = InvariantEvidence(
+                run=run,
+                tool_calls=await uow.tool_calls.list_by_run(run_id),
+                approvals=await uow.approvals.list_by_run(run_id),
+                events=await uow.trace_events.list_by_run(run_id, limit=10_000),
+                steps=await uow.execution_steps.list_by_run(run_id),
+                outbox=await uow.email_outbox.list_by_run(str(run_id)),
+                outbox_total=await uow.count_rows("mock_crm.email_outbox", {}),
+                customer_rows=customers,
+                customers_total=await uow.count_rows("mock_crm.customers", {}),
+                seeded_customers=seeded,
+                max_retries=budgets.max_retries,
+                max_steps=budgets.max_steps,
+                policy_violation_expected=case.expect.policy_violation_expected,
+            )
+            await uow.commit()
+        return evaluate_invariants(evidence)
 
     # -- per-case plumbing --------------------------------------------------
     def _pinned_settings(self, case: EvalCase) -> Settings:

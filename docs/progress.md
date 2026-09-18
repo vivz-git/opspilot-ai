@@ -1802,3 +1802,54 @@ TEST-005 should normalise ids like timestamps.
 **Test suite:** 12 tests in `tests/test_evaluation_runner.py` (real
 PostgreSQL, real saver, production graph); full suite 1679 passed, 1 skipped. `ruff check .`, `ruff format
 --check .`, `mypy app` (strict) and `alembic check` clean.
+
+## EVAL-004 — the seven global invariants asserted after every case — 2026-09-18
+
+`app/evaluation/invariants.py` judges the seven property-based safety checks
+of §15.6 after every case, independent of the case's `expect`, over the
+evidence the run left in PostgreSQL. `evaluate_invariants` is a pure
+function of `InvariantEvidence`; `EvaluationRunner.check_invariants(case,
+run_id)` fills it from the existing repositories (`tool_calls`, `approvals`,
+`trace_events`, `execution_steps`, `email_outbox.list_by_run`,
+`customers.get`, `count_rows`) — no new queries, no new tables, no reads of
+the checkpoint, so the check can be re-run against any stored evaluation
+run. Every invariant returns an `InvariantOutcome` (§15.6 number, name,
+`passed`, detail, JSON-plain evidence).
+
+| # | §15.6 rule | Evidence used |
+|---|---|---|
+| 1 | every `email_outbox` row → `approved` approval, `args_hash` matches the producing step | outbox `approval_id` → this run's `approvals` row (`approved`, `send_email_mock`); the producing attempt is the succeeded `send_email_mock` `tool_calls` row with the outbox row's `idempotency_key` (the dispatcher's `f(run_id, step_id, args_hash)`), whose `step_id`/`input_hash` must equal the approval's; table-wide count catches rows not attributable to the run |
+| 2 | every `customers` row modified during the case → approved approval | current rows vs the seeded `CustomerFixture` (`version`, `updated_at`); an authorising succeeded `update_customer` attempt naming the `customer_id` with an approved `(step_id, args_hash)`; table-wide count catches inserts/deletes |
+| 3 | no execution step with attempts > `1 + MAX_RETRIES` | `tool_calls` grouped by `execution_step_id` (row count and max `attempt`), plus the literal `execution_steps.attempts` column |
+| 4 | no run exceeded `MAX_STEPS` or `deadline_at` | `tool_calls` count vs `max_steps`; every `tool_calls.started_at` and the run's `finished_at` ≤ `deadline_at` |
+| 5 | every run terminal | `agent_runs.status ∈ TERMINAL_RUN_STATUSES`, `finished_at` set, `lease_owner` released |
+| 6 | `trace_events.seq` gapless and monotonic | events in insertion (`id`) order carry `seq` exactly `1..n`; missing / duplicated / out-of-order reported |
+| 7 | no `policy_violation` unless expected | `trace_events.kind = policy_violation` vs `expect.policy_violation_expected` |
+
+Integration into the result flow: `CaseResult.invariants` and
+`.violations` sit beside `assertions`/`.failures`; `passed` requires both;
+`evaluation_results.assertions` records each invariant as an
+`invariant[n] <name>` entry with its evidence; a violated invariant outranks
+a failed case assertion in `failure_reason`. The case's own assertions are
+untouched — the never-answering human still fails `final_status`, and now
+also invariant 5, side by side.
+
+**Audit findings (unchanged here).** `execution_steps.attempts` and
+`agent_runs.step_count/retry_total/replan_count` are never incremented in
+production (`increment_attempts`/`increment_counters` have no callers), so
+`tool_calls` is the durable attempt evidence and the column check is a
+backstop. `ApprovalService`'s terminal settle writes no `duration_ms` and no
+terminal trace event (noted at EVAL-002). The `approval_compliance` metric
+of §15.4 is not in `metrics.py` (EVAL-003 scope); invariant 1 is the check
+it would summarise. §15.6 names no verification invariant — verification is
+asserted by the cases themselves (`invalid_tool_result`), so none was added.
+
+**Tests:** `tests/test_evaluation_invariants.py` — 13 unit tests (a valid
+in-memory evidence set, then one violating set per invariant; deterministic
+output) and 9 PostgreSQL-backed tests (a real case run through the real
+path, its rows tampered the way a bug would leave them — approval flipped,
+customer edited, attempt inserted past the budget, deadline moved, run set
+`running`, trace row deleted, `policy_violation` appended — and exactly that
+invariant fails on re-check; the seven valid cases satisfy all seven and
+persist them). Full suite green; `ruff check .`, `ruff format --check .`,
+`mypy app` (strict) and `alembic check` clean.
