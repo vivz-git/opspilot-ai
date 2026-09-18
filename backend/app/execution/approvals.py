@@ -340,6 +340,7 @@ class ApprovalService:
                     owner=worker_owner,
                     status_reason=inspection.status_reason,
                     finished_at=self._clock.now(),
+                    final_response=inspection.final_response,
                     release_lease=True,
                 )
                 await uow.commit()

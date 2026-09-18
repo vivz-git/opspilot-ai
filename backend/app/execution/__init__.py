@@ -6,11 +6,13 @@ what happens when that process dies.
 them from their LangGraph checkpoint, repairs them to `awaiting_approval`,
 or marks them `failed(orphaned)`.
 
-API-007's `Executor` composes these; nothing here starts a graph on its
-own.
+`executor` — API-007's `Executor`, which composes the two: it owns the
+background task that drives one run under a lease and settles the row from
+the checkpoint when the graph stops.
 """
 
 from app.execution.approvals import ApprovalService, DecideApprovalResult
+from app.execution.executor import ExecutionOutcome, Executor
 from app.execution.leases import (
     LeaseConfig,
     LeaseHeartbeat,
@@ -38,6 +40,8 @@ __all__ = [
     "CheckpointInspection",
     "CheckpointPhase",
     "DecideApprovalResult",
+    "ExecutionOutcome",
+    "Executor",
     "LangGraphRunDriver",
     "LeaseConfig",
     "LeaseHeartbeat",

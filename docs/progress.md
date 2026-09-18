@@ -25,7 +25,7 @@ tools          ██████████░░░░░░░░░░  TOO
 agent graph    ████████████████████  AGENT-001..009 complete
 hitl           ████████████████████  HITL-001..005 complete
 verification   ██████████████░░░░░░  VERIFY-001..002 complete; VERIFY-003 outstanding
-api            ░░░░░░░░░░░░░░░░░░░░  API-001..007
+api            ███████████░░░░░░░░░  API-001, 002, 003, 007 done; API-004..006 outstanding
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
 frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
 evaluation     ░░░░░░░░░░░░░░░░░░░░  EVAL-001..005
@@ -1702,3 +1702,32 @@ The API layer exposes OpsPilot's existing durable audit/trace system through saf
 
 **Test suite: 148 passed, 0 failures** (including 35 trace unit/integration tests and 49 structural tests).
 `ruff check app tests`, `ruff format --check app tests`, `mypy app` (strict, 76 source files) and `alembic check` are clean.
+
+## API-007 — `RunService` + `Executor`: lifecycle ownership, background execution, lease heartbeat, reconcile on startup — 2026-09-18
+
+The run lifecycle (§5.4) now has an owner. `POST /runs/{id}/start` performs
+the durable `created → queued` transition and returns `202` before anything
+else happens; the `Executor` (§2.4, ADR-004) drives the graph in a
+background `asyncio` task under a DB-007 lease and settles the row from the
+checkpoint when the graph stops. Nothing in DB-007 was rewritten: the
+executor is one more caller of `hold_lease`, `LeaseHeartbeat` and the
+conditional `transition_status`, and the `Reconciler` stays the crash
+recovery.
+
+| File | Role | Tests |
+|---|---|---|
+| `app/execution/executor.py` | New. `Executor.schedule(run_id)` (idempotent per process), `execute` (`hold_lease(expected=(queued,))` → `queued → running` under the lease → the graph task raced against `heartbeat.lost` → settle), `shutdown` (cancel in-flight tasks; `hold_lease` releases each lease so the reconciler resumes the rows at the next start). `ExecutionOutcome`, `REASON_EXECUTION_FAILED`. | `tests/test_executor.py` |
+| `app/execution/runs.py` | `RunService(executor=…)`; `_schedule` after every committed transition into `queued` (`start_run`, `create_run(auto_start)`, `retry_run(auto_start)`). Without an executor the service is control plane only, as before. | `tests/test_executor.py`, existing run tests |
+| `app/execution/recovery.py` | `RunDriver.start` / `LangGraphRunDriver.start` (first entry with the initial state, `durability="sync"`); `CheckpointInspection.final_response` read off the finished checkpoint; `Reconciler.reconcile_all` (a bounded paged drain of `reconcile_once`, so a start-up finds every orphan, not the first 50). | `tests/test_executor.py`, `tests/test_recovery.py` |
+| `app/persistence/protocols.py`, `repositories.py` | `transition_status(final_response=…)`: the operator-facing answer lands in the same conditional `UPDATE` as the terminal status — used by the executor, the reconciler (`_settle_finished`) and `ApprovalService` (step 11). | `tests/test_executor.py` |
+| `app/api/dependencies.py` | `wire_runtime`: the composition root. `build_adapters` → `ToolRegistry` → `build_planner` → `create_agent_graph` with the saver, the shared `Clock`/`IdGenerator`/`CancellationSource` and `Settings` budgets → `LangGraphRunDriver` → `Executor`, `RunService`, `ApprovalService`, `Reconciler`; each worker gets its own `new_worker_id` label. Anything injected through `create_app` is kept. | `tests/test_executor.py` |
+| `app/main.py` | Lifespan: `open_checkpointer` → `wire_runtime` → `Reconciler.reconcile_all()` (logged as `reconciled_on_startup`); `Executor.shutdown()` then engine dispose on exit. No database at start-up → `runtime_unavailable` warning, control-plane-only boot, `/readyz` says why. | `tests/test_executor.py`, `tests/test_health.py` |
+
+**Behaviour, precisely.**
+- A pause is not a live worker: on `interrupt()` the graph call returns, the row becomes `awaiting_approval` with the lease released in the same statement, and the task ends. The resume is `ApprovalService.decide_approval`'s existing transaction, which re-acquires ownership under its own worker id — one resume path.
+- Fencing: a refused heartbeat cancels the graph task at once and settles nothing; every settling write is guarded by `status = running AND lease_owner = me`, so a run cancelled or reclaimed meanwhile is never overwritten.
+- Cancellation stays cooperative: `cancel_run` flags the `CancellationSource` the nodes share; the in-flight effect finishes, the graph exits via `fail(cancelled)`, and the already-`cancelled` row is left as the operator set it.
+- Terminal settle writes `status`, `status_reason`, `finished_at`, `duration_ms`, `final_response` and one of `run_completed` / `run_failed` / `run_rejected`; a graph that raised is `failed(execution_failed)` with the error in the `run_failed` event.
+- Start-up reconciliation is the existing query: `awaiting_approval` and terminal runs are never candidates; a live lease is never stolen; a second start finds nothing.
+
+**Test suite:** `tests/test_executor.py` — 24 tests over real PostgreSQL and the real saver. Full suite green (with `DATABASE_URL` at a reachable Postgres); `ruff check .`, `ruff format --check .`, `mypy app` (strict) and `alembic check` clean.

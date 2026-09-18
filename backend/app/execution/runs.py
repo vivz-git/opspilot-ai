@@ -2,6 +2,8 @@
 
 Coordinates durable run creation, idempotency validation, trace recording,
 and run detail retrieval without bypassing DB-007 persistence or worker leases.
+Every transition into `queued` hands the run to the `Executor` (API-007),
+which owns execution from there; this service never drives the graph itself.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from app.errors import (
     RunNotCancellableError,
     RunNotStartableError,
 )
+from app.execution.executor import Executor
 from app.persistence.models import (
     AgentRun,
     ApprovalRow,
@@ -99,12 +102,23 @@ class RunService:
         clock: Clock | None = None,
         ids: IdGenerator | None = None,
         cancellation_source: CancellationSource | None = None,
+        executor: Executor | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._settings = settings
         self._clock = clock or SystemClock()
         self._ids = ids or UuidIdGenerator()
         self._cancellation_source = cancellation_source or InMemoryCancellationSource()
+        #: Drives `queued` runs in the background (API-007). Without one this
+        #: service is control plane only: runs queue and nothing executes.
+        self._executor = executor
+
+    def _schedule(self, run: AgentRun) -> None:
+        """Hand a run that just became `queued` to the executor. The durable
+        transition is already committed, so the caller's response never
+        waits on the graph (§13.2: `202 Accepted`)."""
+        if self._executor is not None and run.status is RunStatus.QUEUED:
+            self._executor.schedule(run.id)
 
     async def create_run(
         self,
@@ -191,6 +205,7 @@ class RunService:
             status=initial_status.value,
             idempotency_key=idempotency_key,
         )
+        self._schedule(run)
         return RunCreateResult(run=run, is_duplicate=False)
 
     async def get_run(self, run_id: uuid.UUID) -> AgentRun | None:
@@ -295,8 +310,9 @@ class RunService:
                 payload={"started_at": now.isoformat()},
             )
             await uow.commit()
-            _log.info("run_started", run_id=str(run_id))
-            return updated
+        _log.info("run_started", run_id=str(run_id))
+        self._schedule(updated)
+        return updated
 
     async def cancel_run(self, run_id: uuid.UUID, *, reason: str | None = None) -> AgentRun:
         """Cooperatively cancel an active or non-terminal run (§13.2)."""
@@ -450,6 +466,7 @@ class RunService:
             new_run_id=str(new_run.id),
             status=initial_status.value,
         )
+        self._schedule(new_run)
         return RunCreateResult(run=new_run, is_duplicate=False)
 
     async def verify_run_exists(self, run_id: uuid.UUID) -> None:

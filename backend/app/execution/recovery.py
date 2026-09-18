@@ -81,6 +81,7 @@ from typing import Any, Protocol
 import structlog
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
+from pydantic import BaseModel
 
 from app.agent.state import (
     TERMINAL_RUN_STATUSES,
@@ -130,10 +131,19 @@ class CheckpointInspection:
     status: RunStatus | None = None
     status_reason: str | None = None
     step_id: str | None = None
+    #: The `final_response` channel of a finished checkpoint, JSON-shaped, so
+    #: whoever settles the row persists the operator-facing answer with it.
+    final_response: dict[str, Any] | None = None
 
 
 class RunDriver(Protocol):
-    """What the reconciler needs from a graph: look, and continue."""
+    """What the executor and the reconciler need from a graph: start, look,
+    and continue."""
+
+    async def start(self, run_id: uuid.UUID, state: dict[str, Any]) -> CheckpointInspection:
+        """Enter the graph for the first time with its initial state (API-007)
+        and return the resulting state."""
+        ...
 
     async def inspect(self, run_id: uuid.UUID) -> CheckpointInspection: ...
 
@@ -152,6 +162,10 @@ class LangGraphRunDriver:
 
     def __init__(self, graph: CompiledStateGraph[Any, Any, Any, Any]) -> None:
         self._graph = graph
+
+    async def start(self, run_id: uuid.UUID, state: dict[str, Any]) -> CheckpointInspection:
+        await self._graph.ainvoke(state, thread_config(run_id), durability=DURABILITY)
+        return await self.inspect(run_id)
 
     async def inspect(self, run_id: uuid.UUID) -> CheckpointInspection:
         snapshot = await self._graph.aget_state(thread_config(run_id))
@@ -199,6 +213,10 @@ def classify_snapshot(snapshot: StateSnapshot) -> CheckpointInspection:
                 step_id = str(intr.value["step_id"])
                 break
 
+    final = values.get("final_response")
+    if isinstance(final, BaseModel):
+        final = final.model_dump(mode="json")
+
     return CheckpointInspection(
         phase=phase,
         checkpoint_id=str(checkpoint_id),
@@ -206,6 +224,7 @@ def classify_snapshot(snapshot: StateSnapshot) -> CheckpointInspection:
         status=status,
         status_reason=status_reason if isinstance(status_reason, str) else None,
         step_id=step_id,
+        final_response=final if isinstance(final, dict) else None,
     )
 
 
@@ -304,6 +323,21 @@ class Reconciler:
             owner=self._owner,
             **{outcome.value: report.count(outcome) for outcome in RecoveryOutcome},
         )
+        return report
+
+    async def reconcile_all(self, *, page: int = 50, max_pages: int = 20) -> ReconciliationReport:
+        """Drain the current candidates at start-up (API-007): pass after
+        pass until one comes back short. Every run a pass touches leaves the
+        orphan query — settled, resumed, or leased by this reconciler until
+        that lease expires — so a run cannot recur within the drain;
+        `max_pages` bounds it anyway."""
+        report = await self.reconcile_once(limit=page)
+        latest = report
+        for _ in range(max_pages - 1):
+            if latest.candidates < page:
+                break
+            latest = await self.reconcile_once(limit=page)
+            report.outcomes.update(latest.outcomes)
         return report
 
     async def recover_run(self, run_id: uuid.UUID) -> RecoveryOutcome:
@@ -599,6 +633,7 @@ class Reconciler:
                 status_reason=inspection.status_reason,
                 finished_at=now,
                 duration_ms=_duration_ms(candidate.started_at, now),
+                final_response=inspection.final_response,
                 release_lease=True,
             )
             if row is not None and event:

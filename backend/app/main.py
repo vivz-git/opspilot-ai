@@ -3,12 +3,17 @@
 `create_app` wires settings (with fail-fast `validate_runtime`), structured
 logging, CORS from configuration, the database engine `/readyz` probes, and
 the health routes. Every other router lands here as its task builds it.
+
+The lifespan is where execution ownership begins and ends (§2.4, API-007):
+it opens the LangGraph saver, composes the graph runtime (`wire_runtime`),
+runs the startup reconciler over orphaned runs, and on shutdown stops the
+executor so no run is left driven by a process that is going away.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,12 +23,15 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from starlette.middleware.cors import CORSMiddleware
 
 from app.api.approvals import router as approvals_router
+from app.api.dependencies import wire_runtime
 from app.api.errors import register_error_handlers
 from app.api.health import discover_alembic_head
 from app.api.health import router as health_router
 from app.api.runs import router as runs_router
 from app.config import Settings, get_settings
+from app.execution.recovery import RecoveryOutcome
 from app.logging_config import configure_logging
+from app.persistence.checkpointing import open_checkpointer
 
 if TYPE_CHECKING:
     from app.execution.approvals import ApprovalService
@@ -50,10 +58,29 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("startup", **settings.safe_dump())
-        try:
-            yield
-        finally:
-            await app.state.db_engine.dispose()
+        async with AsyncExitStack() as stack:
+            # API-007: open the saver, compose the runtime, reconcile orphans
+            # (§2.4). A database that is not there yet is `/readyz`'s to
+            # report — the process still boots, control plane only.
+            try:
+                checkpointer = await stack.enter_async_context(open_checkpointer(settings))
+                wire_runtime(app, checkpointer=checkpointer)
+                report = await app.state.reconciler.reconcile_all()
+            except Exception as exc:  # noqa: BLE001 - degraded start-up is logged, not fatal
+                logger.warning("runtime_unavailable", error=repr(exc))
+            else:
+                logger.info(
+                    "reconciled_on_startup",
+                    candidates=report.candidates,
+                    **{o.value: report.count(o) for o in RecoveryOutcome},
+                )
+            try:
+                yield
+            finally:
+                executor = getattr(app.state, "executor", None)
+                if executor is not None:
+                    await executor.shutdown()
+                await app.state.db_engine.dispose()
 
     app = FastAPI(title="OpsPilot AI", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings

@@ -238,6 +238,7 @@ class SqlAgentRunRepository:
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         duration_ms: int | None = None,
+        final_response: dict[str, Any] | None = None,
         release_lease: bool = False,
     ) -> AgentRun | None:
         values: dict[str, Any] = {"status": status}
@@ -249,6 +250,8 @@ class SqlAgentRunRepository:
             values["finished_at"] = finished_at
         if duration_ms is not None:
             values["duration_ms"] = duration_ms
+        if final_response is not None:
+            values["final_response"] = final_response
         if release_lease:
             values["lease_owner"] = None
             values["lease_expires_at"] = None

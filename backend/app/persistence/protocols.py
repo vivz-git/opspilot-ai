@@ -177,6 +177,7 @@ class AgentRunRepository(Protocol):
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         duration_ms: int | None = None,
+        final_response: dict[str, Any] | None = None,
         release_lease: bool = False,
     ) -> AgentRun | None:
         """Conditional lifecycle transition (§5.4), decided by the database.
@@ -189,6 +190,8 @@ class AgentRunRepository(Protocol):
         retry blindly. `release_lease=True` clears the lease in the same
         statement, for terminal transitions and for handing a paused run
         back to nobody (§6.3: the driving task ends on interrupt).
+        `final_response` rides along on a terminal transition so the
+        operator-facing answer lands in the same statement as the status.
         """
         ...
 
