@@ -2157,3 +2157,92 @@ It passes on a fresh database and in the full-suite run above, and CI uses a
 throwaway Postgres service, so this is a test-isolation weakness in that
 file (the queue query is not scoped to the run under test) rather than a
 defect in the approval path — and it is untouched by this task.
+
+---
+
+## TEST-004 — API contract tests over ASGI transport, every endpoint and every §13.1 code — 2026-09-19
+
+**Done.** `backend/tests/test_api_contract.py` — 7 new tests, plus a one-handler
+fix in `app/api/errors.py`. No test in the existing suite was duplicated or
+weakened.
+
+**The audit came first.** Before writing anything, every endpoint in
+§13.2–§13.7 and every `code` in §13.1's error table was cross-checked against
+what `test_api_runs.py`, `test_api_runs_management.py`, `test_api_approvals.py`,
+`test_api_trace.py` and `test_health.py` already assert. The finding: this
+codebase's API test coverage is already unusually thorough — every run and
+approval endpoint has both a mocked-service unit test (real app, real routing,
+a substituted service dependency) and, for most, a real-Postgres integration
+test over real `httpx.AsyncClient(transport=ASGITransport(...))`. `run_not_startable`
+(`test_executor.py`), the whole approval conflict family (`test_api_approvals.py`'s
+`TestApprovalConflictFamilyPostgres`) and `idempotency_conflict`
+(`test_api_runs.py`) were already exercised exactly the way TEST-004 asks:
+real app, real service, real database, HTTP only. Three gaps and one loose
+end were real:
+
+1. **`budget_exhausted` had no test, and no exception handler.**
+   `app.errors.BudgetExhaustedError` is declared in the taxonomy and
+   `docs/architecture.md` §13.1 documents `budget_exhausted` as a 409, but
+   `app/api/errors.py` had no `@app.exception_handler(BudgetExhaustedError)`.
+   Had the error ever been raised inside a route, FastAPI's handler lookup
+   would miss it and it would fall through to the generic `Exception`
+   handler — `500 internal_error`, not the documented `409 budget_exhausted`.
+   Fixed by adding the handler in the same shape as every other domain error
+   in that module: no new business rule, no new way to trigger the error, just
+   the missing translation between an already-declared error class and its
+   already-documented HTTP mapping. No production code raises this error
+   today (confirmed by grep), so the test drives it through a mocked
+   `RunService`, the same technique the existing suite already uses for
+   otherwise-hard-to-reach conflict codes.
+2. **`internal_error` had no test at all.** The catch-all `Exception` handler
+   existed and worked but had never been exercised. Worth locking in: it is
+   the one guarantee that an unexpected exception's message, type name and
+   traceback never reach the client. Driving it through ASGI transport
+   surfaced a real mechanic worth recording: Starlette's `ServerErrorMiddleware`
+   always sends the registered handler's response *and then re-raises* the
+   original exception "to allow test clients to optionally raise the error
+   within the test case" — `httpx.ASGITransport` propagates that by default.
+   The test passes `raise_app_exceptions=False` to get the response the app
+   already sent, rather than the exception the middleware deliberately
+   re-raises afterward.
+3. **`run_not_cancellable` and `run_active` had a real `RunService` test, but
+   not a real *HTTP* one.** `test_api_runs_management.py`'s Postgres
+   integration class calls `RunService.cancel_run`/`start_run` directly —
+   valuable for the transition logic, but exactly the "bypass route handlers
+   with direct service calls" TEST-004's acceptance criteria says not to rely
+   on for the HTTP contract. Added the missing combination: a real
+   `RunService` over real Postgres, reached only through
+   `POST /runs/{id}/cancel` and `POST /runs/{id}/retry`.
+4. **`RunCancelRequest` and `RunRetryRequest` had no `extra="forbid"` test.**
+   Both models declare it; neither had a 422 test. Added both.
+
+**A tripwire, not a workaround.** §13.6 (evaluation endpoints, API-005) and
+the `GET /tools` catalog route of §13.7 (API-006) are not implemented
+anywhere in `app/api`, nor wired into `app/main.py` — `docs/tasks.md` already
+listed both as outstanding, and `app.openapi()["paths"]` confirms it. There is
+nothing to drive over ASGI transport, and building the routes was out of
+scope for a test-only task with no product decision behind what "budget" or
+an evaluation trigger's contract should be. `test_documented_but_unbuilt_endpoints_are_absent`
+asserts their absence today so it fails, loudly, the day someone adds either
+route without adding the contract test that must come with it.
+
+**One genuine defect reported, not fixed.** §13.1 states "`trace_id` is
+echoed on every error", but none of `register_error_handlers`'s handlers —
+now including the one this task added — ever pass `trace_id` to
+`problem_details(...)`. Every error response today omits the field entirely.
+This is pre-existing, uniform across every error path (not something
+`budget_exhausted` introduced), and fixing it needs a request-correlation
+mechanism that doesn't exist yet (e.g. middleware minting a per-request id) —
+no acceptance criterion of this task requires it. Recorded for whoever owns
+OBS-005 or a future API task; the new tests assert what the API genuinely
+returns.
+
+**Verification.** `tests/test_api_contract.py` 7 passed; run together with
+the run, approval, trace, health and executor API suites, all green; the full
+backend suite **1777 passed, 1 skipped** (baseline before this task: 1770
+passed, 1 skipped — the same single skip, nothing newly skipped); `ruff check .`,
+`ruff format --check .` and `mypy app --strict` clean; `alembic check` reports
+no new upgrade operations (this task adds no migration); the evaluation gate
+`python -m app.evaluation.cli run --suite all` passes 7/7 with 0 invariant
+violations. All against a real PostgreSQL 16 in this session, so nothing here
+was skipped for want of a database.

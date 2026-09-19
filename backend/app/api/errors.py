@@ -19,6 +19,7 @@ from app.errors import (
     ApprovalExpiredError,
     ApprovalNotPendingError,
     ApprovalSupersededError,
+    BudgetExhaustedError,
     IdempotencyConflictError,
     InputValidationError,
     LeaseAcquisitionError,
@@ -216,6 +217,16 @@ def register_error_handlers(app: FastAPI) -> None:
             409,
             code="run_active",
             title="Run active",
+            detail=str(exc),
+            instance=request.url.path,
+        )
+
+    @app.exception_handler(BudgetExhaustedError)
+    async def handle_budget_exhausted(request: Request, exc: BudgetExhaustedError) -> JSONResponse:
+        return problem_details(
+            409,
+            code="budget_exhausted",
+            title="Budget exhausted",
             detail=str(exc),
             instance=request.url.path,
         )
