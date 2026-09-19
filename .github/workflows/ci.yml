@@ -58,7 +58,10 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy app
-      - run: uv run pytest --cov=app --cov-report=term-missing
+      # TEST-006 / §18.4: backend coverage floor is 80% (pyproject.toml
+      # [tool.coverage.report].fail_under is the source of truth; repeated
+      # here so the number is visible in the workflow itself).
+      - run: uv run pytest --cov=app --cov-report=term-missing --cov-fail-under=80
       - run: uv run alembic upgrade head
       - run: uv run python -m app.evaluation.cli run --suite all
 

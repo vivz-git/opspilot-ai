@@ -582,6 +582,7 @@ def final_response(state: Mapping[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # §9.9 #1 — a run reaching a gated step performs no `mock_crm` write
 # ---------------------------------------------------------------------------
+@pytest.mark.critical
 @pytest.mark.usefixtures("seeded")
 class TestAPausedRunWritesNothing:
     """§18.4 #1, "the safety claim": the tables the business cares about are
@@ -877,6 +878,7 @@ def run_mypy(source: Path) -> dict[int, set[str]]:
     return found
 
 
+@pytest.mark.critical
 @pytest.mark.unit
 class TestMutationIsUncallableWithoutAToken:
     """Barrier 3 of §9.5, the structural one: "code that calls
@@ -1275,6 +1277,7 @@ class TestAGrantForHashADoesNotAuthoriseHashB:
 # ---------------------------------------------------------------------------
 # §9.9 #6 — resuming twice sends exactly one email
 # ---------------------------------------------------------------------------
+@pytest.mark.critical
 @pytest.mark.usefixtures("seeded")
 class TestResumingTwiceSendsExactlyOneEmail:
     """§18.4 #4, the idempotency claim, stated where it matters most: a human

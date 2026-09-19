@@ -320,6 +320,7 @@ def _failures(result: CaseResult) -> list[str]:
 class TestDeterminism:
     """§15.2's determinism claim, over real Postgres evidence."""
 
+    @pytest.mark.critical
     async def test_the_same_case_run_twice_yields_an_identical_trace(
         self, runner: EvaluationRunner, registry: EvaluationRegistry, engine: AsyncEngine
     ) -> None:
