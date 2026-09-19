@@ -36,6 +36,14 @@ yarn-error.log*
 pnpm-debug.log*
 coverage/
 .vitest/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Intermediate OpenAPI spec dump (frontend/scripts/generate-api-types.mjs).
+# The generated schema.d.ts it produces IS committed — it's what the app
+# builds against — but this raw export is a throwaway build artifact.
+frontend/.openapi.generated.json
 
 # Editors / OS
 .vscode/
@@ -51,3 +59,7 @@ docker-compose.override.yml
 # Local scratch
 tmp/
 scratch/
+
+# Locally installed Claude Code skills (third-party, session-local tooling —
+# not part of this project's shipped source).
+.claude/
