@@ -1,8 +1,8 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
-import { getHealthz, getRun, listApprovalQueue, listRuns } from "./client";
+import { getHealthz, getRun, listApprovalQueue, listRuns, type RunListQuery } from "./client";
 
 export function useHealthz() {
   return useQuery({
@@ -12,10 +12,14 @@ export function useHealthz() {
   });
 }
 
-export function useRuns() {
+export function useRuns(query: RunListQuery = {}) {
   return useQuery({
-    queryKey: ["runs"],
-    queryFn: listRuns,
+    queryKey: ["runs", query],
+    queryFn: () => listRuns(query),
+    // Keep the previous page's rows on screen while the next page loads,
+    // instead of collapsing to the loading skeleton on every filter/page
+    // change — the pagination-loading state is `isFetching`, not `isPending`.
+    placeholderData: keepPreviousData,
   });
 }
 

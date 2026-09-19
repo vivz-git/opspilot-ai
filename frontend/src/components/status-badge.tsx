@@ -25,6 +25,11 @@ const TONE_BY_STATUS: Record<string, { tone: StatusTone; live?: boolean }> = {
   superseded: { tone: "secondary" },
 };
 
+/** Whether a status is still in flight (used to distinguish "no duration yet" from "settled"). */
+export function isLiveStatus(status: string): boolean {
+  return TONE_BY_STATUS[status]?.live === true;
+}
+
 const DOT_CLASS_BY_TONE: Record<StatusTone, string> = {
   success: "bg-success",
   info: "bg-info",

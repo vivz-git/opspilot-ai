@@ -20,6 +20,10 @@ export type RunResource = Ok<paths["/runs/{run_id}"]["get"]["responses"]>;
 export type ApprovalQueueResponse = Ok<paths["/approvals/queue"]["get"]["responses"]>;
 export type ApprovalResource = ApprovalQueueResponse[number];
 
+/** GET /runs query parameters, taken directly from the generated operation type. */
+export type RunListQuery = NonNullable<paths["/runs"]["get"]["parameters"]["query"]>;
+export type RunStatus = NonNullable<RunListQuery["status"]>[number];
+
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
@@ -49,8 +53,18 @@ export function getHealthz(): Promise<Healthz> {
   return request<Healthz>("/healthz");
 }
 
-export function listRuns(): Promise<RunListResponse> {
-  return request<RunListResponse>("/runs");
+export function listRuns(query: RunListQuery = {}): Promise<RunListResponse> {
+  const params = new URLSearchParams();
+  for (const s of query.status ?? []) params.append("status", s);
+  if (query.since) params.set("since", query.since);
+  if (query.until) params.set("until", query.until);
+  if (query.parent_run_id) params.set("parent_run_id", query.parent_run_id);
+  if (query.q) params.set("q", query.q);
+  if (query.limit != null) params.set("limit", String(query.limit));
+  if (query.cursor) params.set("cursor", query.cursor);
+
+  const qs = params.toString();
+  return request<RunListResponse>(`/runs${qs ? `?${qs}` : ""}`);
 }
 
 export function getRun(runId: string): Promise<RunResource> {
