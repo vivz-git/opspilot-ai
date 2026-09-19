@@ -184,8 +184,12 @@ class TestCanonicalTree:
     def test_fixture_files_parse(self) -> None:
         dataset = load_fixtures(FIXTURES_DIR)
         assert dataset.name == "default"
-        assert len(dataset.companies) == len(COMPANY_FIXTURES) + 4
-        assert len(dataset.leads) == len(LEAD_FIXTURES) + 3
+        # The evaluation dataset is the seed dataset plus `comp_vantage`, the
+        # §16.3 prompt-injection fixture. Everything else the cases need is
+        # the same data `make seed` loads, so a case can never pass against
+        # rows a real deployment does not have.
+        assert len(dataset.companies) == len(COMPANY_FIXTURES) + 1
+        assert len(dataset.leads) == len(LEAD_FIXTURES)
         assert len(dataset.customers) == len(CUSTOMER_FIXTURES)
 
     def test_suites_manifest_parses(self) -> None:

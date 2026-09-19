@@ -39,10 +39,31 @@ class Environment(StrEnum):
     PRODUCTION = "production"
 
 
+class AuthMode(StrEnum):
+    """How a non-local deployment is fenced (ADR-017, ADR-026).
+
+    OpsPilot still has **no application authentication** — v1 authenticates
+    nobody and authorizes nobody. `PROXY` names the only supported hosted
+    shape: an identity-aware proxy (Cloudflare Access or equivalent)
+    terminates authentication in front of the whole deployment, and the app
+    refuses a request that did not arrive through it. That refusal is
+    defence in depth behind the real boundary, not a substitute for it.
+
+    This is an enum rather than a free-text flag because the production fuse
+    keys on it: `OPSPILOT_AUTH_MODE=yes` must not be a way to talk a
+    deployment into starting open.
+    """
+
+    PROXY = "proxy"
+
+
 #: Placeholder values that must never reach a production deployment.
 _PLACEHOLDER_PASSWORDS = frozenset(
     {"change-me-locally", "opspilot", "postgres", "password", "changeme", ""}
 )
+
+#: The levels `logging` actually defines. Anything else is a typo.
+_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 
 class Settings(BaseSettings):
@@ -117,12 +138,32 @@ class Settings(BaseSettings):
     )
 
     # --- Auth (deliberately unimplemented; see §16.6) ---------------------
-    auth_mode: str | None = Field(default=None, validation_alias="OPSPILOT_AUTH_MODE")
+    # There is no application authentication in v1 (ADR-017). `auth_mode`
+    # records how a non-local deployment is fenced instead, and production
+    # refuses to start without it.
+    auth_mode: AuthMode | None = Field(default=None, validation_alias="OPSPILOT_AUTH_MODE")
+    #: Under `auth_mode=proxy`, the header the access proxy stamps on every
+    #: request it forwards. Its presence is all the app checks — the proxy
+    #: verified the identity, the app only refuses traffic that bypassed it.
+    proxy_identity_header: str = Field(
+        default="Cf-Access-Authenticated-User-Email",
+        min_length=1,
+        validation_alias="OPSPILOT_PROXY_IDENTITY_HEADER",
+    )
 
     @field_validator("log_level")
     @classmethod
     def _upper(cls, v: str) -> str:
-        return v.upper()
+        """Normalise and reject a level that does not exist.
+
+        `configure_logging` resolves this with `getattr(logging, level,
+        INFO)`, so an unrecognised value would silently become INFO — and a
+        deployment that asked for WARNING would quietly log more than the
+        operator expected."""
+        level = v.strip().upper()
+        if level not in _LOG_LEVELS:
+            raise ValueError(f"LOG_LEVEL must be one of {sorted(_LOG_LEVELS)}, got {v!r}")
+        return level
 
     # --- Derived ---------------------------------------------------------
     @property
@@ -219,7 +260,7 @@ class Settings(BaseSettings):
             problems.append("DATABASE_URL must use an async driver (postgresql+asyncpg://)")
 
         if self.environment is Environment.PRODUCTION:
-            if not self.auth_mode:
+            if self.auth_mode is None:
                 problems.append(
                     "OPSPILOT_ENV=production requires OPSPILOT_AUTH_MODE; "
                     "OpsPilot has no authentication and must not be exposed (see §16.6)"
@@ -230,6 +271,30 @@ class Settings(BaseSettings):
                 )
             if "*" in self.cors_allow_origins:
                 problems.append("OPSPILOT_ENV=production forbids wildcard CORS_ALLOW_ORIGINS")
+            if not self.cors_origins:
+                problems.append(
+                    "OPSPILOT_ENV=production requires CORS_ALLOW_ORIGINS to name the "
+                    "console origin explicitly"
+                )
+            insecure = [o for o in self.cors_origins if not o.startswith("https://")]
+            if insecure:
+                # A hosted console is served over TLS. An http:// entry here is
+                # either a stale localhost origin left in the deployment or a
+                # mixed-content page that will not work anyway.
+                problems.append(
+                    "OPSPILOT_ENV=production requires https:// CORS_ALLOW_ORIGINS; "
+                    f"refused: {', '.join(insecure)}"
+                )
+            if self.log_level == "DEBUG":
+                # DEBUG turns on third-party library logging that the §14.5
+                # redaction processors never see — driver statements carrying
+                # row data, transport logs carrying headers.
+                problems.append("OPSPILOT_ENV=production forbids LOG_LEVEL=DEBUG")
+            if self.tool_failure_rate > 0:
+                problems.append(
+                    "OPSPILOT_ENV=production forbids OPSPILOT_TOOL_FAILURE_RATE > 0; "
+                    "injected failures belong in the evaluation suite"
+                )
 
         if problems:
             raise ConfigurationError(

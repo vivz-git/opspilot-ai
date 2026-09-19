@@ -9,7 +9,9 @@ via the CLI: `python -m app.integrations.mock.seed` (`make seed`).
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+from collections.abc import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -96,15 +98,31 @@ async def seed_database(
     }
 
 
-async def main() -> None:
-    """CLI entrypoint for `make seed` / `python -m app.integrations.mock.seed`."""
+async def main(argv: Sequence[str] | None = None) -> None:
+    """CLI entrypoint for `make seed` / `python -m app.integrations.mock.seed`.
+
+    Defaults to `--reset`, which is what a local developer wants: the mock CRM
+    goes back to the exact fixture dataset. A hosted deployment that seeds on
+    boot passes `--no-reset` instead, so restarting the container never
+    truncates rows an operator was looking at (docs/deployment.md)."""
+    parser = argparse.ArgumentParser(prog="python -m app.integrations.mock.seed")
+    parser.add_argument(
+        "--no-reset",
+        dest="reset",
+        action="store_false",
+        help="insert only missing rows instead of truncating the mock CRM first",
+    )
+    parser.set_defaults(reset=True)
+    args = parser.parse_args(argv)
+
     settings = get_settings()
     engine = create_async_engine(settings.database_url.get_secret_value())
     session_factory = create_session_factory(engine)
     try:
-        counts = await seed_database(session_factory, reset=True)
+        counts = await seed_database(session_factory, reset=args.reset)
+        verb = "seeded" if args.reset else "topped up"
         print(  # noqa: T201
-            f"Successfully seeded mock CRM: "
+            f"Successfully {verb} mock CRM: "
             f"{counts['companies']} companies, "
             f"{counts['leads']} leads, "
             f"{counts['customers']} customers."

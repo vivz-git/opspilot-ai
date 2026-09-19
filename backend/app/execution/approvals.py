@@ -32,7 +32,12 @@ from app.errors import (
 )
 from app.execution.leases import LeaseConfig, LeaseHeartbeat, UnitOfWorkFactory, new_worker_id
 from app.execution.recovery import CheckpointInspection, CheckpointPhase, RunDriver
-from app.persistence.models import ApprovalRow, TraceEventKind, TraceEventSeverity
+from app.persistence.models import (
+    TERMINAL_TRACE_EVENTS,
+    ApprovalRow,
+    TraceEventKind,
+    TraceEventSeverity,
+)
 from app.runtime import Clock, IdGenerator, UuidIdGenerator
 
 __all__ = [
@@ -333,7 +338,7 @@ class ApprovalService:
         # 11. Settle the row
         if inspection.phase is CheckpointPhase.FINISHED and inspection.status is not None:
             async with self._uow_factory() as uow:
-                await uow.agent_runs.transition_status(
+                row = await uow.agent_runs.transition_status(
                     decided.run_id,
                     expected=(RunStatus.RUNNING,),
                     status=inspection.status,
@@ -343,6 +348,29 @@ class ApprovalService:
                     final_response=inspection.final_response,
                     release_lease=True,
                 )
+                if row is not None and inspection.status in TERMINAL_TRACE_EVENTS:
+                    # A run that ends here ends because a human decided it, so
+                    # this is the only place its terminal event can be written
+                    # — `Executor._settle` never sees the resumed graph. Without
+                    # it the trace stops at the last verification and never says
+                    # the run finished, and an SSE client waits for an event
+                    # that is never coming (§13.4, §14.2).
+                    await uow.trace_events.append(
+                        run_id=decided.run_id,
+                        kind=TERMINAL_TRACE_EVENTS[inspection.status],
+                        severity=(
+                            TraceEventSeverity.WARNING
+                            if inspection.status is RunStatus.FAILED
+                            else TraceEventSeverity.INFO
+                        ),
+                        status=inspection.status.value,
+                        duration_ms=row.duration_ms,
+                        payload={
+                            "status_reason": inspection.status_reason,
+                            "approval_id": str(decided.id),
+                            "owner": worker_owner,
+                        },
+                    )
                 await uow.commit()
         elif inspection.phase is CheckpointPhase.PAUSED:
             async with self._uow_factory() as uow:

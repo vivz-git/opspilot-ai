@@ -29,6 +29,11 @@ services:
   api:
     build:
       context: ./backend
+      args:
+        # Local compose is a development stack: `docker compose exec api
+        # pytest` has to work, so this image keeps the dev extras a hosted
+        # build leaves out.
+        INSTALL_DEV: "true"
     env_file: [.env]
     environment:
       # Inside the network the database is `db`, not `localhost`.

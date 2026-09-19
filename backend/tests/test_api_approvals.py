@@ -41,9 +41,14 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from app.agent.state import ApprovalDecisionKind, ApprovalStatus, RunStatus
+from app.agent.state import (
+    TERMINAL_RUN_STATUSES,
+    ApprovalDecisionKind,
+    ApprovalStatus,
+    RunStatus,
+)
 from app.api.dependencies import get_approval_service
-from app.config import Settings
+from app.config import AuthMode, Settings
 from app.errors import (
     ApprovalExpiredError,
     ApprovalNotPendingError,
@@ -55,7 +60,13 @@ from app.execution.approvals import ApprovalService, DecideApprovalResult
 from app.execution.recovery import LangGraphRunDriver
 from app.main import create_app
 from app.persistence.checkpointing import open_checkpointer
-from app.persistence.models import ApprovalRow, RiskLevel, ToolName, TraceEventKind
+from app.persistence.models import (
+    TERMINAL_TRACE_EVENTS,
+    ApprovalRow,
+    RiskLevel,
+    ToolName,
+    TraceEventKind,
+)
 from app.runtime import FixedClock
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
@@ -565,13 +576,13 @@ class TestApprovalApiUnit:
         assert body["code"] == "run_not_resumable"
 
     def test_authorization_enforced_when_configured(self) -> None:
-        cfg = Settings(_env_file=None, OPSPILOT_AUTH_MODE="token")
+        cfg = Settings(_env_file=None, OPSPILOT_AUTH_MODE=AuthMode.PROXY)
         app = create_app(settings=cfg)
         mock_service = AsyncMock(spec=ApprovalService)
         app.dependency_overrides[get_approval_service] = lambda: mock_service
 
         with TestClient(app) as client:
-            # Request missing authorization header
+            # Nothing stamped by the access proxy
             resp = client.get("/approvals/queue")
             assert resp.status_code == 401
             assert resp.json()["code"] == "policy_violation"
@@ -586,10 +597,11 @@ class TestApprovalApiUnit:
             assert denied.json()["code"] == "policy_violation"
             mock_service.decide_approval.assert_not_awaited()
 
-            # Request with authorization header succeeds
+            # A request the access proxy stamped passes through
             mock_service.list_pending_queue.return_value = []
             resp_authed = client.get(
-                "/approvals/queue", headers={"Authorization": "Bearer test-token"}
+                "/approvals/queue",
+                headers={cfg.proxy_identity_header: "operator@example.com"},
             )
             assert resp_authed.status_code == 200
 
@@ -726,6 +738,19 @@ class TestApprovalApiPostgresIntegration:
             grant_events = [e for e in events if e.kind == TraceEventKind.APPROVAL_GRANTED]
             assert len(grant_events) == 1
             assert grant_events[0].payload["approval_id"] == str(approval_id)
+
+            # The approval resumed the graph to its end, so this settle is the
+            # only place that can record the run ending: `Executor._settle`
+            # never sees a run resumed by a decision. A trace that stops at the
+            # approval leaves an SSE client waiting for a terminal event that
+            # never arrives (§13.4, §14.2).
+            run_row = await uow.agent_runs.get(run_id)
+            assert run_row is not None
+            assert run_row.status in TERMINAL_RUN_STATUSES
+            terminal_events = [e for e in events if e.kind == TERMINAL_TRACE_EVENTS[run_row.status]]
+            assert len(terminal_events) == 1, "the run ended but the trace never says so"
+            assert terminal_events[0].seq == max(e.seq for e in events)
+            assert terminal_events[0].payload["approval_id"] == str(approval_id)
 
     async def test_concurrent_http_post_decision_produces_one_200_and_one_409(
         self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver

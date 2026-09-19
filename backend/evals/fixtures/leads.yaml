@@ -1,11 +1,11 @@
 # The `default` evaluation dataset — leads (§15.3, EVAL-001).
 #
-# Rows 1-11 mirror `app/integrations/mock/fixtures.py::LEAD_FIXTURES` field
+# Every row mirrors `app/integrations/mock/fixtures.py::LEAD_FIXTURES` field
 # for field (`L-104` "Dana Miller" is the canonical lead used by the approval
-# cases). The rows after the marker are the three fintech-in-London leads the
-# canonical request finds. `search_leads` orders by `created_at, lead_id`,
-# so with equal timestamps the result is L-201, L-202, L-203 — and the rule
-# planner drafts outreach to the first returned lead (open question Q7).
+# cases; L-201..L-203 are the three fintech-in-London leads the canonical
+# request finds). `search_leads` orders by `created_at, lead_id`, so with
+# equal timestamps the result is L-201, L-202, L-203 — and the rule planner
+# drafts outreach to the first returned lead (open question Q7).
 #
 # Every address is on an RFC 2606 reserved domain.
 leads:
@@ -174,7 +174,6 @@ leads:
     last_contacted_at: 2026-01-15T12:00:00Z
     created_at: 2026-01-15T12:00:00Z
     updated_at: 2026-01-15T12:00:00Z
-  # --- evaluation-only rows below this line ---------------------------------
   - lead_id: L-201
     company_id: comp_ledgerline
     full_name: Priya Nair

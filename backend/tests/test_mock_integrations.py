@@ -191,6 +191,29 @@ class TestSeedFixturesAndRFC2606:
         assert l104["email"] == "dana@northwind.example"
         assert l104["company_id"] == "comp_northwind"
 
+    def test_the_seed_dataset_can_serve_the_canonical_request(self) -> None:
+        """The README's worked example — "Find the top 3 fintech leads in
+        London" — is the request a seeded deployment demonstrates. Before the
+        London rows existed, `search_leads(industry=fintech, location=London)`
+        returned nothing against `make seed` data and the run died on
+        `replan_budget_exhausted`. This pins the dataset to the claim."""
+        london_fintech = {
+            company["company_id"]
+            for company in COMPANY_FIXTURES
+            if company["industry"] == "fintech" and "London" in str(company["hq_location"])
+        }
+        assert len(london_fintech) >= 3, "the canonical request needs three fintech companies"
+        leads = [lead for lead in LEAD_FIXTURES if lead["company_id"] in london_fintech]
+        assert len(leads) >= 3, "the canonical request needs three leads to rank"
+
+    async def test_search_finds_the_canonical_demo_leads(self, adapters: Adapters) -> None:
+        """The same claim, through the port the tool actually calls."""
+        page = await adapters.leads.search(
+            LeadFilter(industry="fintech", location="London", limit=3)
+        )
+        assert page.total_matched >= 3
+        assert [item.lead_id for item in page.leads] == ["L-201", "L-202", "L-203"]
+
     async def test_seeding_is_idempotent(
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:

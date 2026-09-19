@@ -141,7 +141,11 @@ def runner(
 #    `draft_id` produced by `save_draft`'s output and consumed by
 #    `send_email_mock`'s input, the same `idempotency_key` across retried
 #    attempts of one step) is preserved and compared, without pinning it to
-#    a literal random string that was never meant to be stable.
+#    a literal random string that was never meant to be stable. `owner` —
+#    the worker id that settled the run (`new_worker_id`,
+#    `app/execution/leases.py`) — is the same kind of value: process
+#    identity, minted per process, never seeded, and never a statement
+#    about what the agent decided.
 #
 # Nothing else is touched: `run_id`'s own row-primary-key column, business
 # timestamps embedded inside tool outputs (`retrieved_at`, `saved_at`,
@@ -154,6 +158,11 @@ _IDENTITY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "run_id",
         "approval_id",
+        # The worker that settled the run (`new_worker_id`, DB-007). Process
+        # identity, minted per process exactly like `run_id` is per run —
+        # never influenced by the seed, and never a statement about what the
+        # agent decided.
+        "owner",
         "tool_call_id",
         "execution_step_id",
         "superseded_by",

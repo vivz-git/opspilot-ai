@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from app.agent.state import PlannerKind
-from app.config import Environment, IntegrationMode, PlannerMode, Settings
+from app.config import AuthMode, Environment, IntegrationMode, PlannerMode, Settings
 from app.errors import ConfigurationError
 from pydantic import SecretStr, ValidationError
 
@@ -56,7 +56,7 @@ class TestStartupFuses:
         with pytest.raises(ConfigurationError, match="database password"):
             settings(
                 OPSPILOT_ENV=Environment.PRODUCTION,
-                OPSPILOT_AUTH_MODE="oidc",
+                OPSPILOT_AUTH_MODE=AuthMode.PROXY,
                 DATABASE_URL="postgresql+asyncpg://opspilot:change-me-locally@db:5432/opspilot",
             ).validate_runtime()
 
@@ -64,7 +64,10 @@ class TestStartupFuses:
         """A deployment that sets only DATABASE_URL must not trip on
         POSTGRES_PASSWORD, which exists for docker-compose."""
         s = settings(
-            OPSPILOT_ENV=Environment.PRODUCTION, OPSPILOT_AUTH_MODE="oidc", DATABASE_URL=PROD_URL
+            OPSPILOT_ENV=Environment.PRODUCTION,
+            OPSPILOT_AUTH_MODE=AuthMode.PROXY,
+            DATABASE_URL=PROD_URL,
+            CORS_ALLOW_ORIGINS="https://ops.example.com",
         )
         assert s.postgres_password.get_secret_value() == "change-me-locally"
         s.validate_runtime()
@@ -73,7 +76,7 @@ class TestStartupFuses:
         with pytest.raises(ConfigurationError, match="CORS"):
             settings(
                 OPSPILOT_ENV=Environment.PRODUCTION,
-                OPSPILOT_AUTH_MODE="oidc",
+                OPSPILOT_AUTH_MODE=AuthMode.PROXY,
                 DATABASE_URL=PROD_URL,
                 CORS_ALLOW_ORIGINS="*",
             ).validate_runtime()
@@ -81,10 +84,64 @@ class TestStartupFuses:
     def test_a_fully_configured_production_environment_starts(self) -> None:
         settings(
             OPSPILOT_ENV=Environment.PRODUCTION,
-            OPSPILOT_AUTH_MODE="oidc",
+            OPSPILOT_AUTH_MODE=AuthMode.PROXY,
             DATABASE_URL=PROD_URL,
             CORS_ALLOW_ORIGINS="https://ops.example.com",
         ).validate_runtime()
+
+    def test_production_refuses_an_unrecognised_auth_mode(self) -> None:
+        """The fuse must not be satisfiable by typing something into the
+        variable. `proxy` is the only shape v1 supports (ADR-026); anything
+        else is someone talking the deployment into starting open."""
+        with pytest.raises(ValidationError):
+            settings(OPSPILOT_ENV=Environment.PRODUCTION, OPSPILOT_AUTH_MODE="yes")
+
+    def test_production_requires_an_explicit_console_origin(self) -> None:
+        with pytest.raises(ConfigurationError, match="CORS_ALLOW_ORIGINS"):
+            settings(
+                OPSPILOT_ENV=Environment.PRODUCTION,
+                OPSPILOT_AUTH_MODE=AuthMode.PROXY,
+                DATABASE_URL=PROD_URL,
+                CORS_ALLOW_ORIGINS="",
+            ).validate_runtime()
+
+    def test_production_refuses_a_plaintext_console_origin(self) -> None:
+        """A leftover http://localhost origin in a hosted deployment is either
+        dead configuration or a mixed-content page."""
+        with pytest.raises(ConfigurationError, match="https://"):
+            settings(
+                OPSPILOT_ENV=Environment.PRODUCTION,
+                OPSPILOT_AUTH_MODE=AuthMode.PROXY,
+                DATABASE_URL=PROD_URL,
+                CORS_ALLOW_ORIGINS="https://ops.example.com,http://localhost:3000",
+            ).validate_runtime()
+
+    def test_production_refuses_debug_logging(self) -> None:
+        with pytest.raises(ConfigurationError, match="LOG_LEVEL=DEBUG"):
+            settings(
+                OPSPILOT_ENV=Environment.PRODUCTION,
+                OPSPILOT_AUTH_MODE=AuthMode.PROXY,
+                DATABASE_URL=PROD_URL,
+                CORS_ALLOW_ORIGINS="https://ops.example.com",
+                LOG_LEVEL="debug",
+            ).validate_runtime()
+
+    def test_production_refuses_injected_tool_failures(self) -> None:
+        with pytest.raises(ConfigurationError, match="TOOL_FAILURE_RATE"):
+            settings(
+                OPSPILOT_ENV=Environment.PRODUCTION,
+                OPSPILOT_AUTH_MODE=AuthMode.PROXY,
+                DATABASE_URL=PROD_URL,
+                CORS_ALLOW_ORIGINS="https://ops.example.com",
+                OPSPILOT_TOOL_FAILURE_RATE=0.1,
+            ).validate_runtime()
+
+    def test_an_unknown_log_level_is_rejected_rather_than_silently_info(self) -> None:
+        with pytest.raises(ValidationError):
+            settings(LOG_LEVEL="verbose")
+
+    def test_a_known_log_level_is_normalised(self) -> None:
+        assert settings(LOG_LEVEL="warning").log_level == "WARNING"
 
     def test_a_sync_database_url_fails_loudly_at_startup(self) -> None:
         with pytest.raises(ConfigurationError, match="async driver"):

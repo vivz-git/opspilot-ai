@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { mockHealthz, mockJson } from "./api-mock";
+import { CORS_HEADERS, mockHealthz, mockJson } from "./api-mock";
 
 const APPROVAL_ID = "a1b2c3d4-e5f6-4a1b-8c9d-0e1f2a3b4c5d";
 const RUN_ID = "8f1e2c3a-6b4d-4e2f-9a1b-7c8d9e0f1a2b";
@@ -47,6 +47,7 @@ test("operator opens a pending approval from the queue and approves it", async (
     (url) => url.pathname === `/approvals/${APPROVAL_ID}/decision`,
     (route) =>
       route.fulfill({
+        headers: CORS_HEADERS,
         status: 200,
         contentType: "application/json",
         body: JSON.stringify(approval({ status: "approved", decided_at: "2026-09-19T09:00:00Z" })),
@@ -75,6 +76,7 @@ test("operator rejects an approval with a required reason", async ({ page }) => 
     (route) => {
       requestBody = route.request().postDataJSON();
       route.fulfill({
+        headers: CORS_HEADERS,
         status: 200,
         contentType: "application/json",
         body: JSON.stringify(
@@ -101,6 +103,7 @@ for (const [code, expectedText] of [
       (url) => url.pathname === `/approvals/${APPROVAL_ID}/decision`,
       (route) =>
         route.fulfill({
+          headers: CORS_HEADERS,
           status: 409,
           contentType: "application/problem+json",
           body: JSON.stringify({ code, detail: "server detail text", status: 409 }),
