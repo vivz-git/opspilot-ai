@@ -3,6 +3,14 @@
 import { StatusBadge } from "@/components/status-badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { useRuns } from "@/lib/api/queries";
 
 export default function RunsPage() {
@@ -19,9 +27,9 @@ export default function RunsPage() {
 
       {isPending && (
         <div className="flex flex-col gap-2">
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-9 w-full" />
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
         </div>
       )}
 
@@ -46,24 +54,40 @@ export default function RunsPage() {
       )}
 
       {data && data.items.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {data.items.map((run) => (
-            <Card key={run.run_id}>
-              <CardContent className="flex items-center justify-between gap-4 pt-6">
-                <div className="flex min-w-0 flex-col gap-1">
-                  <span className="truncate text-sm font-medium">{run.user_request}</span>
-                  <span className="font-mono text-xs text-muted-foreground">{run.run_id}</span>
-                </div>
-                <div className="flex shrink-0 items-center gap-3">
-                  <span className="text-xs text-muted-foreground">
-                    {run.counters.step_count} steps
-                  </span>
-                  <StatusBadge status={run.status} />
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        <Card className="overflow-hidden p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Request</TableHead>
+                <TableHead>Run ID</TableHead>
+                <TableHead className="text-right">Steps</TableHead>
+                <TableHead className="text-right">Retries</TableHead>
+                <TableHead>Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.items.map((run) => (
+                <TableRow key={run.run_id}>
+                  <TableCell className="max-w-xs truncate font-medium">
+                    {run.user_request}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {run.run_id}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">
+                    {run.counters.step_count}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">
+                    {run.counters.retry_total}
+                  </TableCell>
+                  <TableCell>
+                    <StatusBadge status={run.status} />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
       )}
     </div>
   );

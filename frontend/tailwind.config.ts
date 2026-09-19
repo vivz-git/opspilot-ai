@@ -48,6 +48,10 @@ const config: Config = {
           DEFAULT: "hsl(var(--warning))",
           foreground: "hsl(var(--warning-foreground))",
         },
+        info: {
+          DEFAULT: "hsl(var(--info))",
+          foreground: "hsl(var(--info-foreground))",
+        },
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -55,8 +59,11 @@ const config: Config = {
         sm: "calc(var(--radius) - 4px)",
       },
       fontFamily: {
-        mono: ["var(--font-geist-mono)", "ui-monospace", "SFMono-Regular", "monospace"],
-        sans: ["var(--font-geist-sans)", "ui-sans-serif", "system-ui"],
+        // Developer-tool pairing (ui-ux-pro-max typography match for this
+        // product type): IBM Plex Sans for UI text, JetBrains Mono for
+        // run ids, step ids, hashes and other data-dense values.
+        sans: ["var(--font-plex-sans)", "ui-sans-serif", "system-ui"],
+        mono: ["var(--font-jetbrains-mono)", "ui-monospace", "SFMono-Regular", "monospace"],
       },
     },
   },

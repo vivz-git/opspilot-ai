@@ -4,6 +4,14 @@ import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { useApprovalQueue } from "@/lib/api/queries";
 
 export default function ApprovalsPage() {
@@ -21,8 +29,9 @@ export default function ApprovalsPage() {
 
       {isPending && (
         <div className="flex flex-col gap-2">
-          <Skeleton className="h-20 w-full" />
-          <Skeleton className="h-20 w-full" />
+          <Skeleton className="h-9 w-full" />
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
         </div>
       )}
 
@@ -47,27 +56,45 @@ export default function ApprovalsPage() {
       )}
 
       {data && data.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {data.map((approval) => (
-            <Card key={approval.approval_id}>
-              <CardContent className="flex flex-col gap-2 pt-6">
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-sm font-medium">{approval.title}</span>
-                  <div className="flex shrink-0 items-center gap-2">
+        <Card className="overflow-hidden p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Step</TableHead>
+                <TableHead>Tool</TableHead>
+                <TableHead>Run / step</TableHead>
+                <TableHead>Risk</TableHead>
+                <TableHead>Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.map((approval) => (
+                <TableRow key={approval.approval_id}>
+                  <TableCell className="max-w-sm">
+                    <div className="font-medium">{approval.title}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {approval.summary}
+                    </div>
+                  </TableCell>
+                  <TableCell>
                     <Badge variant="outline" className="font-mono">
                       {approval.tool}
                     </Badge>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {approval.run_id} · {approval.step_id}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs uppercase text-muted-foreground">
+                    {approval.risk}
+                  </TableCell>
+                  <TableCell>
                     <StatusBadge status={approval.status} />
-                  </div>
-                </div>
-                <p className="text-sm text-muted-foreground">{approval.summary}</p>
-                <span className="font-mono text-xs text-muted-foreground">
-                  run {approval.run_id} · step {approval.step_id}
-                </span>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
       )}
     </div>
   );

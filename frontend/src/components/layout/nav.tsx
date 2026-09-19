@@ -24,7 +24,7 @@ export function Nav() {
   const pathname = usePathname();
 
   return (
-    <nav className="flex flex-col gap-1 p-3">
+    <nav className="flex flex-col gap-1 px-2 py-3">
       {NAV_ITEMS.map((item) => {
         const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
         const Icon = item.icon;
@@ -32,14 +32,18 @@ export function Nav() {
           <Link
             key={item.href}
             href={item.href}
+            aria-current={active ? "page" : undefined}
             className={cn(
-              "flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+              "flex items-center gap-2 rounded-md border-l-2 py-2 pl-2.5 pr-3 text-sm font-medium transition-colors",
               active
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                ? "border-primary bg-accent text-foreground"
+                : "border-transparent text-muted-foreground hover:bg-accent/60 hover:text-foreground"
             )}
           >
-            <Icon className="h-4 w-4" aria-hidden />
+            <Icon
+              className={cn("h-4 w-4 shrink-0", active ? "text-primary" : "text-muted-foreground")}
+              aria-hidden
+            />
             {item.label}
           </Link>
         );

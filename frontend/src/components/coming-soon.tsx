@@ -20,8 +20,10 @@ export function ComingSoon({
         <p className="text-sm text-muted-foreground">{description}</p>
       </div>
       <Card>
-        <CardHeader>
-          <Icon className="h-5 w-5 text-muted-foreground" aria-hidden />
+        <CardHeader className="gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-md bg-accent text-muted-foreground">
+            <Icon className="h-5 w-5" aria-hidden />
+          </div>
           <CardTitle>Not wired up yet</CardTitle>
           <CardDescription>{note}</CardDescription>
         </CardHeader>
