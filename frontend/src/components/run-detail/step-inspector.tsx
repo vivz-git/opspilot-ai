@@ -6,22 +6,11 @@ import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { JsonBlock } from "@/components/ui/json-block";
 import { Separator } from "@/components/ui/separator";
 import type { RunStepSummary, TraceEventResource } from "@/lib/api/client";
 import { formatDuration, formatTimestamp } from "@/lib/format";
 import { eventsForStep, groupStepBlocks, type AttemptBlock } from "@/lib/trace";
-
-function JsonBlock({ label, value }: { label: string; value: unknown }) {
-  if (value == null) return null;
-  return (
-    <div className="flex flex-col gap-1">
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
-      <pre className="max-h-48 overflow-auto rounded-md border border-border/60 bg-background p-2 font-mono text-[11px] leading-relaxed">
-        {JSON.stringify(value, null, 2)}
-      </pre>
-    </div>
-  );
-}
 
 interface VerificationCheck {
   name: string;

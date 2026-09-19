@@ -1,5 +1,7 @@
 "use client";
 
+import { useRouter } from "next/navigation";
+
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,10 +14,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import type { ApprovalResource } from "@/lib/api/client";
 import { useApprovalQueue } from "@/lib/api/queries";
 
 export default function ApprovalsPage() {
+  const router = useRouter();
   const { data, isPending, isError, error } = useApprovalQueue();
+
+  function handleSelectApproval(approval: ApprovalResource) {
+    router.push(`/approvals/${approval.approval_id}`);
+  }
 
   return (
     <div className="flex flex-col gap-6">
@@ -69,7 +77,20 @@ export default function ApprovalsPage() {
             </TableHeader>
             <TableBody>
               {data.map((approval) => (
-                <TableRow key={approval.approval_id}>
+                <TableRow
+                  key={approval.approval_id}
+                  role="link"
+                  tabIndex={0}
+                  aria-label={`Review approval ${approval.title}`}
+                  className="cursor-pointer"
+                  onClick={() => handleSelectApproval(approval)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      handleSelectApproval(approval);
+                    }
+                  }}
+                >
                   <TableCell className="max-w-sm">
                     <div className="font-medium">{approval.title}</div>
                     <div className="truncate text-xs text-muted-foreground">

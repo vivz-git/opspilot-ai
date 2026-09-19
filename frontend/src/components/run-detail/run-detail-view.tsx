@@ -11,12 +11,21 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError } from "@/lib/api/client";
 import { useRun, useRunTrace } from "@/lib/api/queries";
+import { useRunEvents } from "@/lib/api/use-run-events";
+import { TERMINAL_RUN_STATUSES } from "@/lib/sse";
 
 export function RunDetailView({ runId }: { runId: string }) {
   const [selectedStepId, setSelectedStepId] = React.useState<string | null>(null);
 
   const runQuery = useRun(runId);
   const traceQuery = useRunTrace(runId);
+  // Live updates are an enhancement over the REST reconstruction above, and
+  // only make sense once we actually know the run — and only while it's
+  // still capable of producing another event (§13.4, FE-007).
+  const runStatus = runQuery.data?.status;
+  const connectionStatus = useRunEvents(runId, {
+    enabled: Boolean(runQuery.data) && !TERMINAL_RUN_STATUSES.has(runStatus ?? ""),
+  });
 
   if (runQuery.isPending || traceQuery.isPending) {
     return (
@@ -71,7 +80,7 @@ export function RunDetailView({ runId }: { runId: string }) {
 
   return (
     <div className="flex flex-col gap-6">
-      <RunHeader run={run} />
+      <RunHeader run={run} connectionStatus={connectionStatus} />
       {run.pending_approval && <ApprovalPanel approval={run.pending_approval} />}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">

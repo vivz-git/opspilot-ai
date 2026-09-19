@@ -21,6 +21,8 @@ export type RunStepSummary = NonNullable<RunResource["steps"]>[number];
 export type RunPendingApproval = NonNullable<RunResource["pending_approval"]>;
 export type ApprovalQueueResponse = Ok<paths["/approvals/queue"]["get"]["responses"]>;
 export type ApprovalResource = ApprovalQueueResponse[number];
+export type ApprovalDecisionRequest =
+  paths["/approvals/{approval_id}/decision"]["post"]["requestBody"]["content"]["application/json"];
 
 /** GET /runs query parameters, taken directly from the generated operation type. */
 export type RunListQuery = NonNullable<paths["/runs"]["get"]["parameters"]["query"]>;
@@ -31,6 +33,25 @@ export type TraceEventResource = TraceResponse["events"][number];
 export type TraceEventKind = TraceEventResource["kind"];
 export type TraceEventSeverity = TraceEventResource["severity"];
 export type TraceQuery = NonNullable<paths["/runs/{run_id}/trace"]["get"]["parameters"]["query"]>;
+
+export type ToolListResponse = Ok<paths["/tools"]["get"]["responses"]>;
+export type ToolResource = ToolListResponse[number];
+
+export type EvaluationRunListResponse = Ok<paths["/evaluations/runs"]["get"]["responses"]>;
+export type EvaluationRunResource = EvaluationRunListResponse["items"][number];
+export type EvaluationRunListQuery = NonNullable<
+  paths["/evaluations/runs"]["get"]["parameters"]["query"]
+>;
+export type EvaluationRunCreateRequest =
+  paths["/evaluations/runs"]["post"]["requestBody"]["content"]["application/json"];
+export type EvaluationResultListResponse = Ok<
+  paths["/evaluations/runs/{evaluation_run_id}/results"]["get"]["responses"]
+>;
+export type EvaluationResultResource = EvaluationResultListResponse[number];
+export type EvaluationMetricsResponse = Ok<paths["/evaluations/metrics"]["get"]["responses"]>;
+export type EvaluationMetricsQuery = NonNullable<
+  paths["/evaluations/metrics"]["get"]["parameters"]["query"]
+>;
 
 export class ApiError extends Error {
   constructor(
@@ -92,4 +113,66 @@ export function getRunTrace(runId: string, query: TraceQuery = {}): Promise<Trac
 
 export function listApprovalQueue(): Promise<ApprovalQueueResponse> {
   return request<ApprovalQueueResponse>("/approvals/queue");
+}
+
+export function getApproval(approvalId: string): Promise<ApprovalResource> {
+  return request<ApprovalResource>(`/approvals/${encodeURIComponent(approvalId)}`);
+}
+
+export function decideApproval(
+  approvalId: string,
+  body: ApprovalDecisionRequest
+): Promise<ApprovalResource> {
+  return request<ApprovalResource>(`/approvals/${encodeURIComponent(approvalId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function listTools(): Promise<ToolListResponse> {
+  return request<ToolListResponse>("/tools");
+}
+
+export function listEvaluationRuns(
+  query: EvaluationRunListQuery = {}
+): Promise<EvaluationRunListResponse> {
+  const params = new URLSearchParams();
+  if (query.suite) params.set("suite", query.suite);
+  if (query.limit != null) params.set("limit", String(query.limit));
+
+  const qs = params.toString();
+  return request<EvaluationRunListResponse>(`/evaluations/runs${qs ? `?${qs}` : ""}`);
+}
+
+export function getEvaluationRun(evaluationRunId: string): Promise<EvaluationRunResource> {
+  return request<EvaluationRunResource>(`/evaluations/runs/${encodeURIComponent(evaluationRunId)}`);
+}
+
+export function listEvaluationResults(
+  evaluationRunId: string
+): Promise<EvaluationResultListResponse> {
+  return request<EvaluationResultListResponse>(
+    `/evaluations/runs/${encodeURIComponent(evaluationRunId)}/results`
+  );
+}
+
+export function createEvaluationRun(
+  body: EvaluationRunCreateRequest
+): Promise<EvaluationRunResource> {
+  return request<EvaluationRunResource>("/evaluations/runs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function getEvaluationMetrics(
+  query: EvaluationMetricsQuery = {}
+): Promise<EvaluationMetricsResponse> {
+  const params = new URLSearchParams();
+  if (query.suite) params.set("suite", query.suite);
+
+  const qs = params.toString();
+  return request<EvaluationMetricsResponse>(`/evaluations/metrics${qs ? `?${qs}` : ""}`);
 }

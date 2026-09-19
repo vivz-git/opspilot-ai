@@ -25,15 +25,18 @@ from starlette.middleware.cors import CORSMiddleware
 from app.api.approvals import router as approvals_router
 from app.api.dependencies import wire_runtime
 from app.api.errors import register_error_handlers
+from app.api.evaluations import router as evaluations_router
 from app.api.health import discover_alembic_head
 from app.api.health import router as health_router
 from app.api.runs import router as runs_router
+from app.api.tools import router as tools_router
 from app.config import Settings, get_settings
 from app.execution.recovery import RecoveryOutcome
 from app.logging_config import configure_logging
 from app.persistence.checkpointing import open_checkpointer
 
 if TYPE_CHECKING:
+    from app.evaluation.runner import EvaluationRunner
     from app.execution.approvals import ApprovalService
     from app.execution.recovery import RunDriver
     from app.execution.runs import RunService
@@ -47,6 +50,7 @@ def create_app(
     *,
     approval_service: ApprovalService | None = None,
     run_service: RunService | None = None,
+    evaluation_runner: EvaluationRunner | None = None,
     driver: RunDriver | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
@@ -64,6 +68,7 @@ def create_app(
             # report — the process still boots, control plane only.
             try:
                 checkpointer = await stack.enter_async_context(open_checkpointer(settings))
+                app.state.checkpointer = checkpointer
                 wire_runtime(app, checkpointer=checkpointer)
                 report = await app.state.reconciler.reconcile_all()
             except Exception as exc:  # noqa: BLE001 - degraded start-up is logged, not fatal
@@ -90,6 +95,7 @@ def create_app(
     app.state.alembic_head_revision = discover_alembic_head(BACKEND_ROOT)
     app.state.approval_service = approval_service
     app.state.run_service = run_service
+    app.state.evaluation_runner = evaluation_runner
     app.state.run_driver = driver
     app.state.clock = clock
 
@@ -108,6 +114,10 @@ def create_app(
     app.include_router(approvals_router, prefix="/api/v1")
     app.include_router(runs_router)
     app.include_router(runs_router, prefix="/api/v1")
+    app.include_router(evaluations_router)
+    app.include_router(evaluations_router, prefix="/api/v1")
+    app.include_router(tools_router)
+    app.include_router(tools_router, prefix="/api/v1")
 
     return app
 

@@ -20,7 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.graph import create_agent_graph
 from app.config import Settings
-from app.errors import PolicyViolation
+from app.errors import ConfigurationError, PolicyViolation
+from app.evaluation.loader import load_registry
+from app.evaluation.registry import EvaluationRegistry
+from app.evaluation.runner import EvaluationRunner
 from app.execution.approvals import ApprovalService
 from app.execution.executor import Executor
 from app.execution.leases import LeaseConfig, new_worker_id
@@ -41,7 +44,10 @@ from app.runtime import (
 
 __all__ = [
     "get_approval_service",
+    "get_evaluation_registry",
+    "get_evaluation_runner",
     "get_run_service",
+    "get_uow_factory",
     "require_authorization",
     "wire_runtime",
 ]
@@ -187,6 +193,49 @@ def get_run_service(request: Request) -> RunService:
     )
     app.state.run_service = service
     return service
+
+
+def get_uow_factory(request: Request) -> UnitOfWorkFactory:
+    """Provide the shared `UnitOfWorkFactory` for read-only query endpoints
+    that have no dedicated service (evaluations §13.7)."""
+    return _uow_factory(request.app)
+
+
+def get_evaluation_registry(request: Request) -> EvaluationRegistry:
+    """Provide the loaded, validated `backend/evals/` tree (EVAL-001), cached
+    on `app.state` after the first load — the tree does not change at
+    runtime, so re-parsing it on every request would only add latency."""
+    app = request.app
+    registry: EvaluationRegistry | None = getattr(app.state, "evaluation_registry", None)
+    if registry is None:
+        registry = load_registry()
+        app.state.evaluation_registry = registry
+    return registry
+
+
+def get_evaluation_runner(request: Request) -> EvaluationRunner:
+    """Provide the `EvaluationRunner` (EVAL-002) that composes the same
+    production graph `wire_runtime` does, so `POST /evaluations/runs` drives
+    the real service path — never a second, API-only execution path."""
+    app = request.app
+    runner: EvaluationRunner | None = getattr(app.state, "evaluation_runner", None)
+    if runner is not None:
+        return runner
+
+    checkpointer = getattr(app.state, "checkpointer", None)
+    if checkpointer is None:
+        raise ConfigurationError(
+            "evaluation runtime is not available: no checkpointer (is the database up?)"
+        )
+    settings: Settings = app.state.settings
+    runner = EvaluationRunner(
+        settings=settings,
+        session_factory=_session_factory(app),
+        checkpointer=checkpointer,
+        registry=get_evaluation_registry(request),
+    )
+    app.state.evaluation_runner = runner
+    return runner
 
 
 def require_authorization(request: Request) -> None:
