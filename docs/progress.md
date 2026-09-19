@@ -1925,3 +1925,117 @@ attempts a live database connection without the `require_database()` skip
 guard every other integration test in this repo uses, so it errors instead
 of skipping when no Postgres is reachable — a pre-existing gap in that test
 file, untouched by this task, not a regression introduced here.
+
+---
+
+## TEST-002 — graph behaviour: every terminal path, pause, retry, replan, skip and verify transition — 2026-09-19
+
+**Done.** `backend/tests/test_graph_behavior.py` — 16 integration tests, ~7 s,
+no production code changed.
+
+**What drives them.** Every test builds its graph with
+`app.execution.runtime.build_driver`, the one function `wire_runtime` and the
+evaluation runner both call (ADR-024), and drives it through
+`RunService` → `Executor` → `ApprovalService` against real PostgreSQL and the
+real LangGraph saver. So the real `ToolRegistry`, the real approval gate, the
+real verifiers, the real `RuleTaskNormalizer` and the real `RulePlanner` are
+on the path: a pause is a real `awaiting_approval` row that the real approval
+service decides, a terminal status is the row the executor settled, and every
+attempt is a real `tool_calls` row. There is no second graph, no fake
+execution path and no re-implementation of a node's logic in the test.
+
+**The only double is the tool.** `ToolScript` (§18.2's `ScriptedTool` —
+"lets a graph test force an exact failure sequence") wraps
+`default_implementations()` and is handed to `build_driver`'s existing
+`implementations` parameter, exactly as `FailureInjector` is by EVAL-002. It
+keys on `(tool, step_id, attempt)` — finer than the evaluation injector's
+`(tool, attempt)`, which is what lets one `score_lead` step fail while its
+siblings succeed — and it can raise a classified error, return a well-formed
+success without performing the effect, or block until the test releases it.
+Because the override goes into the registry, a scripted tool is reached only
+where a real one would be: after argument resolution, after input validation,
+after the gate, after the stored-decision check and with the minted token.
+
+The plans are the rule planner's own, selected by choosing the request
+(`"Draft outreach to lead L-104 and email it."` → the six-step gated
+pipeline; `"Score the top 2 leads in Seattle."` → search + fan-out research +
+one required and one optional `score_lead`). Nothing is hand-assembled, so a
+change to planning breaks these tests rather than passing them. The clock is
+a `FixedClock`, so the backoff is asserted on rather than waited for, and the
+mock CRM is reseeded per test through `seed_database(..., reset=True)` so
+every effect count is exact.
+
+**The six control paths, each on state and on the trace.**
+
+| Path | State | Trace |
+|---|---|---|
+| **Terminal — complete** | `completed`, both steps `succeeded`, `not_required`/`passed` verification, no errors, `step_count=2`, `final_response.done` | the exact nine-event timeline, closed by `run_completed`; `seq` unique and increasing |
+| **Terminal — rejected** | `rejected` (not `failed`), `status_reason=approval_rejected`, step `rejected`, response names `s6` in `not_done` | `approval_requested` → `approval_rejected`, and no event for `s6` before them |
+| **Terminal — fail** | from `understand` (`out_of_scope`, no plan, no dispatch), from `plan` (`invalid_plan` — the six-step plan does not fit a three-step budget), from `recover` (`retry_budget_exhausted`, `replan_budget_exhausted`, `verification_failed`) and from `decide` (`budget_exhausted`) | `run_failed` closes each; zero `tool_calls` on the two pre-dispatch failures |
+| **Pause** | `s5` succeeded and `s6` pending at the checkpoint; the interrupt payload carries the step, tool, `args_hash` and de-referenced preview; the `approvals` row is `pending` with the same hash | `approval_requested` → `approval_granted` → `tool_started` → `tool_succeeded` → `verification_passed`, and every mail-port event is after the grant. Zero `email_outbox` rows while paused; exactly one after |
+| **Retry** | `retry_count={s2: 2}`, step `succeeded`, two `transient` errors, `step_count=4` (attempts are steps) | three `tool_started`, two `tool_failed`, two `retry_scheduled` with `target=execute_tool` and the §10.4 delays (250 ms, 500 ms ± the seeded jitter) — matched against `FixedClock.sleep_calls`, so the delay was computed and never slept |
+| **Replan** | `replan_count=2`, `plan_history` revisions `[0, 1]`, current revision `2`, `retry_count` empty (a `NOT_FOUND` is a planning fault) | six events for the failing step (three attempts), no `retry_scheduled` at all, `run_failed` last |
+| **Skip** | optional step `skipped`, required sibling `succeeded`, `replan_count=0`, `final_response.partial=true` with the step in `not_done` | one `tool_started`/`tool_failed` pair for it and nothing else; `run_completed` last |
+| **Verify** | a lying `save_draft` is caught by the read-back, retried once and written for real (`retry_count={s5: 1}`, verification `passed`, exactly one `outreach_drafts` row); lying on every attempt ends the run `failed(verification_failed)` with zero rows, zero outbox rows and no approval ever requested | `tool_succeeded` → `verification_failed` → `retry_scheduled(target=execute_tool, error_class=verification_failed)` → `tool_succeeded` → `verification_passed`; three `verification_failed` in the terminal case |
+
+**Forced loops terminate in budget.** Two, both genuine cycles in the
+compiled graph rather than a counter read back:
+`decide → execute_tool → recover → plan → decide …` ends after exactly
+`MAX_REPLANS` revisions as `replan_budget_exhausted` (three attempts at the
+failing step, one per plan, and the settled `search_leads`/`research_company`
+steps carried over rather than redone), and
+`decide → execute_tool → recover → execute_tool …` ends after exactly
+`1 + MAX_RETRIES` attempts. A third test pins the interaction the §10.5 table
+names: with `MAX_STEPS=2` and `MAX_RETRIES=5` the *step* budget stops the
+retry loop after two attempts, because `decide` checks budgets first on every
+pass. A fourth pins that ordering directly — a two-step plan under
+`MAX_STEPS=2` terminates `budget_exhausted` at `decide` although both
+attempts succeeded and nothing failed, which is rule 1 running before rule 3
+as §6.2 specifies.
+
+**Cancellation and durability.** An operator cancels through
+`RunService.cancel_run` while `score_lead` is genuinely in flight (the
+scripted tool blocks until the test releases it): that attempt finishes and
+is recorded `succeeded`, the graph exits through `fail(cancelled)` at the
+next node boundary, the following step is never dispatched, and the
+executor's guarded settle leaves the operator's `cancelled` row standing —
+the checkpoint says `failed(cancelled)`, the row says `cancelled`, and both
+are correct for what they describe. Separately, a paused run is resumed by a
+*second* composition — its own graph, registry, tool bindings, executor and
+services over the same saver — which reads the plan, the five settled steps
+and the pause out of the checkpoint and re-executes only `s6`. That is
+`thread_id = run_id` plus `durability="sync"` (§6.4) being load-bearing
+rather than assumed.
+
+**Deliberately not re-proven here**, and said so in the module docstring: each
+`decide` rule in isolation and their ordering (`tests/test_decide.py`,
+`tests/test_agent_graph.py`), the recovery classification
+(`tests/test_recover.py`), cancellation at each individual node boundary
+(`tests/test_cancellation.py`), the dispatcher's guarantees
+(`tests/test_tool_dispatch.py`) and the lease mechanics
+(`tests/test_executor.py`). The one §6.1 edge this module does not reach is
+`recover → verify`, the unconfirmed read-back retry: forcing it needs a
+*verifier-port* fault, which a tool-implementation override cannot express,
+and VERIFY-003 already covers it end to end in `tests/test_verify_recovery.py`.
+
+**One observation, not changed here.** On the resume path `ApprovalService`
+settles the run row but emits no terminal `run_*` trace event, so a run that
+reaches `completed` or `rejected` through an approval decision ends its
+timeline on `approval_granted`/`approval_rejected` plus the graph's own
+events, while a run that terminates under the executor is closed by
+`run_completed`/`run_failed` (`Executor._settle`). §10.6 asks for a terminal
+event to close the timeline; the asymmetry is pre-existing, is not a
+regression, and fixing it is a change to HITL-004/API-007 behaviour rather
+than to a test. These tests therefore assert what is actually emitted on each
+path, and this note records the gap for whoever owns OBS-002.
+
+**Verification.** `tests/test_graph_behavior.py` 16 passed in ~7 s; the graph,
+agent, HITL, verification, recovery, cancellation, executor, checkpointing and
+migration suites 627 passed; the full backend suite 1742 passed, 1 skipped
+(baseline before this task: 1726 passed, 1 skipped — the same single skip,
+nothing newly skipped); `ruff check .`, `ruff format --check .` and
+`mypy app --strict` clean; `alembic upgrade head` applies and `alembic check`
+reports no new upgrade operations (this task adds no migration); the
+evaluation gate `python -m app.evaluation.cli run --suite all` passes 7/7 with
+0 invariant violations. All of it against a real PostgreSQL 16 in this
+session, so nothing here was skipped for want of a database.
