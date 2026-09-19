@@ -63,23 +63,36 @@ jobs:
       - run: uv run python -m app.evaluation.cli run --suite all
 
   frontend:
-    name: Frontend (lint, types, tests)
+    name: Frontend (lint, types, tests, build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Skips cleanly until FE-001 lands the Next.js scaffold and lockfile.
-      - id: probe
-        run: echo "ready=${{ hashFiles('frontend/package-lock.json') != '' }}" >> "$GITHUB_OUTPUT"
+      # Needed only to export the backend's OpenAPI schema (app.openapi() —
+      # no server, no database) so the "types are reproducible" check below
+      # has the same contract a developer would generate against locally.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.19"          # matches the version that wrote uv.lock
+          python-version: "3.12"
+      - working-directory: backend
+        run: uv sync --locked
       - uses: actions/setup-node@v4
-        if: steps.probe.outputs.ready == 'true'
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - if: steps.probe.outputs.ready == 'true'
+      - working-directory: frontend
+        run: npm ci
+      - name: Verify src/lib/api/schema.d.ts matches the backend contract
         working-directory: frontend
         run: |
-          npm ci
-          npm run lint
-          npm run typecheck
-          npm test -- --run
+          npm run generate:api
+          git diff --exit-code -- src/lib/api/schema.d.ts
+      - working-directory: frontend
+        run: npm run lint
+      - working-directory: frontend
+        run: npm run typecheck
+      - working-directory: frontend
+        run: npm test -- --run
+      - working-directory: frontend
+        run: npm run build
