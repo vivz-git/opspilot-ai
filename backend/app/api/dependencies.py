@@ -20,8 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.graph import create_agent_graph
 from app.config import Settings
-from app.errors import PolicyViolation
+from app.errors import ConfigurationError, PolicyViolation
+from app.evaluation.loader import load_registry
+from app.evaluation.registry import EvaluationRegistry
+from app.evaluation.runner import EvaluationRunner
 from app.execution.approvals import ApprovalService
+from app.execution.evaluations import EvaluationService
 from app.execution.executor import Executor
 from app.execution.leases import LeaseConfig, new_worker_id
 from app.execution.recovery import LangGraphRunDriver, Reconciler, RunDriver
@@ -41,6 +45,7 @@ from app.runtime import (
 
 __all__ = [
     "get_approval_service",
+    "get_evaluation_service",
     "get_run_service",
     "require_authorization",
     "wire_runtime",
@@ -63,6 +68,14 @@ def _uow_factory(app: FastAPI) -> UnitOfWorkFactory:
         return SqlUnitOfWork(typed_session_factory)
 
     return factory
+
+
+def _evaluation_registry(app: FastAPI) -> EvaluationRegistry:
+    registry: EvaluationRegistry | None = getattr(app.state, "evaluation_registry", None)
+    if registry is None:
+        registry = load_registry()
+        app.state.evaluation_registry = registry
+    return registry
 
 
 def _runtime_primitives(app: FastAPI) -> tuple[Clock, IdGenerator, CancellationSource]:
@@ -88,6 +101,7 @@ def wire_runtime(app: FastAPI, *, checkpointer: BaseCheckpointSaver[Any]) -> Non
     uow_factory = _uow_factory(app)
     clock, ids, cancellation_source = _runtime_primitives(app)
     lease = LeaseConfig.from_settings(settings)
+    app.state.checkpointer = checkpointer
 
     driver: RunDriver | None = getattr(app.state, "run_driver", None)
     if driver is None:
@@ -134,6 +148,23 @@ def wire_runtime(app: FastAPI, *, checkpointer: BaseCheckpointSaver[Any]) -> Non
             clock=clock,
             owner=new_worker_id(ids, label="reconciler"),
             lease=lease,
+        )
+
+    registry = _evaluation_registry(app)
+    if getattr(app.state, "evaluation_service", None) is None:
+        runner = EvaluationRunner(
+            settings=settings,
+            session_factory=_session_factory(app),
+            checkpointer=checkpointer,
+            registry=registry,
+            clock=clock,
+            ids=ids,
+        )
+        app.state.evaluation_service = EvaluationService(
+            uow_factory=uow_factory,
+            registry=registry,
+            runner=runner,
+            clock=clock,
         )
 
 
@@ -186,6 +217,40 @@ def get_run_service(request: Request) -> RunService:
         executor=getattr(app.state, "executor", None),
     )
     app.state.run_service = service
+    return service
+
+
+def get_evaluation_service(request: Request) -> EvaluationService:
+    """Provide the EvaluationService from application state or construct it lazily."""
+    service: EvaluationService | None = getattr(request.app.state, "evaluation_service", None)
+    if service is not None:
+        return service
+
+    app = request.app
+    checkpointer = getattr(app.state, "checkpointer", None)
+    if checkpointer is None:
+        raise ConfigurationError("evaluation runtime is unavailable: no checkpointer open")
+
+    settings: Settings = app.state.settings
+    uow_factory = _uow_factory(app)
+    clock, ids, _ = _runtime_primitives(app)
+    registry = _evaluation_registry(app)
+
+    runner = EvaluationRunner(
+        settings=settings,
+        session_factory=_session_factory(app),
+        checkpointer=checkpointer,
+        registry=registry,
+        clock=clock,
+        ids=ids,
+    )
+    service = EvaluationService(
+        uow_factory=uow_factory,
+        registry=registry,
+        runner=runner,
+        clock=clock,
+    )
+    app.state.evaluation_service = service
     return service
 
 

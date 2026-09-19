@@ -274,9 +274,22 @@ class EvaluationRunner:
         self._ids = ids or UuidIdGenerator()
 
     async def run_suite(
-        self, suite: str, *, evaluation_run_id: uuid.UUID | None = None
+        self,
+        suite: str,
+        *,
+        evaluation_run_id: uuid.UUID | None = None,
+        case_ids: Sequence[str] | None = None,
     ) -> SuiteRunResult:
         cases = self._registry.suite_cases(suite)
+        if case_ids:
+            wanted = set(case_ids)
+            unknown = wanted - {c.id for c in cases}
+            if unknown:
+                raise ConfigurationError(
+                    f"case_ids not in suite {suite!r}: {sorted(unknown)}",
+                    detail={"suite": suite, "unknown": sorted(unknown)},
+                )
+            cases = tuple(c for c in cases if c.id in wanted)
         if evaluation_run_id is None:
             async with self._uow_factory() as uow:
                 eval_run = await uow.evaluations.create_run(

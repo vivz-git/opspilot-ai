@@ -21,6 +21,9 @@ from app.observability.redaction import redact_payload
 from app.persistence.models import (
     AgentRun,
     ApprovalRow,
+    EvaluationResult,
+    EvaluationRun,
+    EvaluationRunStatus,
     ExecutionStep,
     TraceEvent,
     TraceEventKind,
@@ -30,6 +33,13 @@ from app.persistence.models import (
 __all__ = [
     "ApprovalDecisionRequest",
     "ApprovalResource",
+    "EvaluationMetricsEntry",
+    "EvaluationMetricsResponse",
+    "EvaluationResultResource",
+    "EvaluationResultListResponse",
+    "EvaluationRunCreateRequest",
+    "EvaluationRunListResponse",
+    "EvaluationRunResource",
     "RunCancelRequest",
     "RunCounters",
     "RunCreateRequest",
@@ -40,6 +50,9 @@ __all__ = [
     "RunStepSummary",
     "RunSummary",
     "RunTimestamps",
+    "ToolCatalogResponse",
+    "ToolFailureMode",
+    "ToolResource",
     "TraceEventResource",
     "TraceResponse",
     "decode_cursor",
@@ -505,3 +518,197 @@ class TraceResponse(BaseModel):
     events: list[TraceEventResource]
     next_seq: int | None = None
     complete: bool
+
+
+# ---------------------------------------------------------------------------
+# Evaluations (§13.6)
+# ---------------------------------------------------------------------------
+class EvaluationRunCreateRequest(BaseModel):
+    """Payload for POST /evaluations/runs (§13.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    suite: str = Field(default="all", min_length=1, max_length=64)
+    case_ids: list[str] | None = Field(default=None, description="Restrict the run to these cases.")
+    planner: PlannerKind | None = Field(
+        default=None, description="Recorded planner kind for this suite run."
+    )
+
+
+class EvaluationRunResource(BaseModel):
+    """The `EvaluationRunResource` returned by every evaluations/runs endpoint (§13.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation_run_id: uuid.UUID
+    suite: str
+    status: EvaluationRunStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    planner_kind: str
+    git_sha: str | None = None
+    model_id: str | None = None
+    prompt_version: str | None = None
+    seed: int | None = None
+    case_count: int
+    passed: int
+    failed: int
+    metrics: dict[str, Any]
+
+    @classmethod
+    def from_row(cls, row: EvaluationRun) -> EvaluationRunResource:
+        planner_val = (
+            row.planner_kind.value if hasattr(row.planner_kind, "value") else str(row.planner_kind)
+        )
+        return cls(
+            evaluation_run_id=row.id,
+            suite=row.suite,
+            status=row.status,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            planner_kind=planner_val,
+            git_sha=row.git_sha,
+            model_id=row.model_id,
+            prompt_version=row.prompt_version,
+            seed=row.seed,
+            case_count=row.case_count,
+            passed=row.passed,
+            failed=row.failed,
+            metrics=redact_payload(row.metrics or {}, max_bytes=16_384),
+        )
+
+
+class EvaluationRunListResponse(BaseModel):
+    """`GET /evaluations/runs` (§13.6): newest first, no cursor — the
+    underlying repository lists by `suite`/`limit` only, matching the small
+    cardinality of suite runs versus agent runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[EvaluationRunResource]
+
+
+class EvaluationResultResource(BaseModel):
+    """One case's outcome from `GET /evaluations/runs/{id}/results` (§13.6).
+
+    `run_id` is the real, inspectable `agent_runs` row the case executed —
+    the UI links straight to its full trace (§13.4).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_id: uuid.UUID
+    evaluation_run_id: uuid.UUID
+    case_id: str
+    run_id: uuid.UUID
+    passed: bool
+    assertions: list[Any]
+    duration_ms: int | None = None
+    retry_count: int
+    tool_calls_count: int
+    approval_outcome: str | None = None
+    failure_reason: str | None = None
+
+    @classmethod
+    def from_row(cls, row: EvaluationResult) -> EvaluationResultResource:
+        return cls(
+            result_id=row.id,
+            evaluation_run_id=row.evaluation_run_id,
+            case_id=row.case_id,
+            run_id=row.run_id,
+            passed=row.passed,
+            assertions=[
+                redact_payload(a, max_bytes=4096) if isinstance(a, dict) else a
+                for a in (row.assertions or [])
+            ],
+            duration_ms=row.duration_ms,
+            retry_count=row.retry_count,
+            tool_calls_count=row.tool_calls_count,
+            approval_outcome=row.approval_outcome,
+            failure_reason=row.failure_reason,
+        )
+
+
+class EvaluationResultListResponse(BaseModel):
+    """`GET /evaluations/runs/{id}/results`, `?passed=false` for failures only (§13.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[EvaluationResultResource]
+
+
+class EvaluationMetricsEntry(BaseModel):
+    """One suite run's persisted metric snapshot (§15.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation_run_id: uuid.UUID
+    suite: str
+    status: EvaluationRunStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    metrics: dict[str, Any]
+
+    @classmethod
+    def from_row(cls, row: EvaluationRun) -> EvaluationMetricsEntry:
+        return cls(
+            evaluation_run_id=row.id,
+            suite=row.suite,
+            status=row.status,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            metrics=redact_payload(row.metrics or {}, max_bytes=16_384),
+        )
+
+
+class EvaluationMetricsResponse(BaseModel):
+    """`GET /evaluations/metrics?window=30d&suite=all` (§13.6): a metric time
+    series across suite runs, each entry the run's own persisted snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    window: str | None = None
+    suite: str | None = None
+    items: list[EvaluationMetricsEntry]
+
+
+# ---------------------------------------------------------------------------
+# Tool catalog (§13.7)
+# ---------------------------------------------------------------------------
+class ToolFailureMode(BaseModel):
+    """One declared failure mode of a tool contract (§8.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    error_class: str
+    description: str
+
+
+class ToolResource(BaseModel):
+    """The public shape of one `ToolContract` entry, exactly as
+    `app.tools.contracts.catalog()` renders it (§8.1, §13.7) — this model
+    never restates a contract field the registry does not already publish."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    purpose: str
+    side_effect: str
+    requires_approval: bool
+    risk: str
+    verification: str
+    idempotent: bool
+    nondeterministic: bool
+    untrusted_output: bool
+    timeout_ms: int
+    failure_modes: list[ToolFailureMode]
+    schemas: dict[str, Any]
+
+
+class ToolCatalogResponse(BaseModel):
+    """`GET /tools` (§13.7): the contract registry, verbatim."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tools: list[ToolResource]

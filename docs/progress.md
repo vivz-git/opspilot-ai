@@ -25,7 +25,7 @@ tools          ██████████░░░░░░░░░░  TOO
 agent graph    ████████████████████  AGENT-001..009 complete
 hitl           ████████████████████  HITL-001..005 complete
 verification   ██████████████░░░░░░  VERIFY-001..002 complete; VERIFY-003 outstanding
-api            ███████████░░░░░░░░░  API-001, 002, 003, 007 done; API-004..006 outstanding
+api            █████████████████░░░  API-001, 002, 003, 005, 006, 007 done; API-004 outstanding
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
 frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
 evaluation     ████████████████████  EVAL-001..005 done
@@ -2246,3 +2246,88 @@ no new upgrade operations (this task adds no migration); the evaluation gate
 `python -m app.evaluation.cli run --suite all` passes 7/7 with 0 invariant
 violations. All against a real PostgreSQL 16 in this session, so nothing here
 was skipped for want of a database.
+
+## API-005 / API-006 — evaluation endpoints and tool catalog — 2026-09-19
+
+**Done.** Product exposure of the two API surfaces this task's tripwire
+recorded as outstanding.
+
+**API-005 — evaluation endpoints (§13.6).** `app/execution/evaluations.py`
+(`EvaluationService`) wraps the existing `EvaluationRunner`/`EvaluationRegistry`
+(EVAL-001..005) — no second execution path. `POST /evaluations/runs` validates
+`suite`/`case_ids` against the loaded registry, persists the `evaluation_runs`
+row via the same repository call `run_suite` itself would make, and schedules
+`EvaluationRunner.run_suite(suite, evaluation_run_id=..., case_ids=...)` as a
+background `asyncio.Task` — the response is the documented `202
+EvaluationRunResource(status=running)` and never waits for the suite (the same
+"the HTTP call never waits for the agent" principle §2.3 applies to runs).
+`run_suite` gained one small, backward-compatible addition: an optional
+`case_ids` filter over the suite's cases, reused by both the API and (unchanged)
+the CLI/eval test suite. `GET /evaluations/runs`, `GET /evaluations/runs/{id}`,
+`GET /evaluations/runs/{id}/results` (`?passed=false`) and `GET
+/evaluations/metrics` (`?suite=&window=30d|24h`) all read the persisted
+`evaluation_runs`/`evaluation_results` rows the runner (and the CLI wrapping
+it) already writes — `evaluation_results.run_id` is verified end to end
+against real Postgres to be the real, independently inspectable `agent_runs`
+row the case executed, with its own `eval_case_id` and trace. Unknown `suite`
+or `case_ids` outside the suite → `422 validation_error`; unknown
+`evaluation_run_id` → `404 not_found`; the existing RFC 9457 envelope,
+`extra="forbid"` bodies and `/api/v1` prefix parity are reused unchanged.
+
+**API-006 — tool catalog (§13.7).** `app/api/tools.py`'s `GET /tools` returns
+`app.tools.contracts.catalog()` verbatim through Pydantic response models —
+the route holds no tool metadata of its own, so a contract change is visible
+here without touching this file. Health endpoints (`/healthz`, `/readyz`)
+already existed from FOUND-001 and needed no change.
+
+**Wiring.** `app/api/dependencies.py`'s `wire_runtime` now also loads the
+evaluation registry once and composes an `EvaluationRunner`/`EvaluationService`
+alongside the existing run/approval services, sharing the same checkpointer,
+clock and id generator; `get_evaluation_service` mirrors the existing lazy
+fallback pattern. `app/main.py` gained the `evaluations` and `tools` routers
+(root and `/api/v1`) and an `evaluation_service` override parameter on
+`create_app`, matching `approval_service`/`run_service`.
+
+**Tests.** `backend/tests/test_api_evaluations.py` (22 tests): mocked-service
+unit tests for every success/validation path (trigger, list, get, results with
+`passed=false`, metrics with `window`/`suite`, `extra="forbid"`, malformed
+UUID, unknown run) plus a real-Postgres suite (`TestEvaluationsApiPostgresIntegration`)
+that drives the actual suite mechanism only over HTTP: triggers `smoke` suite
+with `case_ids=["lead_ranking"]`, polls to `completed`, and asserts the
+persisted metrics, the `passed=false` filter (empty against a passing case),
+the `suite` filter on `/evaluations/metrics`, and — directly against the
+database — that the result's `run_id` is a real `agent_runs` row with the
+right `eval_case_id`. `backend/tests/test_api_tools.py` (9 tests): every
+registered tool present, the payload equal to `catalog()` byte-for-byte
+(JSON-normalized), `/api/v1` parity, contract-flag spot checks
+(`send_email_mock`, `search_leads`, `update_customer`) and input/output JSON
+Schema presence for every tool. `test_api_contract.py`'s
+`test_documented_but_unbuilt_endpoints_are_absent` tripwire is removed (its
+job is done) and its module docstring updated to point at the two new files.
+
+**Genuine defect found and fixed (minimal).** None. No contract, tool or
+persistence-layer defect was found while building or testing this surface —
+`EvaluationRepository`, `EvaluationRun`/`EvaluationResult` and
+`contracts.catalog()` already matched §12.8/§13.6/§13.7 exactly.
+
+**Verification.** Focused: `test_api_evaluations.py` + `test_api_tools.py` +
+`test_api_contract.py` — **37 passed**. Existing API suite (`test_api_runs.py`,
+`test_api_runs_management.py`, `test_api_approvals.py`, `test_api_trace.py`,
+`test_health.py`) — all green, no regressions. Full backend suite — **1807
+passed, 1 skipped** (prior baseline 1777 passed, 1 skipped; +30 = the 22 + 9
+new tests minus the 1 removed tripwire). `ruff check .`, `ruff format --check .`
+and `mypy app --strict` all clean. `alembic check` reports no new upgrade
+operations (no migration needed — no schema change). `python -m
+app.evaluation.cli run --suite all` passes 7/7 with 0 invariant violations,
+confirming API-005's background scheduling of the same runner did not disturb
+the CLI's own direct call to it. All against a real PostgreSQL 16 started in
+this session (`sudo service postgresql start`; role/db `opspilot`/`opspilot`
+created to match `.env.example`'s default `DATABASE_URL`), migrated to head.
+
+One environment note, not a defect: running the full pytest suite and the
+evaluation CLI **concurrently** against the same real database (both use
+real leases/reconcilers) produces spurious lease contention and a suite run
+stuck `running` — an artifact of two heavy Postgres-backed processes racing
+for the same rows in this single-database dev setup, reproduced and confirmed
+by re-running the CLI alone immediately afterward (clean 7/7). Not a product
+defect; noted so a future session doesn't chase it.
