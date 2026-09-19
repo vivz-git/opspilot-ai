@@ -38,7 +38,6 @@ export function ToolCatalogTable({
           <TableHead>Purpose</TableHead>
           <TableHead>Side effect</TableHead>
           <TableHead>Risk</TableHead>
-          <TableHead>Approval</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -60,23 +59,21 @@ export function ToolCatalogTable({
             }}
           >
             <TableCell className="font-mono text-sm font-medium">{tool.name}</TableCell>
-            <TableCell className="max-w-sm truncate text-sm text-muted-foreground">
+            <TableCell className="max-w-[220px] truncate text-sm text-muted-foreground">
               {tool.purpose}
             </TableCell>
             <TableCell className="font-mono text-xs text-muted-foreground">
               {tool.side_effect}
             </TableCell>
             <TableCell>
-              <RiskBadge risk={tool.risk} />
-            </TableCell>
-            <TableCell>
-              {tool.requires_approval ? (
-                <Badge variant="warning" className="font-mono text-[10px]">
-                  gated
-                </Badge>
-              ) : (
-                <span className="font-mono text-xs text-muted-foreground">—</span>
-              )}
+              <div className="flex items-center gap-1.5">
+                <RiskBadge risk={tool.risk} />
+                {tool.requires_approval && (
+                  <Badge variant="warning" className="font-mono text-[10px]">
+                    gated
+                  </Badge>
+                )}
+              </div>
             </TableCell>
           </TableRow>
         ))}
