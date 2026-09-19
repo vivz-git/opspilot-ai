@@ -1,7 +1,9 @@
 import { StatusBadge } from "@/components/status-badge";
+import { ConnectionIndicator } from "@/components/run-detail/connection-indicator";
 import { Card, CardContent } from "@/components/ui/card";
 import { isLiveStatus } from "@/components/status-badge";
 import type { RunResource } from "@/lib/api/client";
+import type { SseConnectionStatus } from "@/lib/api/use-run-events";
 import { deriveRunDurationMs, formatDuration, formatTimestamp } from "@/lib/format";
 
 function Stat({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
@@ -13,7 +15,13 @@ function Stat({ label, value, mono }: { label: string; value: React.ReactNode; m
   );
 }
 
-export function RunHeader({ run }: { run: RunResource }) {
+export function RunHeader({
+  run,
+  connectionStatus = "idle",
+}: {
+  run: RunResource;
+  connectionStatus?: SseConnectionStatus;
+}) {
   const { timestamps, counters } = run;
   const durationMs = deriveRunDurationMs(timestamps.started_at ?? null, timestamps.finished_at ?? null);
 
@@ -26,7 +34,10 @@ export function RunHeader({ run }: { run: RunResource }) {
             <span className="font-mono text-xs text-muted-foreground">{run.run_id}</span>
           </div>
           <div className="flex flex-col items-end gap-1">
-            <StatusBadge status={run.status} />
+            <div className="flex items-center gap-2">
+              <ConnectionIndicator status={connectionStatus} />
+              <StatusBadge status={run.status} />
+            </div>
             {run.status_reason && (
               <span className="font-mono text-xs text-muted-foreground">{run.status_reason}</span>
             )}
