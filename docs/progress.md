@@ -28,7 +28,7 @@ verification   ██████████████░░░░░░  VER
 api            ███████████░░░░░░░░░  API-001, 002, 003, 007 done; API-004..006 outstanding
 observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
 frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
-evaluation     ████████░░░░░░░░░░░░  EVAL-001, 002 done; 003..005 outstanding
+evaluation     ████████████████████  EVAL-001..005 done
 ```
 
 ---
@@ -1853,3 +1853,75 @@ customer edited, attempt inserted past the budget, deadline moved, run set
 invariant fails on re-check; the seven valid cases satisfy all seven and
 persist them). Full suite green; `ruff check .`, `ruff format --check .`,
 `mypy app` (strict) and `alembic check` clean.
+
+## EVAL-005 — CLI + CI evaluation gate — 2026-09-19
+
+**Done.** `app/evaluation/cli.py`: `python -m app.evaluation.cli run --suite
+<name>` around the existing evaluation system, adding no execution path, no
+metrics computation and no invariant logic of its own. `run_suite_cli`
+composes exactly what EVAL-002 already composes — `get_settings()`,
+`load_registry()`, a real async engine off `Settings.database_url`,
+`open_checkpointer(settings)`, `EvaluationRunner(...)` — and calls
+`EvaluationRunner.run_suite(suite)`, the same call `tests/test_evaluation_runner.py`
+drives. `evaluation_runs`/`evaluation_results` remain the persisted source
+of truth; `print_report` only renders the `SuiteRunResult` the runner
+already wrote back, and computes no metric or invariant verdict of its own.
+
+Per case it prints `[PASS]`/`[FAIL]`, the run id and duration, every failed
+assertion by name and detail, and every violated `§15.6` invariant by number
+and name; then the `compute_evaluation_metrics` summary
+(`case_pass_rate`, `task_success_rate`, duration percentiles, pass/fail
+counts). The exit code is `0` iff every `CaseResult.passed`, which
+`EvaluationRunner.run_case` already defines as *both* the case's own
+assertions *and* all seven invariants holding (`runner.py`'s
+`passed = all(o.passed for o in outcomes) and all(i.passed for i in
+invariants)`) — so a failing case and a violated invariant gate the run
+through the identical, already-tested boolean, not a second judgement
+layered on top in the CLI.
+
+`Makefile`'s pre-existing `eval` target (`cd backend && uv run python -m
+app.evaluation.cli run --suite all` — written ahead of this module, evidence
+the CLI's module path and argument shape were already the intended contract)
+needed no change.
+
+**CI.** `.github/workflows/ci.yml`'s `backend` job gained two steps after
+`pytest --cov=app --cov-report=term-missing`: `uv run alembic upgrade head`,
+then `uv run python -m app.evaluation.cli run --suite all`. No new job, no
+new Postgres service, no new `uv`/Python setup — both steps run inside the
+job's existing service container and environment (`OPSPILOT_PLANNER=rules`,
+`OPSPILOT_INTEGRATIONS=mock`, so the gate needs no LLM API key). The
+explicit `alembic upgrade head` step doesn't rely on the integration tests'
+own `migrate_to_head()` fixture side effect happening to run first; either
+way the same Postgres service is reused, matching how `pytest`'s own
+integration tests already migrate it. A failing gate step fails the job —
+there is no `continue-on-error`, and the step is unconditional, not gated
+behind a file-existence probe the way the frontend job's own steps are.
+
+**Tests.** 10 new unit tests in `tests/test_evaluation_cli.py`, all
+`@pytest.mark.unit` (no database, no LangGraph saver — the integration path
+itself is already covered end to end by `tests/test_evaluation_runner.py`):
+`print_report` on an all-passing `SuiteRunResult` (exits `True`, prints
+`PASSED`), on a case with a failed assertion (exits `False`, prints the
+assertion name/detail and `FAILED`), on a case whose invariants include a
+violation while its own assertions hold (exits `False`, prints
+`invariant[n] <name> violated` and `FAILED` — proving the invariant path
+gates independently of case assertions), and the metric summary rendering;
+`main`'s exit codes via a monkeypatched `run_suite_cli` (0 on pass, 1 on
+fail, default suite is `all`); `build_arg_parser` requiring a subcommand;
+the `Makefile`'s `eval` target text; and the CI workflow parsed as YAML,
+asserting the `backend` job's steps include the evaluation-gate command and
+that it runs after the `pytest` step.
+
+**Environment note.** This session's sandbox has no reachable Postgres and
+no Docker daemon, so the CLI's own real-service-path run, the EVAL-00x
+integration suites, and `alembic check` could not be exercised live here —
+they skip cleanly (the established pattern) or fail on connection refused,
+exactly as every other DB-backed test in this repository does without a
+database. `ruff check .`, `ruff format --check .`, and `mypy app` (strict)
+are clean across the whole backend, and the full suite is otherwise green
+except one pre-existing, unrelated failure: `tests/test_hitl_preview.py
+::TestHitlPreviewZeroMutation::test_preview_generation_does_not_mutate_crm`
+attempts a live database connection without the `require_database()` skip
+guard every other integration test in this repo uses, so it errors instead
+of skipping when no Postgres is reachable — a pre-existing gap in that test
+file, untouched by this task, not a regression introduced here.
