@@ -32,6 +32,7 @@ Reversing an accepted ADR requires a new ADR, not an edit.
 | [021](#adr-021) | Verification is a graph node, not a tool wrapper | accepted |
 | [022](#adr-022) | `rejected` is a terminal status distinct from `failed` | accepted |
 | [023](#adr-023) | Run ownership is a fenced lease; recovery is a checkpoint-driven state machine | accepted |
+| [026](#adr-026) | A hosted deployment is fenced by an identity-aware proxy, declared as `OPSPILOT_AUTH_MODE=proxy` | accepted |
 
 ---
 
@@ -613,6 +614,60 @@ test (`OPSPILOT_LIVE_LLM=1`), so the gate stays keyless and deterministic.
 policy and a much larger surface for one POST. Anthropic as the runtime
 provider: not the project's intended provider, and structured JSON-schema
 output is what makes "a plan or a rejection" cheap to enforce.
+
+---
+
+## ADR-026
+### A hosted deployment is fenced by an identity-aware proxy, declared as `OPSPILOT_AUTH_MODE=proxy`
+
+**Context.** ADR-017 fenced "no authentication in v1" with a startup fuse:
+`OPSPILOT_ENV=production` refuses to start without `OPSPILOT_AUTH_MODE`. The
+field was free text and nothing downstream read it, so `OPSPILOT_AUTH_MODE=yes`
+satisfied the fuse — and `require_authorization` then asked only for a
+non-empty `Authorization` header, which any client can send. A fuse that a
+typo can defeat, guarding a check that verifies nothing, is worse than no fuse:
+it reads like enforcement.
+
+Putting the operator console on the internet needs *some* answer. Building
+session or OIDC auth into the app is the answer ADR-017 deliberately deferred,
+and it is not a deployment task.
+
+**Decision.** The hosted shape is: an identity-aware proxy (Cloudflare Access
+or equivalent) authenticates in front of the whole deployment, and the
+application declares that shape with `OPSPILOT_AUTH_MODE=proxy` — now an enum
+with exactly that one member, so an unrecognised value fails validation
+instead of satisfying the fuse. Under `proxy`, every endpoint requires the
+header the proxy stamps on what it forwards
+(`OPSPILOT_PROXY_IDENTITY_HEADER`, default Cloudflare's). Production also now
+refuses empty, wildcard or non-`https://` CORS origins, `LOG_LEVEL=DEBUG`, and
+a non-zero tool failure rate.
+
+**This does not change ADR-017.** OpsPilot still authenticates nobody. The
+header's *value* is never read as identity: it is not stored in `actor_id`, it
+grants nothing, and `decided_by` stays client-supplied attribution. The check
+is presence-only, and its whole purpose is to fail closed if the proxy is
+bypassed or misconfigured — defence in depth *behind* the boundary, never the
+boundary itself.
+
+**Consequences.** The deployment's security rests on infrastructure the
+project does not ship, so `docs/deployment.md` has to state the Access policy
+explicitly (one operator, never "Everyone", never "Bypass") and the deployment
+is not safe until that is configured — the app cannot verify it. Because the
+console and the API are separate origins, browser requests must carry
+credentials (`credentials: "include"`, `withCredentials` on the `EventSource`)
+for the proxy's cookie to reach the API, which in turn means the API may never
+answer with a wildcard origin; the production CORS fuse now enforces that.
+Real authentication, when it arrives, is a new mode beside `proxy` and a new
+ADR, not an edit to this one.
+
+**Alternatives rejected.** *Implementing session auth now*: it reverses
+ADR-017 as a side effect of a deployment task, and approval authorization —
+*who* may approve — is the hard half, which a login form does not solve.
+*Leaving `auth_mode` free text and documenting the risk*: a paragraph in a
+README is exactly what ADR-017 says a fuse is worth more than. *A shared
+secret header checked by the app*: that is application authentication with
+one credential, no rotation and no revocation — worse than the proxy, and it
+would have to live in the browser bundle to work from the console.
 
 ---
 

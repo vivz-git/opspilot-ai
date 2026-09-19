@@ -2215,6 +2215,25 @@ That last point matters: today `decided_by` is client-supplied and therefore
 **attribution, not authentication** — the code and the docs say so rather than
 implying an audit guarantee that does not exist.
 
+#### 16.6.1 The one supported hosted shape (ADR-026)
+
+None of the above is implemented, so a hosted deployment does not get its
+security from the application. It gets it from an **identity-aware proxy**
+(Cloudflare Access or equivalent) in front of both origins, and it declares
+that with `OPSPILOT_AUTH_MODE=proxy` — an enum with exactly one member, so the
+production fuse cannot be satisfied by typing something into the variable.
+
+Under `proxy`, `require_authorization` refuses any request that does not carry
+`OPSPILOT_PROXY_IDENTITY_HEADER`. The check is presence-only and the header's
+value is read as nothing: not identity, not `actor_id`, not an audit record.
+Its purpose is to fail closed when the proxy is bypassed or misconfigured —
+defence in depth behind the boundary, never the boundary. `docs/deployment.md`
+specifies the Access policy the deployment depends on.
+
+Production additionally refuses empty, wildcard or non-`https://` CORS
+origins, `LOG_LEVEL=DEBUG` (third-party loggers emit below the §14.5 redaction
+processors) and a non-zero `OPSPILOT_TOOL_FAILURE_RATE`.
+
 ### 16.7 Public repository hygiene
 
 This repository is public. Therefore:

@@ -21,6 +21,7 @@ P3  API-001..007                                            the contract is call
 P4  FE-001..008                                             the dashboard exists
 P5  EVAL-001..005 ▸ TEST-002..006                           behaviour is measured
 P6  OBS-004/005, DOC-*                                      hardening and polish
+P7  LAUNCH-001/002                                          hosted operator demo
 ```
 
 The dependency that matters most: **HITL and VERIFICATION land before the API
@@ -214,3 +215,17 @@ Move a SONNET task to OPUS if any of these becomes true mid-task:
 3. A test that should pass fails for a reason nobody understands.
 4. The task turns out to require changing a contract, a status machine or a
    metric definition — that is an ADR, not an implementation detail.
+
+---
+
+## DEPLOYMENT
+
+The hosted shape and its boundary are specified in
+[`docs/deployment.md`](deployment.md) and [ADR-026](decisions.md#adr-026).
+Nothing here adds application authentication; ADR-017 stands.
+
+| ID | Task | Deps | Model | Acceptance criteria |
+|---|---|---|---|---|
+| LAUNCH-001 | Make the system deployable behind an identity-aware proxy: `OPSPILOT_AUTH_MODE` as a validated enum enforced on every endpoint, the remaining production fuses (CORS scheme/emptiness, `LOG_LEVEL=DEBUG`, injected failure rate), a `$PORT`-aware entrypoint with explicit migrations, cross-origin credentials for the console and its SSE stream, and a seed dataset that can serve the canonical request | API-*, FE-* | OPUS | **done** — `app/config.py` (`AuthMode`, five new fuses), `app/api/dependencies.py` + `app/errors.py::AccessDenied`, `backend/scripts/start.sh`, `backend/Dockerfile` (`INSTALL_DEV`), `railway.json`, `frontend/vercel.json`, security headers in `next.config.mjs`, the three London fintech companies and `L-201..L-203` in `app/integrations/mock/fixtures.py`, and the terminal trace event on the approval-resume settle. Verified against a live stack — `docs/progress.md` §LAUNCH-001 lists every check |
+| LAUNCH-002 | Perform the deployment: Railway (API + Postgres), Vercel (console), Cloudflare Access applications over both hostnames with a single-operator allow policy, then the three verification calls in `docs/deployment.md` §5 | LAUNCH-001 | — | `GET /healthz` and `GET /readyz` answer over TLS; `GET /runs` **without** an Access session does not return 200; the canonical demo completes end to end in a browser through the proxy. Requires one-time interactive `railway login` / `vercel login` and Cloudflare dashboard access — it cannot be automated from a sandbox |
+

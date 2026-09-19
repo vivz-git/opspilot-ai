@@ -9,15 +9,19 @@ happened, and records everything it did as an inspectable trace.
 It is deliberately **not** a chatbot. A request produces a *run*: a planned,
 budgeted, terminating unit of work with a status, a trace and a verdict.
 
-> **Project status — architecture complete, implementation starting.**
-> The design is finished and specified in [`docs/architecture.md`](docs/architecture.md).
-> What is implemented today is the contract spine: the typed agent state, the
-> tool contract registry, the error/recovery taxonomy, the approval-binding
-> primitives and configuration, with 214 passing tests. The graph, tools,
-> persistence, API and dashboard are the next phase —
-> see [`docs/tasks.md`](docs/tasks.md). No document here claims more than exists;
-> [`docs/architecture.md` §4.1.1](docs/architecture.md#411-package-layout)
-> marks exactly which modules are built.
+> **Project status — the system runs end to end.**
+> The agent, the nine tools, persistence, approvals, verification, recovery,
+> the evaluation suite, the HTTP API and the operator console are implemented
+> and tested: **1799 backend tests** (93% line coverage) plus 123 frontend
+> unit tests and 14 Playwright specs. The canonical request below runs against
+> a real database, pauses for a human, and finishes with a verified simulated
+> effect and a complete trace.
+>
+> It is **not deployed openly**, and must not be: OpsPilot has no application
+> authentication ([ADR-017](docs/decisions.md#adr-017)). The supported hosted
+> shape is a single-operator console behind an identity-aware proxy —
+> [`docs/deployment.md`](docs/deployment.md),
+> [ADR-026](docs/decisions.md#adr-026).
 
 ---
 
@@ -59,21 +63,33 @@ understand ─► plan ─► decide ─► search_leads          ✓ verified (
 git clone <this repo> && cd opspilot-ai
 cp .env.example .env          # or: make env
 make up                       # Postgres + API at http://localhost:8000
-make migrate                  # apply schema        (available after DB-001)
-make seed                     # load the mock CRM   (available after TOOL-001)
-make up-full                  # adds the dashboard  (available after FE-001)
+make migrate                  # apply schema
+make seed                     # load the mock CRM
+make up-full                  # adds the console at http://localhost:3000
 ```
 
 **No `GROQ_API_KEY` is required.** Leave it blank and the agent uses the
 deterministic rule planner (`OPSPILOT_PLANNER=auto`). Set it to get
 LLM-generated plans and outreach copy. Nothing else changes.
 
-What works today:
+Run the worked example against it — the console has no submission form yet, so
+the run starts over the API and you drive the approval in the browser:
+
+```bash
+curl -fsS -X POST http://localhost:8000/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"user_request":"Find the top 3 fintech leads in London, research their companies, score them, draft outreach to the best one and email it to them.","auto_start":true}'
+```
+
+It pauses at `awaiting_approval`. Open `http://localhost:3000/runs/<run_id>`,
+follow the link to the approval, read the payload, approve — the timeline
+finishes live over SSE. [`docs/deployment.md` §6](docs/deployment.md) lists
+what to check at each step.
 
 ```bash
 cd backend
-pip install -e ".[dev]"
-pytest                        # 214 passed, 1 skipped — contracts, state, recovery, security, structure
+uv sync --locked --extra dev
+uv run pytest                 # 1799 passed, 1 skipped (the opt-in live Groq smoke test)
 ```
 
 ## Documentation
@@ -81,10 +97,11 @@ pytest                        # 214 passed, 1 skipped — contracts, state, reco
 | Document | What it is for |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | The specification. System, agent, graph, state, tool contracts, approval, retry, verification, persistence, API, observability, evaluation, security, testing, integration boundary. |
-| [`docs/decisions.md`](docs/decisions.md) | 23 ADRs — each decision, the alternative rejected, and what it costs. Plus the open questions. |
+| [`docs/decisions.md`](docs/decisions.md) | 26 ADRs — each decision, the alternative rejected, and what it costs. Plus the open questions. |
 | [`docs/tasks.md`](docs/tasks.md) | The prioritized backlog: 70 tasks with dependencies, acceptance criteria and model allocation. |
 | [`docs/progress.md`](docs/progress.md) | What is done, verified and outstanding. |
 | [`docs/handoff.md`](docs/handoff.md) | How the next session continues. **Start here.** |
+| [`docs/deployment.md`](docs/deployment.md) | The hosted operator demo: architecture, environment, the access layer, and the demo script. |
 
 ## The nine tools
 
@@ -116,7 +133,7 @@ Pydantic v2 · SQLAlchemy 2 async · Groq API (`openai/gpt-oss-120b`)
 **Data** PostgreSQL 16 — three schemas: control plane, LangGraph runtime,
 simulated system of record
 **Infra** Docker · docker-compose · GitHub Actions (lint, strict types, tests,
-gitleaks)
+gitleaks) · Railway (API + Postgres) · Vercel (console) · Cloudflare Access
 
 ## Security
 
@@ -129,6 +146,13 @@ OpsPilot has **no authentication in v1** — a deliberate, fenced scope decision
 ([ADR-017](docs/decisions.md#adr-017)). It is a localhost single-operator tool.
 Read that ADR before exposing it anywhere.
 
+A hosted demo is therefore only safe behind an **identity-aware proxy** that
+authenticates before any request reaches the application
+([ADR-026](docs/decisions.md#adr-026)). Declaring that with
+`OPSPILOT_AUTH_MODE=proxy` makes the app refuse any request that did not come
+through the proxy — which is a fail-closed check, not authentication.
+`docs/deployment.md` has the policy and the verification steps.
+
 ## Development
 
 ```bash
@@ -136,7 +160,7 @@ make help            # all targets
 make lint            # ruff + ruff format --check + mypy strict
 make test            # backend suite
 make test-unit       # no database required
-make eval            # deterministic evaluation suite (after EVAL-005)
+make eval            # deterministic evaluation suite
 make secrets-scan    # gitleaks over the working tree
 make check           # everything CI enforces
 ```
