@@ -303,6 +303,11 @@ dropped connection can never produce a permanently stale or gap-ridden timeline.
 `/tools` is not decoration: it renders the same registry the agent obeys, so a
 contract change is visible to a human without reading code.
 
+**Visual direction.** This section is the *information* contract — what each
+route reads and shows. `docs/frontend-design.md` is the companion *visual*
+contract (tokens, component conventions, motion policy, the approvals
+UI contract) — authoritative for every screen from FE-004 on.
+
 ---
 
 ## 4. Agent architecture
