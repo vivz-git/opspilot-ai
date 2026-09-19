@@ -4,6 +4,8 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 
 import {
   createEvaluationRun,
+  decideApproval,
+  getApproval,
   getEvaluationMetrics,
   getEvaluationRun,
   getHealthz,
@@ -14,6 +16,7 @@ import {
   listEvaluationRuns,
   listRuns,
   listTools,
+  type ApprovalDecisionRequest,
   type EvaluationMetricsQuery,
   type EvaluationRunCreateRequest,
   type EvaluationRunListQuery,
@@ -90,6 +93,26 @@ export function useApprovalQueue() {
     queryKey: ["approvals", "queue"],
     queryFn: listApprovalQueue,
     refetchInterval: 15_000,
+  });
+}
+
+export function useApproval(approvalId: string) {
+  return useQuery({
+    queryKey: ["approvals", approvalId],
+    queryFn: () => getApproval(approvalId),
+    enabled: Boolean(approvalId),
+  });
+}
+
+export function useDecideApproval(approvalId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ApprovalDecisionRequest) => decideApproval(approvalId, body),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["approvals", approvalId], updated);
+      queryClient.invalidateQueries({ queryKey: ["approvals", "queue"] });
+      queryClient.invalidateQueries({ queryKey: ["runs", updated.run_id], exact: true });
+    },
   });
 }
 

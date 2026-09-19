@@ -21,6 +21,8 @@ export type RunStepSummary = NonNullable<RunResource["steps"]>[number];
 export type RunPendingApproval = NonNullable<RunResource["pending_approval"]>;
 export type ApprovalQueueResponse = Ok<paths["/approvals/queue"]["get"]["responses"]>;
 export type ApprovalResource = ApprovalQueueResponse[number];
+export type ApprovalDecisionRequest =
+  paths["/approvals/{approval_id}/decision"]["post"]["requestBody"]["content"]["application/json"];
 
 /** GET /runs query parameters, taken directly from the generated operation type. */
 export type RunListQuery = NonNullable<paths["/runs"]["get"]["parameters"]["query"]>;
@@ -111,6 +113,21 @@ export function getRunTrace(runId: string, query: TraceQuery = {}): Promise<Trac
 
 export function listApprovalQueue(): Promise<ApprovalQueueResponse> {
   return request<ApprovalQueueResponse>("/approvals/queue");
+}
+
+export function getApproval(approvalId: string): Promise<ApprovalResource> {
+  return request<ApprovalResource>(`/approvals/${encodeURIComponent(approvalId)}`);
+}
+
+export function decideApproval(
+  approvalId: string,
+  body: ApprovalDecisionRequest
+): Promise<ApprovalResource> {
+  return request<ApprovalResource>(`/approvals/${encodeURIComponent(approvalId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export function listTools(): Promise<ToolListResponse> {

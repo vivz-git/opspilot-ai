@@ -149,8 +149,9 @@ describe("RunDetailView", () => {
     const panel = heading.closest("[class*='rounded-lg']") as HTMLElement;
     expect(within(panel).getByText(run.pending_approval!.title)).toBeInTheDocument();
     const link = within(panel).getByRole("link", { name: /Review in Approvals/ });
-    expect(link).toHaveAttribute("href", "/approvals");
-    // The panel itself never renders an approve/reject action (FE-004's job) —
+    expect(link).toHaveAttribute("href", `/approvals/${run.pending_approval!.approval_id}`);
+    // The panel itself never renders an approve/reject action (that's
+    // ApprovalDetailView's job, at /approvals/{id}) —
     // scoped to the panel because the Plan-vs-Actual row for this step's
     // rationale text ("...the approved outreach email") would otherwise
     // false-positive-match an /approve/i query against the whole document.
