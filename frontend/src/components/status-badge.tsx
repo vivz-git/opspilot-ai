@@ -4,13 +4,14 @@ import { cn } from "@/lib/utils";
 type StatusTone = NonNullable<BadgeProps["variant"]> | "info";
 
 /**
- * Status vocabulary comes from the backend's RunStatus / ApprovalStatus
- * enums (architecture.md §5.4, §9) — the frontend renders it, it doesn't
- * invent its own. `live` states get a pulsing dot (real-time-monitoring
- * convention: an in-progress state should visibly differ from a settled
- * one, not just by color).
+ * Status vocabulary comes from the backend's RunStatus / ApprovalStatus /
+ * StepStatus / VerificationStatus enums (architecture.md §5.4, §8.1, §9) —
+ * the frontend renders it, it doesn't invent its own. `live` states get a
+ * pulsing dot (real-time-monitoring convention: an in-progress state
+ * should visibly differ from a settled one, not just by color).
  */
 const TONE_BY_STATUS: Record<string, { tone: StatusTone; live?: boolean }> = {
+  // RunStatus / ApprovalStatus
   completed: { tone: "success" },
   approved: { tone: "success" },
   running: { tone: "info", live: true },
@@ -23,6 +24,14 @@ const TONE_BY_STATUS: Record<string, { tone: StatusTone; live?: boolean }> = {
   cancelled: { tone: "secondary" },
   expired: { tone: "secondary" },
   superseded: { tone: "secondary" },
+  // StepStatus
+  succeeded: { tone: "success" },
+  ready: { tone: "outline" },
+  skipped: { tone: "secondary" },
+  // VerificationStatus
+  passed: { tone: "success" },
+  not_required: { tone: "outline" },
+  unconfirmed: { tone: "warning" },
 };
 
 /** Whether a status is still in flight (used to distinguish "no duration yet" from "settled"). */

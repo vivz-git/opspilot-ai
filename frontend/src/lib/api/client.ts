@@ -17,12 +17,20 @@ export type Healthz = Ok<paths["/healthz"]["get"]["responses"]>;
 export type RunListResponse = Ok<paths["/runs"]["get"]["responses"]>;
 export type RunSummary = RunListResponse["items"][number];
 export type RunResource = Ok<paths["/runs/{run_id}"]["get"]["responses"]>;
+export type RunStepSummary = NonNullable<RunResource["steps"]>[number];
+export type RunPendingApproval = NonNullable<RunResource["pending_approval"]>;
 export type ApprovalQueueResponse = Ok<paths["/approvals/queue"]["get"]["responses"]>;
 export type ApprovalResource = ApprovalQueueResponse[number];
 
 /** GET /runs query parameters, taken directly from the generated operation type. */
 export type RunListQuery = NonNullable<paths["/runs"]["get"]["parameters"]["query"]>;
 export type RunStatus = NonNullable<RunListQuery["status"]>[number];
+
+export type TraceResponse = Ok<paths["/runs/{run_id}/trace"]["get"]["responses"]>;
+export type TraceEventResource = TraceResponse["events"][number];
+export type TraceEventKind = TraceEventResource["kind"];
+export type TraceEventSeverity = TraceEventResource["severity"];
+export type TraceQuery = NonNullable<paths["/runs/{run_id}/trace"]["get"]["parameters"]["query"]>;
 
 export class ApiError extends Error {
   constructor(
@@ -69,6 +77,17 @@ export function listRuns(query: RunListQuery = {}): Promise<RunListResponse> {
 
 export function getRun(runId: string): Promise<RunResource> {
   return request<RunResource>(`/runs/${encodeURIComponent(runId)}`);
+}
+
+export function getRunTrace(runId: string, query: TraceQuery = {}): Promise<TraceResponse> {
+  const params = new URLSearchParams();
+  if (query.since_seq != null) params.set("since_seq", String(query.since_seq));
+  if (query.limit != null) params.set("limit", String(query.limit));
+  for (const k of query.kind ?? []) params.append("kind", k);
+  if (query.severity_min) params.set("severity_min", query.severity_min);
+
+  const qs = params.toString();
+  return request<TraceResponse>(`/runs/${encodeURIComponent(runId)}/trace${qs ? `?${qs}` : ""}`);
 }
 
 export function listApprovalQueue(): Promise<ApprovalQueueResponse> {

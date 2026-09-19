@@ -15,6 +15,21 @@ export function formatDuration(ms: number | null | undefined): string {
   return `${hours}h ${minutes}m`;
 }
 
+/**
+ * `RunResource` (GET /runs/{id}) does not carry `duration_ms` the way
+ * `RunSummary` (GET /runs) does — a real contract gap, not an oversight to
+ * paper over silently. Derived here from the two real timestamps the
+ * detail endpoint *does* return, the same arithmetic the backend itself
+ * would do, never a fabricated value.
+ */
+export function deriveRunDurationMs(startedAt: string | null, finishedAt: string | null): number | null {
+  if (!startedAt || !finishedAt) return null;
+  const started = new Date(startedAt).getTime();
+  const finished = new Date(finishedAt).getTime();
+  if (Number.isNaN(started) || Number.isNaN(finished)) return null;
+  return Math.max(0, finished - started);
+}
+
 /** Compact timestamp for a dense table cell. */
 export function formatTimestamp(iso: string): string {
   const date = new Date(iso);
