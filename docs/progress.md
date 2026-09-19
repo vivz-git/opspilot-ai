@@ -2039,3 +2039,121 @@ reports no new upgrade operations (this task adds no migration); the
 evaluation gate `python -m app.evaluation.cli run --suite all` passes 7/7 with
 0 invariant violations. All of it against a real PostgreSQL 16 in this
 session, so nothing here was skipped for want of a database.
+
+---
+
+## TEST-003 — the approval-gating suite: the six tests of §9.9 — 2026-09-19
+
+**Done.** `backend/tests/test_approval_gating.py` — 28 integration tests,
+~7 s, no production code changed.
+
+**The claim.** One sentence: a consequential mutation cannot occur without a
+human decision for those exact arguments. §9.5 builds it from three
+independent barriers — the router, the re-assertion in `execute_tool` and
+`ToolRegistry.dispatch`, and the `ApprovalToken` that mutating port methods
+demand — and this module proves each alone and all composed. §9.9 numbers
+the six tests that must exist; the module is organised as one class per
+number, and the docstring carries the mapping.
+
+**What drives them.** The end-to-end tests build the graph with
+`app.execution.runtime.build_driver` — the one function `wire_runtime` and
+the evaluation runner both call (ADR-024) — and drive it through
+`RunService` → `Executor` → `ApprovalService` against real PostgreSQL and
+the real LangGraph saver, with the **real** tool implementations: unlike
+TEST-002 this suite passes no `implementations` override at all, because a
+gate test that substituted the gated tool would be testing the substitute.
+The isolation tests reach one barrier at a time with the same real objects —
+the real `ToolRegistry` over the real mock adapters, the real `NodeHandlers`,
+the real `ApprovalGate`. The *human* is scripted (a real `approvals` row,
+written by `ApprovalService` or by `ApprovalRepository`); the gate, the token
+and the dispatcher never are. §18.2 puts the approval gate among the things
+deliberately not doubled — "never disabled, ever" — and
+`test_this_suite_never_disables_the_gate` parses this module's own syntax
+tree and fails if it references a gate internal (`_assert_gate`,
+`_verify_stored_decision`, `_issue_approval_token`, `_MINT`), passes
+`requires_approval` or `implementations` to anything, or takes a
+`monkeypatch` fixture. §18.3's "no test may disable the gate" is enforced,
+not promised.
+
+**Evidence is the durable record**, never the graph's own account of what it
+did: `mock_crm` rows compared *whole* before and after (a count comparison
+would miss `update_customer`, which mutates in place and adds no row),
+`tool_calls`, `approvals`, `trace_events` and the checkpoint. The clock is a
+`FixedClock` and `seed_database(..., reset=True)` runs per test, so every
+effect count is exact.
+
+**The six claims.**
+
+| §9.9 | Claim | What is asserted |
+|---|---|---|
+| **1** | a paused run performs no `mock_crm` write | `email_outbox` and `customers` are row-for-row identical across the pause, for a `send_email_mock` gate and an `update_customer` gate; no `tool_calls` row and only `approval_requested` for the gated step; the run row is `awaiting_approval` with the lease released. The control that makes it mean something: the ungated `save_draft`/`get_customer` work *did* happen, so the run genuinely reached the gate rather than dying early |
+| **2** | `execute_tool` alone raises `PolicyViolation` with no grant | the node is called **directly**, so barrier 1 has failed by construction. Refused for: no decision, a `reject` decision, a decision for a neighbouring step, an undecided `pending` row, and — the independence claim — a checkpointed grant for exactly these arguments with no durable `approved` row behind it. `ToolRegistry.dispatch(approval_token=None)` raises `ApprovalRequiredError` and records a `failed` attempt with `adapter IS NULL`, the ADR-024 signature of a refusal before the port |
+| **3** | `MailPort.send` is uncallable without a token | the compile-time half, executed: six calls type-checked with the project's own mypy configuration — omitted, `None` and string tokens rejected `[call-arg]`/`[arg-type]`, and the two calls presenting a real token clean, because a checker that rejected everything would prove nothing. Plus the runtime constructor test the acceptance criteria name: direct construction, a guessed sentinel, attribute mutation and `dataclasses.replace` all raise `PolicyViolation`; `token` is a required keyword-only parameter of exactly `MailPort.send` and `CustomerPort.update`; the adapter refuses a forged token and writes nothing; and CI is asserted to run `mypy app` *before* `pytest` |
+| **4** | rejection is `rejected`, zero effects, named | `rejected`/`approval_rejected` (never `failed`), the step `rejected`, `s6` in `not_done` and in the summary and in neither `done` nor `unconfirmed`, the same on the persisted `final_response`; the tables unchanged; no `tool_calls` row and no `tool_*` event naming the declined step; the operator and reason on the row and in the `approval_rejected` event. Repeated for a declined customer update |
+| **5** | a grant for hash A does not authorise hash B | B is the same draft to a different recipient — the substitution a revised plan, a re-resolved `$ref` or an injected instruction would make after the human read A. Refused at each barrier *independently*: by `approval_state` (barrier 2), by the gate over the durable row while barrier 2 is deliberately satisfied *for B* (barrier 3), and by the dispatcher holding a genuinely gate-minted token for A with B on the wire — the strongest form, because nothing about the token is forged. Positive control: A itself dispatches, writes one outbox row to Dana, and carries the approval id |
+| **6** | resuming twice sends exactly one email | the same approve posted twice (one winner, one no-op), four concurrent approves (one winner, the losers `ApprovalConflictError` — "first writer wins, audibly"), and a decision that committed before the worker died, where the *replay* is the resume that performs the effect. Each leaves one `email_outbox` row for the run, one `approval_granted` and one succeeded attempt, whose `idempotency_key` is `(run_id, step_id, args_hash)` and nothing attempt-dependent (§10.4, ADR-020) |
+
+**The assertions bite.** Two mutations of production code were run against
+the suite and each turned it red: `ToolRegistry._assert_gate` returning early
+on a missing token, and `ApprovalGate.issue_from_persisted` skipping the
+`args_hash` comparison — the latter caught *specifically*, because the test
+distinguishes which barrier refused, and the failure showed
+`ApprovalGate.issue` still refusing underneath it. Both mutations were
+reverted. A third check confirmed the whole-row snapshot detects an in-place
+`UPDATE` to `mock_crm.customers`, which is the failure a row-count comparison
+would have missed.
+
+**Two divergences between §9 and the code, reported and not changed here.**
+Neither is required by TEST-003's acceptance criteria, and fixing either is a
+change to the approval path — an OPUS change with an ADR, not a line in a
+test commit.
+
+1. **The adapter does not re-validate the hash.** §9.5 says "The adapter
+   re-validates the hash against the payload it was handed", and
+   `ApprovalToken.authorises` documents itself as "Re-checked inside the
+   adapter". `MockMailAdapter.send` and `MockCustomerAdapter.update` check
+   only `isinstance(token, ApprovalToken)`. The check does happen, in
+   `ToolRegistry._assert_gate`, which calls `token.authorises(...)` against
+   the arguments before the port is reached — so the *property* holds on
+   every path the application has, and TEST-003 asserts it there. It is not
+   obviously implementable at the port as written: the adapter is handed an
+   `OutboundMessage`, not the tool's arguments, so it cannot recompute the
+   hash the token carries without the port taking the tool's argument
+   dictionary as well. Either the architecture sentence or the port
+   signature should move; this records the question for whoever decides.
+2. **The operator's reason is not quoted in the response.** §9.6 says
+   `complete` "produces a response that names what was not done and why,
+   quoting the operator's reason". `ApprovalService` resumes with
+   `Command(resume=decision_kind.value)` — a bare `"approve"`/`"reject"` —
+   so `_decision_from_resume` builds an `ApprovalDecision` with
+   `reason=None`, and `synthesize_complete_response` names the declined step
+   but cannot quote a reason it was never given. The reason is durable on the
+   `approvals` row and in the `approval_rejected` event, so nothing is lost
+   for the dashboard or the audit trail; only the synthesized summary is
+   poorer than §9.6 describes. §9.9 #4 and §18.3 both ask for "a response
+   naming the declined action", which the response does, so the suite asserts
+   what the code genuinely provides rather than inventing a semantics.
+
+**Verification.** `tests/test_approval_gating.py` 28 passed in ~7 s, none
+skipped; run with the HITL, approval-API, registry, dispatch, tool-policy,
+structural, security, verification and graph-behaviour suites, 561 passed;
+the full backend suite **1770 passed, 1 skipped** against a fresh database
+(baseline before this task: 1742 passed, 1 skipped — the same single skip,
+the opt-in live Groq smoke test, nothing newly skipped); `ruff check .`,
+`ruff format --check .` and `mypy app --strict` clean; `alembic check`
+reports no new upgrade operations (this task adds no migration); the
+evaluation gate `python -m app.evaluation.cli run --suite all` passes 7/7
+with 0 invariant violations. All against a real PostgreSQL 16 in this
+session, so nothing here was skipped for want of a database.
+
+**One environment-only issue, pre-existing and unrelated to this task.**
+`tests/test_api_approvals.py::TestApprovalApiPostgresIntegration::
+test_full_http_decision_cycle_with_real_persistence` fails on a database
+that has accumulated rows from earlier sessions: it asserts its approval
+appears in `GET /approvals/queue`, and `ApprovalRepository.list_pending` is
+global with `ORDER BY requested_at DESC LIMIT 50`, so a long-lived database
+with more than fifty newer pending approvals pushes the row off the page.
+It passes on a fresh database and in the full-suite run above, and CI uses a
+throwaway Postgres service, so this is a test-isolation weakness in that
+file (the queue query is not scoped to the run under test) rather than a
+defect in the approval path — and it is untouched by this task.
