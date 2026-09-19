@@ -8,6 +8,10 @@ const nextConfig = {
   // The browser talks to the API directly (CORS allowlisted server-side);
   // no rewrite proxy, so the deployed origin split stays explicit.
   env: {},
+  // Playwright drives the dev server over 127.0.0.1 while it's addressed as
+  // localhost internally; harmless outside dev (this option is a no-op for
+  // `next build`/`next start`).
+  allowedDevOrigins: ["127.0.0.1"],
 };
 
 export default nextConfig;

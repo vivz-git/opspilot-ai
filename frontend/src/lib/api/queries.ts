@@ -1,13 +1,21 @@
 "use client";
 
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
+  createEvaluationRun,
+  getEvaluationMetrics,
+  getEvaluationRun,
   getHealthz,
   getRun,
   getRunTrace,
   listApprovalQueue,
+  listEvaluationResults,
+  listEvaluationRuns,
   listRuns,
+  type EvaluationMetricsQuery,
+  type EvaluationRunCreateRequest,
+  type EvaluationRunListQuery,
   type RunListQuery,
   type TraceEventResource,
 } from "./client";
@@ -81,5 +89,55 @@ export function useApprovalQueue() {
     queryKey: ["approvals", "queue"],
     queryFn: listApprovalQueue,
     refetchInterval: 15_000,
+  });
+}
+
+/** A run that is still executing is polled; a terminal one never needs to be asked again. */
+const ACTIVE_EVALUATION_STATUSES = new Set(["running"]);
+
+export function useEvaluationRuns(query: EvaluationRunListQuery = {}) {
+  return useQuery({
+    queryKey: ["evaluations", "runs", query],
+    queryFn: () => listEvaluationRuns(query),
+    placeholderData: keepPreviousData,
+    refetchInterval: (q) => {
+      const items = q.state.data?.items ?? [];
+      return items.some((r) => ACTIVE_EVALUATION_STATUSES.has(r.status)) ? 5_000 : false;
+    },
+  });
+}
+
+export function useEvaluationRun(evaluationRunId: string) {
+  return useQuery({
+    queryKey: ["evaluations", "runs", evaluationRunId],
+    queryFn: () => getEvaluationRun(evaluationRunId),
+    enabled: Boolean(evaluationRunId),
+    refetchInterval: (q) =>
+      q.state.data && ACTIVE_EVALUATION_STATUSES.has(q.state.data.status) ? 3_000 : false,
+  });
+}
+
+export function useEvaluationResults(evaluationRunId: string) {
+  return useQuery({
+    queryKey: ["evaluations", "runs", evaluationRunId, "results"],
+    queryFn: () => listEvaluationResults(evaluationRunId),
+    enabled: Boolean(evaluationRunId),
+  });
+}
+
+export function useEvaluationMetrics(query: EvaluationMetricsQuery = {}) {
+  return useQuery({
+    queryKey: ["evaluations", "metrics", query],
+    queryFn: () => getEvaluationMetrics(query),
+  });
+}
+
+export function useCreateEvaluationRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: EvaluationRunCreateRequest) => createEvaluationRun(body),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["evaluations"] });
+    },
   });
 }
