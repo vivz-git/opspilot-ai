@@ -87,7 +87,11 @@ test("new trace events pushed over SSE appear without a page reload", async ({ p
   );
 
   await page.goto(`/runs/${RUN_ID}`);
-  await expect(page.getByText("plan_created")).toBeVisible();
+  // A generous timeout here: under a shared dev server compiling several
+  // routes' first visit in parallel across e2e workers, the initial JS
+  // chunk for this dynamic route can take a while to build — that's dev
+  // server contention, not the SSE behavior under test.
+  await expect(page.getByText("plan_created")).toBeVisible({ timeout: 20_000 });
 
   // Pushed live, never in the initial REST trace fetch above.
   await expect(page.getByText("tool_started")).toBeVisible();
