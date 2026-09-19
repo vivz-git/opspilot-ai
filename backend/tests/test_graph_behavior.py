@@ -716,6 +716,7 @@ class TestRetryAndTerminalFailure:
         # The backoff was asserted on, not waited for.
         assert [int(s * 1000) for s in h.clock.sleep_calls] == delays
 
+    @pytest.mark.critical
     async def test_a_permanently_failing_tool_stops_at_exactly_one_plus_max_retries(
         self, make_run: Callable[..., Awaitable[Harness]]
     ) -> None:
@@ -881,6 +882,7 @@ class TestSkipAndReplan:
 # 5. Verify: its own node, its own failure, its own recovery
 # ---------------------------------------------------------------------------
 class TestVerification:
+    @pytest.mark.critical
     async def test_a_lying_tool_is_caught_by_the_read_back_and_the_retry_writes_for_real(
         self, make_run: Callable[..., Awaitable[Harness]]
     ) -> None:

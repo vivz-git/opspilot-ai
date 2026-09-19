@@ -113,4 +113,14 @@ markers = [
   "integration: requires Postgres",
   "contract: validates a published contract (tool, API, or state)",
   "eval: deterministic end-to-end evaluation scenario",
+  "critical: one of the six §18.4 tests that protect the product's claims; skipping it fails the run (TEST-006)",
 ]
+
+# ---------------------------------------------------------------------------
+# Coverage — the TEST-006 / §18.4 backend floor. `fail_under` is the single
+# source of truth for the 80% number; CI passes --cov-fail-under=80 too so
+# the threshold is visible directly in the workflow file, not just here.
+# ---------------------------------------------------------------------------
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

@@ -1238,3 +1238,77 @@ def test_trace_redaction_is_presentation_only_and_does_not_mutate_persisted_obje
     assert event.payload["api_key"] == "sk-secret-12345"
     assert event.payload["nested"]["auth_token"] == "token-xyz"  # noqa: S105
     assert event.input["password"] == "supersecretpassword"  # noqa: S105
+
+
+# ---------------------------------------------------------------------------
+# TEST-006 — §18.4's six tests cannot be silently swapped or unmarked
+# ---------------------------------------------------------------------------
+TESTS_DIR = APP.parent / "tests"
+
+#: The exact six tests §18.4 names as "the ones that protect the product's
+#: claims", hardcoded by file and node name so this task cannot substitute a
+#: different set. A `ClassDef` covers every method inside it — TEST-003
+#: already grouped three of its six §9.9 claims into one class each, and
+#: three of those classes double as three of these six.
+CRITICAL_TESTS_18_4: tuple[tuple[str, str, str], ...] = (
+    (
+        "test_approval_gating.py",
+        "TestAPausedRunWritesNothing",
+        "§18.4 #1 — a paused run writes nothing",
+    ),
+    (
+        "test_approval_gating.py",
+        "TestMutationIsUncallableWithoutAToken",
+        "§18.4 #2 — uncallable without a token",
+    ),
+    (
+        "test_graph_behavior.py",
+        "test_a_lying_tool_is_caught_by_the_read_back_and_the_retry_writes_for_real",
+        "§18.4 #3 — the lying tool is caught",
+    ),
+    (
+        "test_approval_gating.py",
+        "TestResumingTwiceSendsExactlyOneEmail",
+        "§18.4 #4 — exactly one effect under double resume/retry",
+    ),
+    (
+        "test_graph_behavior.py",
+        "test_a_permanently_failing_tool_stops_at_exactly_one_plus_max_retries",
+        "§18.4 #5 — exact attempt count on permanent failure",
+    ),
+    (
+        "test_determinism.py",
+        "test_the_same_case_run_twice_yields_an_identical_trace",
+        "§18.4 #6 — identical trace on re-run",
+    ),
+)
+
+
+def _carries_critical_marker(decorator_list: list[ast.expr]) -> bool:
+    return any(ast.unparse(dec) == "pytest.mark.critical" for dec in decorator_list)
+
+
+def test_the_six_critical_tests_of_18_4_are_marked_critical_and_present() -> None:
+    """TEST-006's acceptance criteria: "the six critical tests cannot be
+    skipped silently." `tests/conftest.py` fails the run if any test carrying
+    `@pytest.mark.critical` is skipped — but that guard is worthless if the
+    six tests it watches can be silently renamed, deleted, or unmarked. This
+    pins the exact set §18.4 names, so a different six can't be substituted."""
+    assert len(CRITICAL_TESTS_18_4) == 6
+    for filename, name, label in CRITICAL_TESTS_18_4:
+        path = TESTS_DIR / filename
+        assert path.exists(), f"{label}: {filename} not found"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == name
+            ),
+            None,
+        )
+        assert found is not None, f"{label}: {name} not found in {filename}"
+        assert _carries_critical_marker(found.decorator_list), (
+            f"{label}: {filename}::{name} must carry @pytest.mark.critical"
+        )
