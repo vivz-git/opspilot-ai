@@ -13,6 +13,7 @@ import {
   listEvaluationResults,
   listEvaluationRuns,
   listRuns,
+  listTools,
   type EvaluationMetricsQuery,
   type EvaluationRunCreateRequest,
   type EvaluationRunListQuery,
@@ -89,6 +90,13 @@ export function useApprovalQueue() {
     queryKey: ["approvals", "queue"],
     queryFn: listApprovalQueue,
     refetchInterval: 15_000,
+  });
+}
+
+export function useTools() {
+  return useQuery({
+    queryKey: ["tools"],
+    queryFn: listTools,
   });
 }
 

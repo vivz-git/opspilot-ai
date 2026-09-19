@@ -32,6 +32,9 @@ export type TraceEventKind = TraceEventResource["kind"];
 export type TraceEventSeverity = TraceEventResource["severity"];
 export type TraceQuery = NonNullable<paths["/runs/{run_id}/trace"]["get"]["parameters"]["query"]>;
 
+export type ToolListResponse = Ok<paths["/tools"]["get"]["responses"]>;
+export type ToolResource = ToolListResponse[number];
+
 export type EvaluationRunListResponse = Ok<paths["/evaluations/runs"]["get"]["responses"]>;
 export type EvaluationRunResource = EvaluationRunListResponse["items"][number];
 export type EvaluationRunListQuery = NonNullable<
@@ -108,6 +111,10 @@ export function getRunTrace(runId: string, query: TraceQuery = {}): Promise<Trac
 
 export function listApprovalQueue(): Promise<ApprovalQueueResponse> {
   return request<ApprovalQueueResponse>("/approvals/queue");
+}
+
+export function listTools(): Promise<ToolListResponse> {
+  return request<ToolListResponse>("/tools");
 }
 
 export function listEvaluationRuns(
