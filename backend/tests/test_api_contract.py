@@ -65,14 +65,11 @@ this task requires. Out of scope here; recorded for whoever owns OBS-005 or
 a future API task. The tests below assert what the API genuinely returns
 (no `trace_id` key), not the aspirational doc text.
 
-**Documented-but-unbuilt surface.** §13.6 (evaluation endpoints, API-005) and
-the `GET /tools` catalog route of §13.7 (API-006) are not implemented
-anywhere in `app/api` or wired into `app/main.py` — `docs/tasks.md` and
-`docs/progress.md` both list API-005/006 as outstanding. There is nothing to
-drive over ASGI transport, and inventing the routes is out of scope for a
-test-only task. `test_documented_but_unbuilt_endpoints_are_absent` below is a
-tripwire, not a workaround: it fails the day someone adds `/tools` or
-`/evaluations` without adding their contract tests alongside.
+**Evaluation and tool catalog endpoints.** §13.6 (API-005) and §13.7
+(API-006) are now implemented (`app/api/evaluations.py`, `app/api/tools.py`)
+and wired into `app/main.py`. Their contract tests live in
+`tests/test_api_tools_evaluations.py`, not here, so this file's own table
+above stays scoped to the runs/approvals/health surface it already covered.
 
 Every test here uses `httpx.AsyncClient(transport=ASGITransport(app=app))`
 against a real `create_app()` instance and never calls a service method
@@ -89,7 +86,6 @@ from unittest.mock import AsyncMock
 import pytest
 from app.agent.state import RunStatus
 from app.api.dependencies import get_run_service
-from app.config import Settings
 from app.errors import BudgetExhaustedError
 from app.execution.runs import RunCreateResult, RunService
 from app.main import create_app
@@ -293,19 +289,3 @@ class TestRunManagementConflictsRealComposition:
             assert row.parent_run_id is None
             await uow.commit()
 
-
-# ---------------------------------------------------------------------------
-# The documented-but-unbuilt API surface (API-005, API-006's `/tools`)
-# ---------------------------------------------------------------------------
-def test_documented_but_unbuilt_endpoints_are_absent() -> None:
-    """A tripwire, not a workaround (§ module docstring): §13.6/§13.7 document
-    the evaluation endpoints and `GET /tools`, but no router for either is
-    wired into `app.main` (confirmed against `docs/tasks.md`'s API-005/006
-    rows, both outstanding). This fails the day someone adds the route
-    without adding the contract test that must come with it."""
-    app = create_app(settings=Settings(_env_file=None))
-    paths = set(app.openapi()["paths"])
-
-    assert "/tools" not in paths
-    assert "/api/v1/tools" not in paths
-    assert not any(p.startswith(("/evaluations", "/api/v1/evaluations")) for p in paths)

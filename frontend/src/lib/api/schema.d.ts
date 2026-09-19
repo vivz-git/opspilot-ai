@@ -67,6 +67,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/evaluations/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Evaluation Metrics
+         * @description Return the §15.4 metric snapshot of the most recent matching run.
+         *
+         *     An empty `metrics` object (with `evaluation_run_id: null`) means no run
+         *     has been recorded yet — never a fabricated zero-valued snapshot.
+         */
+        get: operations["get_evaluation_metrics_api_v1_evaluations_metrics_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/evaluations/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Evaluation Runs
+         * @description Return evaluation runs, most recently started first (§12.8).
+         */
+        get: operations["list_evaluation_runs_api_v1_evaluations_runs_get"];
+        put?: never;
+        /**
+         * Create Evaluation Run
+         * @description Start a suite run. Returns immediately with the `running` row; the
+         *     suite executes in the background and completes the row as the CLI does.
+         */
+        post: operations["create_evaluation_run_api_v1_evaluations_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/evaluations/runs/{evaluation_run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Evaluation Run */
+        get: operations["get_evaluation_run_api_v1_evaluations_runs__evaluation_run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/evaluations/runs/{evaluation_run_id}/results": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Evaluation Results
+         * @description Return every case result for one evaluation run, ordered by case id.
+         */
+        get: operations["list_evaluation_results_api_v1_evaluations_runs__evaluation_run_id__results_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/runs": {
         parameters: {
             query?: never;
@@ -211,6 +296,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Tools
+         * @description Return every registered tool contract (§8.2), in registry order.
+         */
+        get: operations["list_tools_api_v1_tools_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/approvals/queue": {
         parameters: {
             query?: never;
@@ -268,6 +373,91 @@ export interface paths {
          *     The database conditional update resolves races and idempotency.
          */
         post: operations["decide_approval_approvals__approval_id__decision_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluations/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Evaluation Metrics
+         * @description Return the §15.4 metric snapshot of the most recent matching run.
+         *
+         *     An empty `metrics` object (with `evaluation_run_id: null`) means no run
+         *     has been recorded yet — never a fabricated zero-valued snapshot.
+         */
+        get: operations["get_evaluation_metrics_evaluations_metrics_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluations/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Evaluation Runs
+         * @description Return evaluation runs, most recently started first (§12.8).
+         */
+        get: operations["list_evaluation_runs_evaluations_runs_get"];
+        put?: never;
+        /**
+         * Create Evaluation Run
+         * @description Start a suite run. Returns immediately with the `running` row; the
+         *     suite executes in the background and completes the row as the CLI does.
+         */
+        post: operations["create_evaluation_run_evaluations_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluations/runs/{evaluation_run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Evaluation Run */
+        get: operations["get_evaluation_run_evaluations_runs__evaluation_run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluations/runs/{evaluation_run_id}/results": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Evaluation Results
+         * @description Return every case result for one evaluation run, ordered by case id.
+         */
+        get: operations["list_evaluation_results_evaluations_runs__evaluation_run_id__results_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -455,6 +645,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Tools
+         * @description Return every registered tool contract (§8.2), in registry order.
+         */
+        get: operations["list_tools_tools_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -545,6 +755,127 @@ export interface components {
          * @enum {string}
          */
         ApprovalStatus: "pending" | "approved" | "rejected" | "expired" | "superseded" | "cancelled";
+        /**
+         * EvaluationMetricsResponse
+         * @description GET /evaluations/metrics — the §15.4 snapshot of the latest matching run.
+         *
+         *     Not a new computation: `metrics` is copied verbatim from the most recent
+         *     `evaluation_runs.metrics` (optionally filtered by `suite`), the same
+         *     JSONB the runner (EVAL-003) already wrote.
+         */
+        EvaluationMetricsResponse: {
+            /** Evaluation Run Id */
+            evaluation_run_id?: string | null;
+            /** Metrics */
+            metrics?: {
+                [key: string]: unknown;
+            };
+            /** Suite */
+            suite?: string | null;
+        };
+        /**
+         * EvaluationResultResource
+         * @description One `evaluation_results` row (§12.8) — a single case's outcome.
+         */
+        EvaluationResultResource: {
+            /** Approval Outcome */
+            approval_outcome?: string | null;
+            /** Assertions */
+            assertions?: {
+                [key: string]: unknown;
+            }[];
+            /** Case Id */
+            case_id: string;
+            /** Duration Ms */
+            duration_ms?: number | null;
+            /**
+             * Evaluation Run Id
+             * Format: uuid
+             */
+            evaluation_run_id: string;
+            /** Failure Reason */
+            failure_reason?: string | null;
+            /** Passed */
+            passed: boolean;
+            /**
+             * Result Id
+             * Format: uuid
+             */
+            result_id: string;
+            /** Retry Count */
+            retry_count: number;
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+            /** Tool Calls Count */
+            tool_calls_count: number;
+        };
+        /**
+         * EvaluationRunCreateRequest
+         * @description Payload for POST /evaluations/runs.
+         */
+        EvaluationRunCreateRequest: {
+            /**
+             * Suite
+             * @description Suite name declared in evals/suites.yaml.
+             * @default all
+             */
+            suite: string;
+        };
+        /** EvaluationRunListResponse */
+        EvaluationRunListResponse: {
+            /** Items */
+            items: components["schemas"]["EvaluationRunResource"][];
+        };
+        /**
+         * EvaluationRunResource
+         * @description One `evaluation_runs` row (§12.8).
+         */
+        EvaluationRunResource: {
+            /** Case Count */
+            case_count: number;
+            /**
+             * Evaluation Run Id
+             * Format: uuid
+             */
+            evaluation_run_id: string;
+            /** Failed */
+            failed: number;
+            /** Finished At */
+            finished_at?: string | null;
+            /** Git Sha */
+            git_sha?: string | null;
+            /** Metrics */
+            metrics?: {
+                [key: string]: unknown;
+            };
+            /** Model Id */
+            model_id?: string | null;
+            /** Passed */
+            passed: number;
+            planner_kind: components["schemas"]["PlannerKind"];
+            /** Prompt Version */
+            prompt_version?: string | null;
+            /** Seed */
+            seed?: number | null;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            status: components["schemas"]["EvaluationRunStatus"];
+            /** Suite */
+            suite: string;
+        };
+        /**
+         * EvaluationRunStatus
+         * @description §12.8 — one suite execution's lifecycle. Distinct from `RunStatus`,
+         *     which is the *agent* run each case drives, not the suite itself.
+         * @enum {string}
+         */
+        EvaluationRunStatus: "running" | "completed" | "failed";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -802,6 +1133,47 @@ export interface components {
             /** Started At */
             started_at?: string | null;
         };
+        /** ToolFailureModeResource */
+        ToolFailureModeResource: {
+            /** Description */
+            description: string;
+            /** Error Class */
+            error_class: string;
+        };
+        /**
+         * ToolResource
+         * @description One entry of the `GET /tools` catalog — a contract, not a live tool.
+         */
+        ToolResource: {
+            /** Failure Modes */
+            failure_modes: components["schemas"]["ToolFailureModeResource"][];
+            /** Idempotent */
+            idempotent: boolean;
+            /** Name */
+            name: string;
+            /** Nondeterministic */
+            nondeterministic: boolean;
+            /** Purpose */
+            purpose: string;
+            /** Requires Approval */
+            requires_approval: boolean;
+            /** Risk */
+            risk: string;
+            /** Schemas */
+            schemas: {
+                [key: string]: unknown;
+            };
+            /** Side Effect */
+            side_effect: string;
+            /** Timeout Ms */
+            timeout_ms: number;
+            /** Untrusted Output */
+            untrusted_output: boolean;
+            /** Verification */
+            verification: string;
+            /** Version */
+            version: string;
+        };
         /**
          * TraceEventKind
          * @description §14.2 — the fixed vocabulary of product-trace events.
@@ -988,6 +1360,167 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApprovalResource"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_evaluation_metrics_api_v1_evaluations_metrics_get: {
+        parameters: {
+            query?: {
+                /** @description Restrict to the latest run of one suite. */
+                suite?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationMetricsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_evaluation_runs_api_v1_evaluations_runs_get: {
+        parameters: {
+            query?: {
+                /** @description Filter to one suite. */
+                suite?: string | null;
+                /** @description Max runs to return. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationRunListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_evaluation_run_api_v1_evaluations_runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvaluationRunCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationRunResource"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_evaluation_run_api_v1_evaluations_runs__evaluation_run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                evaluation_run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationRunResource"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_evaluation_results_api_v1_evaluations_runs__evaluation_run_id__results_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                evaluation_run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationResultResource"][];
                 };
             };
             /** @description Validation Error */
@@ -1283,6 +1816,26 @@ export interface operations {
             };
         };
     };
+    list_tools_api_v1_tools_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ToolResource"][];
+                };
+            };
+        };
+    };
     list_approval_queue_approvals_queue_get: {
         parameters: {
             query?: {
@@ -1368,6 +1921,167 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApprovalResource"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_evaluation_metrics_evaluations_metrics_get: {
+        parameters: {
+            query?: {
+                /** @description Restrict to the latest run of one suite. */
+                suite?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationMetricsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_evaluation_runs_evaluations_runs_get: {
+        parameters: {
+            query?: {
+                /** @description Filter to one suite. */
+                suite?: string | null;
+                /** @description Max runs to return. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationRunListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_evaluation_run_evaluations_runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvaluationRunCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationRunResource"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_evaluation_run_evaluations_runs__evaluation_run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                evaluation_run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationRunResource"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_evaluation_results_evaluations_runs__evaluation_run_id__results_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                evaluation_run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluationResultResource"][];
                 };
             };
             /** @description Validation Error */
@@ -1701,6 +2415,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_tools_tools_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ToolResource"][];
                 };
             };
         };
