@@ -59,6 +59,8 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy app
       - run: uv run pytest --cov=app --cov-report=term-missing
+      - run: uv run alembic upgrade head
+      - run: uv run python -m app.evaluation.cli run --suite all
 
   frontend:
     name: Frontend (lint, types, tests)
