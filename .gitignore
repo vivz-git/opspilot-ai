@@ -59,3 +59,7 @@ docker-compose.override.yml
 # Local scratch
 tmp/
 scratch/
+
+# Locally installed Claude Code skills (third-party, session-local tooling —
+# not part of this project's shipped source).
+.claude/
