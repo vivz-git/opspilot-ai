@@ -140,7 +140,7 @@ describe("RunDetailView", () => {
     expect(screen.getByText("Still waiting on a human decision.")).toBeInTheDocument();
   });
 
-  it("renders the pending-approval panel with a link to the Approvals workflow, and no approve/reject action", async () => {
+  it("renders the pending-approval panel with a link to its approval detail page, and no approve/reject action", async () => {
     const { run, events } = buildRunWithRetryAndApproval();
     mockRunAndTrace(run, events);
     renderWithQueryClient(<RunDetailView runId={run.run_id} />);
@@ -148,8 +148,8 @@ describe("RunDetailView", () => {
     const heading = await screen.findByText("Awaiting approval");
     const panel = heading.closest("[class*='rounded-lg']") as HTMLElement;
     expect(within(panel).getByText(run.pending_approval!.title)).toBeInTheDocument();
-    const link = within(panel).getByRole("link", { name: /Review in Approvals/ });
-    expect(link).toHaveAttribute("href", "/approvals");
+    const link = within(panel).getByRole("link", { name: /Review this approval/ });
+    expect(link).toHaveAttribute("href", `/approvals/${run.pending_approval!.approval_id}`);
     // The panel itself never renders an approve/reject action (FE-004's job) —
     // scoped to the panel because the Plan-vs-Actual row for this step's
     // rationale text ("...the approved outreach email") would otherwise

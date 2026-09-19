@@ -1,13 +1,16 @@
 "use client";
 
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
+  decideApproval,
+  getApproval,
   getHealthz,
   getRun,
   getRunTrace,
   listApprovalQueue,
   listRuns,
+  type ApprovalDecisionRequest,
   type RunListQuery,
   type TraceEventResource,
 } from "./client";
@@ -81,5 +84,35 @@ export function useApprovalQueue() {
     queryKey: ["approvals", "queue"],
     queryFn: listApprovalQueue,
     refetchInterval: 15_000,
+  });
+}
+
+export function useApproval(approvalId: string) {
+  return useQuery({
+    queryKey: ["approvals", approvalId],
+    queryFn: () => getApproval(approvalId),
+    enabled: Boolean(approvalId),
+  });
+}
+
+/**
+ * The only state this drives is `ApprovalResource.status`, always freshly
+ * read from the server — there is no local approval state machine. Every
+ * settle (success *or* conflict) refetches this approval so the screen
+ * shows the server's current truth (e.g. now "superseded" or "expired")
+ * instead of the stale "pending" it was rendered from. It never fetches or
+ * navigates to a *different* approval — the API doesn't expose which one
+ * superseded this one, and even if it did, switching underneath the
+ * operator without them asking is exactly what "never silently switch to
+ * a newer approval" rules out.
+ */
+export function useDecideApproval(approvalId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ApprovalDecisionRequest) => decideApproval(approvalId, body),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["approvals", approvalId] });
+      queryClient.invalidateQueries({ queryKey: ["approvals", "queue"] });
+    },
   });
 }

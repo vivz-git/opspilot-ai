@@ -1,5 +1,7 @@
 "use client";
 
+import { useRouter } from "next/navigation";
+
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,6 +17,7 @@ import {
 import { useApprovalQueue } from "@/lib/api/queries";
 
 export default function ApprovalsPage() {
+  const router = useRouter();
   const { data, isPending, isError, error } = useApprovalQueue();
 
   return (
@@ -69,7 +72,20 @@ export default function ApprovalsPage() {
             </TableHeader>
             <TableBody>
               {data.map((approval) => (
-                <TableRow key={approval.approval_id}>
+                <TableRow
+                  key={approval.approval_id}
+                  role="link"
+                  tabIndex={0}
+                  aria-label={`Open approval ${approval.approval_id}`}
+                  className="cursor-pointer"
+                  onClick={() => router.push(`/approvals/${approval.approval_id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      router.push(`/approvals/${approval.approval_id}`);
+                    }
+                  }}
+                >
                   <TableCell className="max-w-sm">
                     <div className="font-medium">{approval.title}</div>
                     <div className="truncate text-xs text-muted-foreground">

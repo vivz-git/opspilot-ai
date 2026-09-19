@@ -9,9 +9,9 @@ import { formatTimestamp } from "@/lib/format";
 
 /**
  * Renders the pending approval already carried on `RunResource.pending_approval`.
- * No approve/reject action here — that mechanism belongs to FE-004. This
- * only points at the existing /approvals workflow, it does not build a
- * second one.
+ * No approve/reject action here — the one decision surface is the approval
+ * detail page this links to (§5.6: never a shortcut action bolted onto a
+ * different page).
  */
 export function ApprovalPanel({ approval }: { approval: RunPendingApproval }) {
   return (
@@ -34,8 +34,8 @@ export function ApprovalPanel({ approval }: { approval: RunPendingApproval }) {
           <span>expires {formatTimestamp(approval.expires_at)}</span>
         </div>
         <Button asChild variant="outline" size="sm" className="w-fit">
-          <Link href="/approvals">
-            Review in Approvals
+          <Link href={`/approvals/${approval.approval_id}`}>
+            Review this approval
             <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
           </Link>
         </Button>

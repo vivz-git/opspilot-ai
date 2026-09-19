@@ -21,6 +21,10 @@ export type RunStepSummary = NonNullable<RunResource["steps"]>[number];
 export type RunPendingApproval = NonNullable<RunResource["pending_approval"]>;
 export type ApprovalQueueResponse = Ok<paths["/approvals/queue"]["get"]["responses"]>;
 export type ApprovalResource = ApprovalQueueResponse[number];
+export type ApprovalDecisionRequest = NonNullable<
+  paths["/approvals/{approval_id}/decision"]["post"]["requestBody"]
+>["content"]["application/json"];
+export type ApprovalDecisionKind = ApprovalDecisionRequest["decision"];
 
 /** GET /runs query parameters, taken directly from the generated operation type. */
 export type RunListQuery = NonNullable<paths["/runs"]["get"]["parameters"]["query"]>;
@@ -92,4 +96,26 @@ export function getRunTrace(runId: string, query: TraceQuery = {}): Promise<Trac
 
 export function listApprovalQueue(): Promise<ApprovalQueueResponse> {
   return request<ApprovalQueueResponse>("/approvals/queue");
+}
+
+export function getApproval(approvalId: string): Promise<ApprovalResource> {
+  return request<ApprovalResource>(`/approvals/${encodeURIComponent(approvalId)}`);
+}
+
+/**
+ * Records the operator's decision. `body.args_hash` should be the hash the
+ * operator actually saw on screen (echoed back, never recomputed here —
+ * the backend is the sole authority on what hash a set of arguments
+ * canonicalizes to, and a mismatch is exactly the signal that this screen
+ * has gone stale).
+ */
+export function decideApproval(
+  approvalId: string,
+  body: ApprovalDecisionRequest
+): Promise<ApprovalResource> {
+  return request<ApprovalResource>(`/approvals/${encodeURIComponent(approvalId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
