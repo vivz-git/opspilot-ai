@@ -7,7 +7,8 @@ Provides:
 - `get_approval_service` / `get_run_service`: yield the wired services, or
   construct control-plane-only ones lazily when the lifespan could not wire
   the runtime (no database at start-up; `/readyz` reports that).
-- `require_authorization`: enforces the v1 authentication boundary.
+- `require_authorization`: enforces the v1 access boundary (it is not
+  authentication — see the function's own docstring).
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.graph import create_agent_graph
-from app.config import Settings
-from app.errors import ConfigurationError, PolicyViolation
+from app.config import AuthMode, Settings
+from app.errors import AccessDenied, ConfigurationError
 from app.evaluation.loader import load_registry
 from app.evaluation.registry import EvaluationRegistry
 from app.evaluation.runner import EvaluationRunner
@@ -239,13 +240,33 @@ def get_evaluation_runner(request: Request) -> EvaluationRunner:
 
 
 def require_authorization(request: Request) -> None:
-    """Enforce the existing authorization boundary (§16.6).
+    """Enforce the v1 access boundary (§16.6, ADR-017, ADR-026).
 
-    In v1 development mode (`auth_mode` is None), access is permitted for local operation.
-    When `auth_mode` is configured, an `Authorization` header is required.
+    This is **not authentication**. OpsPilot v1 authenticates nobody: it has
+    no sessions, no tokens it can verify, and no notion of who may approve.
+    What this dependency does is refuse traffic that did not arrive through
+    the boundary the deployment declared.
+
+    - `auth_mode is None` — the localhost single-operator shape of ADR-017.
+      Nothing is enforced here because nothing is exposed; the fence is the
+      loopback bind and the CORS allowlist, and `OPSPILOT_ENV=production`
+      refuses to start in this state.
+    - `auth_mode is PROXY` — an identity-aware proxy (Cloudflare Access or
+      equivalent) terminates authentication in front of the deployment and
+      stamps `settings.proxy_identity_header` on everything it forwards. A
+      request without that header reached the origin some other way, so it
+      is refused. The proxy is the security boundary; this check only makes
+      the app fail closed if that boundary is bypassed or misconfigured.
+
+    The header's *value* is deliberately not trusted for anything: it is not
+    read into `actor_id`, it grants nothing, and it is not an audit record.
+    Anything that needs identity needs real authentication first (§16.6).
     """
     settings: Settings = request.app.state.settings
-    if settings.auth_mode is not None:
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.strip():
-            raise PolicyViolation("Authorization header required under configured auth_mode")
+    if settings.auth_mode is AuthMode.PROXY:
+        asserted = request.headers.get(settings.proxy_identity_header)
+        if not asserted or not asserted.strip():
+            raise AccessDenied(
+                "request did not arrive through the configured access proxy",
+                detail={"auth_mode": settings.auth_mode.value},
+            )

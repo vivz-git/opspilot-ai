@@ -67,6 +67,14 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
+    // The console and the API are separate origins (next.config.mjs: no
+    // rewrite proxy). When they sit behind an identity-aware proxy, the
+    // proxy's session cookie lives on the API origin and a cross-origin
+    // fetch omits it unless credentials are included — the request would
+    // then be bounced to a login page the XHR cannot follow. The backend
+    // allowlists origins explicitly and never wildcards them (§17.3), which
+    // is what makes sending credentials safe here.
+    credentials: "include",
     headers: { Accept: "application/json", ...init?.headers },
   });
 

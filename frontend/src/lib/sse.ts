@@ -68,5 +68,10 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
  * simpler and more explicit than a global polyfill.
  */
 export function createRunEventSource(runId: string): EventSource {
-  return new EventSource(`${API_BASE_URL}/runs/${encodeURIComponent(runId)}/events`);
+  return new EventSource(`${API_BASE_URL}/runs/${encodeURIComponent(runId)}/events`, {
+    // Same reason as `client.ts`'s `credentials: "include"`: the trace stream
+    // is a cross-origin request to the API, and behind an access proxy it
+    // only authenticates if the proxy's cookie rides along.
+    withCredentials: true,
+  });
 }

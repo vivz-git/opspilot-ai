@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 import sqlalchemy as sa
 from sqlalchemy import CheckConstraint, ForeignKey, Index, UniqueConstraint
@@ -104,6 +104,21 @@ class TraceEventKind(StrEnum):
     #: it from a finished checkpoint (`status` says which). The third
     #: structural emitter after `@traced_node` and `ToolRegistry.dispatch`.
     RUN_RECOVERED = "run_recovered"
+
+
+#: The trace event that records a run reaching each terminal status (§14.2).
+#: Every path that settles a run to a terminal status appends the matching
+#: event: the executor, and the approval-resume settle in `ApprovalService`.
+#: A terminal run without its terminal event is a trace that never says the
+#: run ended — and an SSE client waits for that event to stop reconnecting
+#: (`frontend/src/lib/api/use-run-events.ts`), so the two must not drift.
+TERMINAL_TRACE_EVENTS: Final[dict[RunStatus, TraceEventKind]] = {
+    RunStatus.COMPLETED: TraceEventKind.RUN_COMPLETED,
+    RunStatus.FAILED: TraceEventKind.RUN_FAILED,
+    RunStatus.REJECTED: TraceEventKind.RUN_REJECTED,
+    RunStatus.EXPIRED: TraceEventKind.RUN_EXPIRED,
+    RunStatus.CANCELLED: TraceEventKind.RUN_CANCELLED,
+}
 
 
 class TraceEventSeverity(StrEnum):

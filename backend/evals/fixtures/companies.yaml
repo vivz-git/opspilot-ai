@@ -1,14 +1,13 @@
 # The `default` evaluation dataset — companies (§15.3, EVAL-001).
 #
-# Rows 1-8 mirror `app/integrations/mock/fixtures.py::COMPANY_FIXTURES` field
-# for field; `tests/test_evaluation_cases.py` pins them to it. The rows after
-# the marker exist only for the evaluation cases:
+# Rows 1-11 mirror `app/integrations/mock/fixtures.py::COMPANY_FIXTURES` field
+# for field — including comp_ledgerline / comp_quillpay / comp_brasswire, the
+# three fintech companies in London that the canonical request ("Find the top
+# 3 fintech leads in London ...") resolves to, whose firmographics are chosen
+# so `score_lead` ranks them strictly (92 > 78 > 72), see
+# `cases/lead_ranking.yaml`. `tests/test_evaluation_cases.py` pins the mirror.
+# The row after the marker exists only for the evaluation cases:
 #
-#   comp_ledgerline / comp_quillpay / comp_brasswire
-#       the three fintech companies in London that the canonical request
-#       ("Find the top 3 fintech leads in London ...") resolves to. Their
-#       firmographics are chosen so `score_lead` ranks them strictly
-#       (92 > 78 > 72) — see `cases/lead_ranking.yaml`.
 #   comp_vantage
 #       the adversarial fixture of §16.3: a buying signal whose `summary`
 #       contains an injected instruction. It is *data* in a text field, and
@@ -137,7 +136,6 @@ companies:
         observed_at: "2026-03-10T00:00:00Z"
     created_at: 2026-01-15T12:00:00Z
     updated_at: 2026-01-15T12:00:00Z
-  # --- evaluation-only rows below this line ---------------------------------
   - company_id: comp_ledgerline
     name: Ledgerline Capital
     domain: ledgerline.example
@@ -186,6 +184,7 @@ companies:
         observed_at: "2026-02-25T00:00:00Z"
     created_at: 2026-01-15T12:00:00Z
     updated_at: 2026-01-15T12:00:00Z
+  # --- evaluation-only rows below this line ---------------------------------
   - company_id: comp_vantage
     name: Vantage Analytics
     domain: vantage.example

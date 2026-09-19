@@ -174,6 +174,78 @@ COMPANY_FIXTURES: tuple[dict[str, Any], ...] = (
         "created_at": FIXTURE_BASE_TIME,
         "updated_at": FIXTURE_BASE_TIME,
     },
+    # --- The canonical demo segment: fintech in London ---------------------
+    # The README's worked example ("Find the top 3 fintech leads in London
+    # ...") is the request a seeded deployment must be able to serve. These
+    # three rows are what it resolves to, and their firmographics are chosen
+    # so `score_lead` ranks them strictly (92 > 78 > 72). They are mirrored
+    # field for field by `evals/fixtures/companies.yaml`, which
+    # `tests/test_evaluation_cases.py` pins.
+    {
+        "company_id": "comp_ledgerline",
+        "name": "Ledgerline Capital",
+        "domain": "ledgerline.example",
+        "industry": "fintech",
+        "employee_count": 220,
+        "revenue_band": "$25M-$50M",
+        "hq_location": "London, UK",
+        "funding_stage": "Series C",
+        "tech_stack": ["Python", "PostgreSQL", "Kafka", "AWS"],
+        "signals": [
+            {
+                "kind": "funding",
+                "summary": "Closed a Series C round to expand treasury automation",
+                "observed_at": "2026-02-03T00:00:00Z",
+            },
+            {
+                "kind": "hiring",
+                "summary": "Hiring a Head of Revenue Operations",
+                "observed_at": "2026-02-18T00:00:00Z",
+            },
+        ],
+        "created_at": FIXTURE_BASE_TIME,
+        "updated_at": FIXTURE_BASE_TIME,
+    },
+    {
+        "company_id": "comp_quillpay",
+        "name": "Quillpay",
+        "domain": "quillpay.example",
+        "industry": "fintech",
+        "employee_count": 60,
+        "revenue_band": "$5M-$10M",
+        "hq_location": "London, UK",
+        "funding_stage": "Series A",
+        "tech_stack": ["TypeScript", "PostgreSQL"],
+        "signals": [
+            {
+                "kind": "product_launch",
+                "summary": "Launched instant merchant payouts for marketplaces",
+                "observed_at": "2026-02-12T00:00:00Z",
+            }
+        ],
+        "created_at": FIXTURE_BASE_TIME,
+        "updated_at": FIXTURE_BASE_TIME,
+    },
+    {
+        "company_id": "comp_brasswire",
+        "name": "Brasswire Payments",
+        "domain": "brasswire.example",
+        "industry": "fintech",
+        "employee_count": 30,
+        "revenue_band": "$1M-$5M",
+        "hq_location": "London, UK",
+        "funding_stage": "Seed",
+        "tech_stack": ["Ruby"],
+        "signals": [
+            {
+                "kind": "partnership",
+                "summary": "Announced an open-banking partnership with a regional lender",
+                "observed_at": "2026-02-25T00:00:00Z",
+            }
+        ],
+        "created_at": FIXTURE_BASE_TIME,
+        "updated_at": FIXTURE_BASE_TIME,
+    },
 )
 
 LEAD_FIXTURES: tuple[dict[str, Any], ...] = (
@@ -361,6 +433,63 @@ LEAD_FIXTURES: tuple[dict[str, Any], ...] = (
         "tags": ["technology", "ai"],
         "notes": "Exploration of autonomous operational agents.",
         "last_contacted_at": FIXTURE_BASE_TIME,
+        "created_at": FIXTURE_BASE_TIME,
+        "updated_at": FIXTURE_BASE_TIME,
+    },
+    # --- The canonical demo segment: fintech in London ---------------------
+    # `search_leads` orders by `(created_at, lead_id)`, so with equal
+    # timestamps the canonical request returns L-201, L-202, L-203 in that
+    # order and the rule planner drafts outreach to the first of them
+    # (decisions.md Q7). Mirrored field for field by
+    # `evals/fixtures/leads.yaml`.
+    {
+        "lead_id": "L-201",
+        "company_id": "comp_ledgerline",
+        "full_name": "Priya Nair",
+        "title": "Chief Operating Officer",
+        "email": "priya@ledgerline.example",
+        "status": "new",
+        "source": "outbound_campaign",
+        "owner": "emea_team",
+        "phone": "+44-20-7946-0201",
+        "timezone": "Europe/London",
+        "tags": ["fintech", "operations"],
+        "notes": "Evaluating operations automation after the Series C.",
+        "last_contacted_at": None,
+        "created_at": FIXTURE_BASE_TIME,
+        "updated_at": FIXTURE_BASE_TIME,
+    },
+    {
+        "lead_id": "L-202",
+        "company_id": "comp_quillpay",
+        "full_name": "Tom Okafor",
+        "title": "Head of Growth",
+        "email": "tom@quillpay.example",
+        "status": "new",
+        "source": "inbound_web",
+        "owner": "emea_team",
+        "phone": "+44-20-7946-0202",
+        "timezone": "Europe/London",
+        "tags": ["fintech", "growth"],
+        "notes": "Asked for a walkthrough of automated outreach.",
+        "last_contacted_at": None,
+        "created_at": FIXTURE_BASE_TIME,
+        "updated_at": FIXTURE_BASE_TIME,
+    },
+    {
+        "lead_id": "L-203",
+        "company_id": "comp_brasswire",
+        "full_name": "Sofia Lindqvist",
+        "title": "Founder",
+        "email": "sofia@brasswire.example",
+        "status": "new",
+        "source": "partner_referral",
+        "owner": "emea_team",
+        "phone": "+44-20-7946-0203",
+        "timezone": "Europe/London",
+        "tags": ["fintech", "founder"],
+        "notes": "Early-stage; referred by an open-banking partner.",
+        "last_contacted_at": None,
         "created_at": FIXTURE_BASE_TIME,
         "updated_at": FIXTURE_BASE_TIME,
     },

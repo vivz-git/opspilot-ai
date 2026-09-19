@@ -458,7 +458,12 @@ class TestLifecycle:
         assert row.status is RunStatus.COMPLETED
         assert (row.lease_owner, row.lease_expires_at) == (None, None)
         assert row.final_response == COMPLETED.final_response
-        assert await trace_kinds(uow_factory, run_id) == [("approval_granted", "approved")]
+        # The decision path settles the run, so it also writes the run's
+        # terminal event — `Executor._settle` never sees a resumed graph.
+        assert await trace_kinds(uow_factory, run_id) == [
+            ("approval_granted", "approved"),
+            ("run_completed", "completed"),
+        ]
 
 
 # ---------------------------------------------------------------------------

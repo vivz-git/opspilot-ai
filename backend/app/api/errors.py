@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.errors import (
+    AccessDenied,
     ApprovalConflictError,
     ApprovalExpiredError,
     ApprovalNotPendingError,
@@ -127,6 +128,19 @@ def register_error_handlers(app: FastAPI) -> None:
             instance=request.url.path,
         )
 
+    @app.exception_handler(AccessDenied)
+    async def handle_access_denied(request: Request, exc: AccessDenied) -> JSONResponse:
+        """§16.6 — the request never reached the access boundary. Starlette
+        resolves handlers along the exception's MRO, so this wins over the
+        `PolicyViolation` handler below."""
+        return problem_details(
+            401,
+            code="policy_violation",
+            title="Unauthorized",
+            detail=str(exc),
+            instance=request.url.path,
+        )
+
     @app.exception_handler(PolicyViolation)
     async def handle_policy_violation(request: Request, exc: PolicyViolation) -> JSONResponse:
         msg = str(exc)
@@ -136,14 +150,6 @@ def register_error_handlers(app: FastAPI) -> None:
                 409,
                 code="approval_superseded",
                 title="Approval superseded",
-                detail=msg,
-                instance=request.url.path,
-            )
-        if "Authorization" in msg:
-            return problem_details(
-                401,
-                code="policy_violation",
-                title="Unauthorized",
                 detail=msg,
                 instance=request.url.path,
             )

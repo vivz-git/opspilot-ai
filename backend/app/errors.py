@@ -140,6 +140,18 @@ class PolicyViolation(OpsPilotError):
     error_class = ErrorClass.POLICY_VIOLATION
 
 
+class AccessDenied(PolicyViolation):
+    """A request that did not arrive through the deployment's declared access
+    boundary (§16.6, ADR-026).
+
+    Not an authentication failure: OpsPilot v1 authenticates nobody. It is the
+    app failing closed when the identity-aware proxy in front of it was
+    bypassed or misconfigured. It carries its own class so the API maps it to
+    401 by type rather than by sniffing an exception message."""
+
+    error_class = ErrorClass.POLICY_VIOLATION
+
+
 class ApprovalRequiredError(PolicyViolation):
     """A gated tool was reached with no grant: no token was presented to the
     dispatcher (barrier 2 of §9.5), or no durable `approved` row exists from

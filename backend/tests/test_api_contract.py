@@ -288,4 +288,3 @@ class TestRunManagementConflictsRealComposition:
             assert row is not None
             assert row.parent_run_id is None
             await uow.commit()
-
