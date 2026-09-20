@@ -2381,3 +2381,122 @@ Real uvicorn, real PostgreSQL 16, real Next.js production build, real browser:
 - **The reconciler's finalize path** emits `run_recovered`, not a terminal
   event, so a run finalized by crash recovery has the same missing-terminal-
   event shape defect (2) had. Out of scope here; worth its own fix.
+
+---
+
+## LAUNCH-002 — hosted deployment attempt, and what actually blocks it (2026-09-20)
+
+The task was to *perform* the hosted deployment LAUNCH-001 prepared. It did
+not happen, and the reason is worth recording precisely, because it is not
+the reason LAUNCH-001 predicted.
+
+### The blocker is the network, not the login
+
+LAUNCH-001 recorded "no CLI is installed and no account is authenticated".
+Both CLIs install fine now (`npm i -g @railway/cli vercel`: Railway 5.58.0,
+Vercel 59.23.2). Authentication is not reachable to attempt:
+
+```
+CONNECT backboard.railway.com:443   → HTTP/1.1 403 Forbidden
+CONNECT api.vercel.com:443          → HTTP/1.1 403 Forbidden
+CONNECT api.cloudflare.com:443      → HTTP/1.1 403 Forbidden
+railway login --browserless         → tunnel error: unsuccessful
+```
+
+The egress policy for this environment allows GitHub, npm and PyPI and denies
+the three providers' control planes at the proxy, before TLS. A token would
+not help: the API endpoints themselves are unreachable. So there is no login
+URL or device code to surface — the honest report is that **the deployment
+cannot be initiated from this environment at all**, and needs either an
+egress policy that permits those hosts or a human running the §5 commands.
+
+Nothing was faked to paper over this. No hostname, project, or Access policy
+in this repository describes anything that exists.
+
+### Two defects found by trying to run the documented path
+
+**1. `cp .env.example .env` would not start.** `.env.example` ships
+`OPSPILOT_AUTH_MODE=` with no value, because the localhost shape is meant to
+leave it unset — but pydantic-settings reads that as the empty string, not as
+absent, and the enum refused it. The documented local reproduction
+(`docs/deployment.md` §6) failed at import with a validation error. An empty
+value now loads as `None`, which is what "unset" means. The production fuse is
+untouched: `None` is exactly the state it refuses to start on, and
+`tests/test_config.py` now pins both halves of that.
+
+**2. The API's own schema was outside the fence.** Under
+`OPSPILOT_AUTH_MODE=proxy`, every operational route correctly answered an
+unauthenticated caller `401` — and `/openapi.json`, `/docs` and `/redoc`
+answered `200` with the full shape of the API. FastAPI mounts those three as
+plain Starlette routes, which no router dependency reaches. `docs/deployment.md`
+§4 says only `/healthz` and `/readyz` belong outside the access layer, and it
+was wrong about what the code did. They are now registered by hand behind
+`require_authorization`, so they refuse a bypassed proxy like everything else
+and still work untouched in the localhost shape. This is defence in depth
+behind Cloudflare Access, not a replacement for it — but the fuse exists for
+exactly the case where the boundary is bypassed, and it was leaking through.
+
+### Verified against a live stack, not asserted
+
+A real PostgreSQL 16, the API from this tree, and the production build of the
+console, driven by a real Chromium:
+
+- migrations apply to head `c88ad060adfa`; `/healthz` → `ok`, `/readyz` →
+  `ready` at that revision;
+- the seed loads 11 companies, 14 leads, 5 customers;
+- all five console pages render with **0 console errors, 0 CORS errors, 0
+  mixed-content errors** and no failed request;
+- the canonical run pauses at `awaiting_approval` with `email_outbox` empty,
+  no `execution_steps` row for the gated step `s8`, and the approval row
+  carrying its `args_hash` (which the approval page displays);
+- the plan is exactly `search_leads → research_company ×3 → score_lead ×3 →
+  draft_outreach → save_draft`, gated at `send_email_mock`;
+- approving **from the browser** produced one outbox row, `provider=mock`,
+  idempotency key `ad1ef335…:s8:10f877d1…` (`run:step:args_hash`), the
+  `approval_id` recorded on the row, `verification_passed` read back, and
+  `run_completed` as the trace's last event — 34 events, `seq` 1..34
+  contiguous, no duplicates, and the run page moved to `completed` **without a
+  reload**;
+- re-opening the finished run **with the SSE endpoint blocked outright**
+  reconstructs the full timeline, the terminal state and the approval
+  resolution from REST alone;
+- rejecting ends `rejected` / `approval_rejected`, persists
+  `decision_reason`, and adds no outbox row;
+- a decision on an expired approval is refused `409 approval_expired` with no
+  side effect (`OPSPILOT_APPROVAL_TTL_SECONDS` has a 60s floor, so this was
+  waited out, not simulated);
+- `send_email_mock` is the only email-capable tool in the catalog (`risk=high`,
+  `requires_approval=true`), and no network or SMTP client is imported
+  anywhere under `app/integrations/mock/`;
+- all nine production fuses refuse as specified — auth mode unset, placeholder
+  DB password, wildcard CORS, empty CORS, non-`https` CORS origin,
+  `LOG_LEVEL=DEBUG`, failure injection above zero, `INTEGRATIONS=real`, and a
+  sync database driver;
+- with `OPSPILOT_AUTH_MODE=proxy`, `/runs`, `/tools`, `/approvals/queue`,
+  `/approvals/{id}/decision`, `/evaluations/*`, the trace and the SSE stream
+  all return `401` without the proxy header and work with it, while `/healthz`
+  and `/readyz` stay open for the platform probe;
+- no secret is tracked (`.env` is ignored; the only credential-shaped string
+  in the tree is `.env.example`'s `change-me-locally`, which the production
+  fuse refuses) and the client bundle contains no secret — only
+  `NEXT_PUBLIC_API_BASE_URL`;
+- 1804 backend tests pass (1799 + 5 added here), 1 skipped (the opt-in live
+  Groq smoke test); 123 frontend tests pass; ruff and mypy are clean.
+
+### Not done, and why
+
+- **Nothing is deployed**, for the egress reason above. Railway, Vercel and
+  Cloudflare Access remain the one manual step, and until Access exists
+  nothing may be exposed — a public `200` on `/runs` is the failure this whole
+  design is built to prevent.
+- **The two control-plane reporting gaps from LAUNCH-001 are still open and
+  still not fixed here.** `execution_steps.status` stays `pending` on steps
+  that succeeded, and `attempts`, `started_at`, `finished_at` and
+  `duration_ms` are never written: `ExecutionStepRepository.update_status` and
+  `record_result` have no caller in the execution path, while
+  `record_verification` does — which is why `verification_status` is the one
+  field that is right. The trace is authoritative and the console reads the
+  trace, so the operator sees the correct thing; but `GET /runs/{id}` reports
+  every step of a completed run as `pending`. That is an API-contract bug in
+  the core runtime, not a deployment concern, and wiring persistence into the
+  execution nodes does not belong in a deployment change.

@@ -147,7 +147,10 @@ This is the security boundary. It is not optional.
    `CF_Authorization` cookie.
 5. Leave `/healthz` and `/readyz` outside the Access application (a bypass
    policy scoped to those two paths) so the platform's probe still works.
-   They expose a status word and a migration revision, nothing else.
+   They expose a status word and a migration revision, nothing else. Those
+   two are the *only* paths that answer without the proxy header:
+   `/openapi.json`, `/docs` and `/redoc` are fenced with everything else, so
+   a bypassed proxy is not handed the shape of the API (LAUNCH-002).
 
 With `OPSPILOT_AUTH_MODE=proxy` the API refuses any request that does not
 carry `OPSPILOT_PROXY_IDENTITY_HEADER`. That is **not** authentication — it
@@ -183,10 +186,28 @@ Then verify, in this order:
 curl -fsS https://<api-hostname>/healthz          # {"status":"ok"}
 curl -fsS https://<api-hostname>/readyz           # {"status":"ready","revision":"..."}
 curl -si  https://<api-hostname>/runs | head -1   # 401/302 — the access layer is on
+curl -si  https://<api-hostname>/openapi.json | head -1   # 401/302 — so is the schema
 ```
 
-A `200` on that third command means the API is exposed without the access
+A `200` on either of the last two means the API is exposed without the access
 layer. Stop and fix the Access policy before going further.
+
+### Deployment status
+
+**Not deployed.** Everything in this document is configuration that has been
+verified against a live local stack in the exact hosted shape — production
+environment, `auth_mode=proxy`, an https-only CORS origin, migrations and seed
+on boot — but no Railway project, Vercel project or Cloudflare Access
+application exists yet, and no hostname in this repository describes anything
+real.
+
+The remaining step is the one that cannot be automated from a sandbox: the
+environments this has been attempted from deny egress to
+`backboard.railway.com`, `api.vercel.com` and `api.cloudflare.com` at the
+proxy (`403` on `CONNECT`), so even the device-code login cannot start. A
+human with those three accounts runs §5 above, then §4, then re-runs the
+verification commands. `docs/progress.md` §LAUNCH-002 records exactly what was
+and was not checked.
 
 ---
 
