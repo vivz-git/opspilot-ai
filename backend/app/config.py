@@ -151,6 +151,21 @@ class Settings(BaseSettings):
         validation_alias="OPSPILOT_PROXY_IDENTITY_HEADER",
     )
 
+    @field_validator("auth_mode", mode="before")
+    @classmethod
+    def _blank_auth_mode_is_unset(cls, v: object) -> object:
+        """Treat an empty `OPSPILOT_AUTH_MODE` as unset, not as a bad value.
+
+        `.env.example` ships the key with no value, because the localhost
+        shape is *supposed* to leave it unset — so `cp .env.example .env`
+        handed the app an empty string and it refused to start before it
+        could say anything useful. Unset is the honest reading, and it
+        changes nothing about the fence: `None` is exactly what the
+        production fuse below refuses to start on."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     @field_validator("log_level")
     @classmethod
     def _upper(cls, v: str) -> str:

@@ -208,3 +208,31 @@ class TestDerivedValues:
         assert s.seed == 1337
         assert s.integrations is IntegrationMode.MOCK
         assert s.trace_payload_max_bytes == 16_384
+
+
+class TestBlankAuthModeIsUnset:
+    """`.env.example` ships `OPSPILOT_AUTH_MODE=` with no value, because the
+    localhost shape is meant to leave it unset. Reading that as an empty
+    string made `cp .env.example .env` fail startup with a validation error
+    instead of running the documented local stack."""
+
+    def test_an_empty_value_loads_as_none(self) -> None:
+        assert Settings(_env_file=None, OPSPILOT_AUTH_MODE="").auth_mode is None
+        assert Settings(_env_file=None, OPSPILOT_AUTH_MODE="   ").auth_mode is None
+
+    def test_an_empty_value_still_refuses_to_start_production(self) -> None:
+        """Unset is exactly what the production fuse exists to refuse, so
+        this must not become a way to run production without a fence."""
+        settings = Settings(
+            _env_file=None,
+            OPSPILOT_ENV="production",
+            OPSPILOT_AUTH_MODE="",
+            CORS_ALLOW_ORIGINS="https://console.example.com",
+            DATABASE_URL="postgresql+asyncpg://opspilot:a-real-password@db:5432/opspilot",
+        )
+        with pytest.raises(ConfigurationError, match="OPSPILOT_AUTH_MODE"):
+            settings.validate_runtime()
+
+    def test_a_bad_value_is_still_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, OPSPILOT_AUTH_MODE="everyone")

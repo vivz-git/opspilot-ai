@@ -18,12 +18,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
-from fastapi import FastAPI
+from fastapi import APIRouter, Depends, FastAPI
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import create_async_engine
 from starlette.middleware.cors import CORSMiddleware
 
 from app.api.approvals import router as approvals_router
-from app.api.dependencies import wire_runtime
+from app.api.dependencies import require_authorization, wire_runtime
 from app.api.errors import register_error_handlers
 from app.api.evaluations import router as evaluations_router
 from app.api.health import discover_alembic_head
@@ -87,7 +89,21 @@ def create_app(
                     await executor.shutdown()
                 await app.state.db_engine.dispose()
 
-    app = FastAPI(title="OpsPilot AI", version="0.1.0", lifespan=lifespan)
+    # The schema and its two viewers are registered by hand, below, so that
+    # they sit behind `require_authorization` like every other route. FastAPI
+    # mounts its built-ins as plain Starlette routes, which no router
+    # dependency can reach — so under `auth_mode=proxy` they answered an
+    # unauthenticated caller with the full shape of the API while every
+    # operational route correctly refused it. Only `/healthz` and `/readyz`
+    # belong outside the fence (docs/deployment.md §4).
+    app = FastAPI(
+        title="OpsPilot AI",
+        version="0.1.0",
+        lifespan=lifespan,
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+    )
     app.state.settings = settings
     app.state.db_engine = create_async_engine(
         settings.database_url.get_secret_value(), pool_pre_ping=True
@@ -109,6 +125,7 @@ def create_app(
         allow_headers=["*"],
     )
 
+    app.include_router(_schema_router(app))
     app.include_router(health_router)
     app.include_router(approvals_router)
     app.include_router(approvals_router, prefix="/api/v1")
@@ -120,6 +137,33 @@ def create_app(
     app.include_router(tools_router, prefix="/api/v1")
 
     return app
+
+
+def _schema_router(app: FastAPI) -> APIRouter:
+    """`/openapi.json`, `/docs` and `/redoc`, fenced like the rest of the API.
+
+    In the localhost shape `require_authorization` is a no-op, so these behave
+    exactly as FastAPI's built-ins did. Under `auth_mode=proxy` they refuse a
+    request that did not come through the access proxy, which is the whole
+    point of the fuse: a bypassed boundary should not hand out the API's
+    shape any more than it hands out a run.
+    """
+    router = APIRouter(dependencies=[Depends(require_authorization)], include_in_schema=False)
+    schema_url = "/openapi.json"
+
+    @router.get(schema_url)
+    async def openapi_schema() -> dict[str, object]:
+        return app.openapi()
+
+    @router.get("/docs")
+    async def swagger_ui() -> HTMLResponse:
+        return get_swagger_ui_html(openapi_url=schema_url, title=f"{app.title} — Swagger UI")
+
+    @router.get("/redoc")
+    async def redoc_ui() -> HTMLResponse:
+        return get_redoc_html(openapi_url=schema_url, title=f"{app.title} — ReDoc")
+
+    return router
 
 
 app = create_app()

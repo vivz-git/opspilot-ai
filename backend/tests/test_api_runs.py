@@ -440,6 +440,32 @@ class TestAuthorizationBoundary:
             )
             assert wrong.status_code == 401
 
+    def test_the_schema_and_its_viewers_are_behind_the_fence(self) -> None:
+        """A bypassed proxy should not be handed the shape of the API.
+
+        FastAPI mounts `/openapi.json`, `/docs` and `/redoc` as plain
+        Starlette routes, which no router dependency reaches — so they used
+        to answer an unauthenticated caller in full while every operational
+        route refused it. Only the two probe paths belong outside (ADR-026,
+        docs/deployment.md §4)."""
+        settings = Settings(_env_file=None, OPSPILOT_AUTH_MODE=AuthMode.PROXY)
+        app = create_app(settings=settings)
+
+        with TestClient(app) as client:
+            for path in ("/openapi.json", "/docs", "/redoc"):
+                assert client.get(path).status_code == 401, path
+
+            header = {settings.proxy_identity_header: "operator@example.com"}
+            for path in ("/openapi.json", "/docs", "/redoc"):
+                assert client.get(path, headers=header).status_code == 200, path
+
+    def test_the_schema_and_its_viewers_stay_open_in_the_localhost_shape(self) -> None:
+        """Fencing them must not cost the localhost operator their docs."""
+        app = create_app(settings=Settings(_env_file=None))
+        with TestClient(app) as client:
+            for path in ("/openapi.json", "/docs", "/redoc"):
+                assert client.get(path).status_code == 200, path
+
     def test_nothing_is_enforced_in_the_localhost_shape(self) -> None:
         """ADR-017: with no access layer declared there is nothing exposed to
         fence, and `OPSPILOT_ENV=production` refuses to start in this state."""
