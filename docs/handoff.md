@@ -17,7 +17,7 @@ cat docs/tasks.md             # 2. what is next, with acceptance criteria
 cat docs/decisions.md         # 3. what is already decided, and why
 git status                    # 4. is the tree clean?
 git log --oneline -15         # 5. what actually landed
-cd backend && uv run pytest   # 6. still green? expect 1799 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
+cd backend && uv run pytest   # 6. still green? expect 1804 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
 grep -rn "TODO\|FIXME" backend/app 2>/dev/null   # 7. any unfinished edges
 ```
 
@@ -37,7 +37,7 @@ persistence layer, the nine tools behind `ToolRegistry.dispatch`, the
 LangGraph graph with all nine nodes, both planners, recovery, cancellation,
 the HITL approval path, the verifiers, the HTTP API (runs, trace, SSE,
 approvals, evaluations, tools, health), the evaluation runner and the operator
-console are implemented and tested: 1799 backend tests at 93% coverage, 123
+console are implemented and tested: 1804 backend tests at 93% coverage, 123
 frontend unit tests, 14 Playwright specs, 7/7 evaluation cases.
 
 The canonical request runs against a real database, pauses for a human,
@@ -48,9 +48,14 @@ was checked.
 
 **Nothing is hosted.** The deployment configuration exists
 (`docs/deployment.md`, `railway.json`, `frontend/vercel.json`,
-`backend/scripts/start.sh`), but no platform CLI was authenticated in the
-session that wrote it, so the one-time interactive logins and the Cloudflare
-Access policy are still a human's to perform.
+`backend/scripts/start.sh`) and LAUNCH-002 verified it against a live stack in
+the exact hosted shape, but no platform account has been reachable from any
+session that tried. LAUNCH-002 established *why*, and it is not the missing
+login LAUNCH-001 assumed: the sandbox's egress policy denies
+`backboard.railway.com`, `api.vercel.com` and `api.cloudflare.com` at the
+proxy (`403` on `CONNECT`), so the device-code flow cannot even start. Either
+run §5 yourself, or work from an environment whose egress policy permits those
+three hosts. A token alone will not help.
 
 **Do not expose this without the access layer.** OpsPilot authenticates
 nobody (ADR-017). The hosted shape is `OPSPILOT_AUTH_MODE=proxy` behind an
@@ -62,14 +67,23 @@ fail-closed backstop, not authentication.
 Pick from these, in the order a portfolio reviewer would notice them:
 
 1. **Finish the deployment.** `docs/deployment.md` §4 and §5: `railway login`,
-   `vercel login`, the Cloudflare Access applications, then the three
-   verification `curl`s in §5. The third one returning `200` means the access
-   layer is not on — stop there.
+   `vercel login`, the Cloudflare Access applications, then the four
+   verification `curl`s in §5. `/runs` or `/openapi.json` returning `200`
+   means the access layer is not on — stop there. Read §5's "Deployment
+   status" first: this needs an environment that can reach the three
+   providers' control planes.
 2. **Two denormalised-projection bugs** (both pre-existing, both visible in
    the console, neither a safety issue): `agent_runs.step_count` stays 0 on a
    completed run, and `execution_steps.status` stays `pending` for steps that
    succeeded. The run resource's `verification_status` and the trace both
    disagree with those columns, so the projection is what is wrong.
+   LAUNCH-002 found the cause of the second:
+   `ExecutionStepRepository.update_status` and `record_result` have no caller
+   in the execution path, while `record_verification` does — which is exactly
+   why `verification_status` is the one column that is right, and why
+   `attempts`, `started_at`, `finished_at` and `duration_ms` are never written
+   either. The console reads the trace, so an operator sees the truth; an API
+   consumer reading `GET /runs/{id}` does not.
 3. **The reconciler's finalize path** emits `run_recovered` rather than the
    run's terminal trace event — the same defect that
    `ApprovalService.decide_approval` had until LAUNCH-001 fixed it there.

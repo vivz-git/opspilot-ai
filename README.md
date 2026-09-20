@@ -12,16 +12,19 @@ budgeted, terminating unit of work with a status, a trace and a verdict.
 > **Project status — the system runs end to end.**
 > The agent, the nine tools, persistence, approvals, verification, recovery,
 > the evaluation suite, the HTTP API and the operator console are implemented
-> and tested: **1799 backend tests** (93% line coverage) plus 123 frontend
+> and tested: **1804 backend tests** (93% line coverage) plus 123 frontend
 > unit tests and 14 Playwright specs. The canonical request below runs against
 > a real database, pauses for a human, and finishes with a verified simulated
 > effect and a complete trace.
 >
-> It is **not deployed openly**, and must not be: OpsPilot has no application
-> authentication ([ADR-017](docs/decisions.md#adr-017)). The supported hosted
-> shape is a single-operator console behind an identity-aware proxy —
+> It is **not deployed** — and must not be deployed openly: OpsPilot has no
+> application authentication ([ADR-017](docs/decisions.md#adr-017)). The
+> supported hosted shape is a **hosted single-operator demo** — one console,
+> one operator, behind an identity-aware proxy —
 > [`docs/deployment.md`](docs/deployment.md),
-> [ADR-026](docs/decisions.md#adr-026).
+> [ADR-026](docs/decisions.md#adr-026). The configuration for it is complete
+> and verified against a live stack in that exact shape; standing the hosted
+> environment up is still a human's step (`docs/deployment.md` §5).
 
 ---
 
@@ -89,7 +92,7 @@ what to check at each step.
 ```bash
 cd backend
 uv sync --locked --extra dev
-uv run pytest                 # 1799 passed, 1 skipped (the opt-in live Groq smoke test)
+uv run pytest                 # 1804 passed, 1 skipped (the opt-in live Groq smoke test)
 ```
 
 ## Documentation
