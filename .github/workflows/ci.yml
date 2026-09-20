@@ -17,12 +17,21 @@ jobs:
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow default entirely for this
+    # job, so `contents: read` is restated here (checkout still needs it) and
+    # `pull-requests: write` is added — the only extra scope the gitleaks
+    # action needs GITHUB_TOKEN for: commenting findings on the PR. No other
+    # job gets this; the workflow-level default stays `contents: read`.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_SUMMARY: "true"
 
   backend:
