@@ -17,7 +17,7 @@ cat docs/tasks.md             # 2. what is next, with acceptance criteria
 cat docs/decisions.md         # 3. what is already decided, and why
 git status                    # 4. is the tree clean?
 git log --oneline -15         # 5. what actually landed
-cd backend && uv run pytest   # 6. still green? expect 1095 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
+cd backend && uv run pytest   # 6. still green? expect 1799 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
 grep -rn "TODO\|FIXME" backend/app 2>/dev/null   # 7. any unfinished edges
 ```
 
@@ -32,43 +32,56 @@ code is what runs and the document is a bug — fix the document, do not
 
 ## 2. Where the project stands
 
-Architecture is **complete**. Implemented and tested: the contract spine
-(errors, security, tool schemas and registry, agent state, configuration), the
-foundation (app factory, lockfile, Alembic, injected clock/ids/randomness),
-the whole persistence layer — every control-plane and `mock_crm` table, the
-async repositories, constraint tests against real Postgres, and DB-007's
-LangGraph checkpointer, run leases, heartbeat and crash-recovery reconciler —
-the integration ports and mock adapters with the seed dataset (TOOL-001), the
-single tool dispatch choke point `ToolRegistry.dispatch` (TOOL-002, ADR-024),
-the nine tool implementations (TOOL-003), the LangGraph graph with all nine
-nodes (AGENT-002), deterministic understanding (AGENT-003), the `decide`
-router and fan-out expansion (AGENT-004), `$ref` resolution in `execute_tool`
-(AGENT-005) and the planner layer — `RulePlanner`, `LLMPlanner` over Groq,
-the plan validator and one-shot repair (AGENT-006, ADR-025). 1095 tests pass
-(plus one opt-in live-provider smoke test). `docs/progress.md` has the
-per-task record.
+**The system runs end to end.** The contract spine, the foundation, the whole
+persistence layer, the nine tools behind `ToolRegistry.dispatch`, the
+LangGraph graph with all nine nodes, both planners, recovery, cancellation,
+the HITL approval path, the verifiers, the HTTP API (runs, trace, SSE,
+approvals, evaluations, tools, health), the evaluation runner and the operator
+console are implemented and tested: 1799 backend tests at 93% coverage, 123
+frontend unit tests, 14 Playwright specs, 7/7 evaluation cases.
 
-Not yet implemented: `recover` backoff mechanics, the responder and terminal
-status computation, cancellation, HITL persistence and endpoints, the
-verifiers, the API, the dashboard and the evaluation runner.
+The canonical request runs against a real database, pauses for a human,
+resumes on the decision, verifies its simulated effect and terminates with a
+complete trace — driven from the console in a browser, live over SSE. That was
+demonstrated, not assumed; `docs/progress.md` §LAUNCH-001 records exactly what
+was checked.
+
+**Nothing is hosted.** The deployment configuration exists
+(`docs/deployment.md`, `railway.json`, `frontend/vercel.json`,
+`backend/scripts/start.sh`), but no platform CLI was authenticated in the
+session that wrote it, so the one-time interactive logins and the Cloudflare
+Access policy are still a human's to perform.
+
+**Do not expose this without the access layer.** OpsPilot authenticates
+nobody (ADR-017). The hosted shape is `OPSPILOT_AUTH_MODE=proxy` behind an
+identity-aware proxy (ADR-026), and the app's own header check is a
+fail-closed backstop, not authentication.
 
 ## 3. Start here
 
-**Next task: `AGENT-007`** — the `recover` node wired to `recovery_action`,
-with backoff via the injected clock. Model class: SONNET. Everything up to
-AGENT-006 is done: `docs/progress.md` has the per-task record.
+Pick from these, in the order a portfolio reviewer would notice them:
 
-The planner (AGENT-006) is in `app/agent/planner/`: `Planner` protocol,
-`RulePlanner`, `LLMPlanner` over `GroqStructuredClient`, `validate_plan`, and
-the revision helpers the `plan` node uses. Compose it with
-`app.agent.planner.factory.build_planner(settings)` and inject it into
-`NodeHandlers(planner=...)` / `create_agent_graph(planner=...)`. Two things the
-recover work should know: `route_after_execute` keys on the *latest attempt*
-of the current step (a successful retry or re-execution after a replan no
-longer routes to `recover` because an older error is at the tail of
-`errors`), and the `plan` node treats `status_reason` in
-{`replan_required`, `replannable_fault`} as the revision request — keep
-writing one of those when routing to `plan`.
+1. **Finish the deployment.** `docs/deployment.md` §4 and §5: `railway login`,
+   `vercel login`, the Cloudflare Access applications, then the three
+   verification `curl`s in §5. The third one returning `200` means the access
+   layer is not on — stop there.
+2. **Two denormalised-projection bugs** (both pre-existing, both visible in
+   the console, neither a safety issue): `agent_runs.step_count` stays 0 on a
+   completed run, and `execution_steps.status` stays `pending` for steps that
+   succeeded. The run resource's `verification_status` and the trace both
+   disagree with those columns, so the projection is what is wrong.
+3. **The reconciler's finalize path** emits `run_recovered` rather than the
+   run's terminal trace event — the same defect that
+   `ApprovalService.decide_approval` had until LAUNCH-001 fixed it there.
+   `persistence/models.py::TERMINAL_TRACE_EVENTS` is the shared map to use.
+4. **A run-submission form in the console.** The demo currently starts runs
+   over `POST /runs`; an operator console that cannot ask for anything is an
+   obvious gap.
+5. **`trace_id` is never echoed on error responses**, contradicting §13.1.
+   Needs per-request correlation (middleware) that does not exist yet.
+
+Whatever you pick: `docs/architecture.md` is the specification, and
+`docs/decisions.md` records what is already decided and what it cost.
 
 Historical notes from the first implementation sessions (still accurate;
 kept because they describe shapes later tasks must match):

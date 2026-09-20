@@ -57,7 +57,7 @@ import pytest
 from app.agent.state import RunStatus
 from app.api.dependencies import get_run_service
 from app.api.schemas import TraceEventResource
-from app.config import Settings
+from app.config import AuthMode, Settings
 from app.errors import NotFoundError
 from app.execution.runs import RunService, RunTraceResult
 from app.main import create_app
@@ -819,7 +819,7 @@ class TestApiTraceSSE:
     @pytest.mark.asyncio
     async def test_sse_authorization_behavior(self) -> None:
         run_id = uuid.uuid4()
-        settings = Settings(_env_file=None, OPSPILOT_AUTH_MODE="bearer")
+        settings = Settings(_env_file=None, OPSPILOT_AUTH_MODE=AuthMode.PROXY)
         app = create_app(settings=settings)
 
         transport = ASGITransport(app=app)

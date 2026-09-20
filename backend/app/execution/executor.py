@@ -59,7 +59,12 @@ from app.agent.nodes import create_initial_state
 from app.agent.state import TERMINAL_RUN_STATUSES, Budgets, RunMetadata, RunStatus
 from app.execution.leases import LeaseConfig, LeaseNotAcquired, UnitOfWorkFactory, hold_lease
 from app.execution.recovery import CheckpointInspection, CheckpointPhase, RunDriver
-from app.persistence.models import AgentRun, TraceEventKind, TraceEventSeverity
+from app.persistence.models import (
+    TERMINAL_TRACE_EVENTS,
+    AgentRun,
+    TraceEventKind,
+    TraceEventSeverity,
+)
 from app.runtime import Clock
 
 __all__ = [
@@ -73,14 +78,6 @@ _log = structlog.get_logger("opspilot.executor")
 #: `agent_runs.status_reason` when the graph itself raised (§12.3's open
 #: list, beside `orphaned`, `recovery_failed` and `resume_failed`).
 REASON_EXECUTION_FAILED: Final = "execution_failed"
-
-_TERMINAL_EVENTS: Final[dict[RunStatus, TraceEventKind]] = {
-    RunStatus.COMPLETED: TraceEventKind.RUN_COMPLETED,
-    RunStatus.FAILED: TraceEventKind.RUN_FAILED,
-    RunStatus.REJECTED: TraceEventKind.RUN_REJECTED,
-    RunStatus.EXPIRED: TraceEventKind.RUN_EXPIRED,
-    RunStatus.CANCELLED: TraceEventKind.RUN_CANCELLED,
-}
 
 
 class ExecutionOutcome(StrEnum):
@@ -277,7 +274,7 @@ class Executor:
             if row is not None:
                 await uow.trace_events.append(
                     run_id=run.id,
-                    kind=_TERMINAL_EVENTS[terminal],
+                    kind=TERMINAL_TRACE_EVENTS[terminal],
                     severity=(
                         TraceEventSeverity.WARNING
                         if terminal is RunStatus.FAILED

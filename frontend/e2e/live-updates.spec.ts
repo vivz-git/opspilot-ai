@@ -1,7 +1,7 @@
 import type { Route } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
-import { API_BASE, mockHealthz, mockJson } from "./api-mock";
+import { API_BASE, CORS_HEADERS, mockHealthz, mockJson } from "./api-mock";
 
 const RUN_ID = "8f1e2c3a-6b4d-4e2f-9a1b-7c8d9e0f1a2b";
 
@@ -64,6 +64,7 @@ test("new trace events pushed over SSE appear without a page reload", async ({ p
       runFetchCount += 1;
       const status = runFetchCount === 1 ? "running" : "completed";
       route.fulfill({
+        headers: CORS_HEADERS,
         status: 200,
         contentType: "application/json",
         body: JSON.stringify(runResource(status)),
@@ -80,6 +81,7 @@ test("new trace events pushed over SSE appear without a page reload", async ({ p
     (url) => url.origin === new URL(API_BASE).origin && url.pathname === `/runs/${RUN_ID}/events`,
     (route: Route) =>
       route.fulfill({
+        headers: CORS_HEADERS,
         status: 200,
         contentType: "text/event-stream",
         body: sseEvent(2, "tool_started") + sseEvent(3, "run_completed"),

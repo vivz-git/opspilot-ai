@@ -31,7 +31,7 @@ from unittest.mock import AsyncMock
 import pytest
 from app.agent.state import ApprovalStatus, PlannerKind, RunStatus
 from app.api.dependencies import get_run_service
-from app.config import Settings
+from app.config import AuthMode, Settings
 from app.errors import IdempotencyConflictError
 from app.execution.runs import RunCreateResult, RunDetails, RunService
 from app.main import create_app
@@ -388,15 +388,27 @@ class TestGetRunsEndpoint:
 
 
 class TestAuthorizationBoundary:
+    """§16.6 / ADR-026. This is the *access* boundary, not authentication: it
+    refuses traffic that did not arrive through the declared access proxy."""
+
     def test_require_authorization_enforced_when_configured(self) -> None:
-        settings = Settings(_env_file=None, OPSPILOT_AUTH_MODE="bearer")
+        settings = Settings(_env_file=None, OPSPILOT_AUTH_MODE=AuthMode.PROXY)
         app = create_app(settings=settings)
 
         with TestClient(app) as client:
-            # Missing header -> 401 policy_violation
+            # Nothing stamped by the proxy -> 401 policy_violation
             unauth = client.post("/runs", json={"user_request": "Valid request"})
             assert unauth.status_code == 401
             assert unauth.json()["code"] == "policy_violation"
+
+            # An Authorization header is not the proxy's assertion, and the
+            # app has no credential it could verify: it must not open the door.
+            bearer = client.post(
+                "/runs",
+                headers={"Authorization": "Bearer token123"},
+                json={"user_request": "Valid request"},
+            )
+            assert bearer.status_code == 401
 
             # With mock service and valid auth header
             mock_service = AsyncMock(spec=RunService)
@@ -409,10 +421,31 @@ class TestAuthorizationBoundary:
 
             auth = client.post(
                 "/runs",
-                headers={"Authorization": "Bearer token123"},
+                headers={settings.proxy_identity_header: "operator@example.com"},
                 json={"user_request": "Valid request"},
             )
             assert auth.status_code == 201
+
+    def test_a_custom_proxy_header_name_is_honoured(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            OPSPILOT_AUTH_MODE=AuthMode.PROXY,
+            OPSPILOT_PROXY_IDENTITY_HEADER="X-Access-User",
+        )
+        app = create_app(settings=settings)
+
+        with TestClient(app) as client:
+            wrong = client.get(
+                "/runs", headers={"Cf-Access-Authenticated-User-Email": "operator@example.com"}
+            )
+            assert wrong.status_code == 401
+
+    def test_nothing_is_enforced_in_the_localhost_shape(self) -> None:
+        """ADR-017: with no access layer declared there is nothing exposed to
+        fence, and `OPSPILOT_ENV=production` refuses to start in this state."""
+        app = create_app(settings=Settings(_env_file=None))
+        with TestClient(app) as client:
+            assert client.get("/runs").status_code != 401
 
 
 class TestPrefixParity:

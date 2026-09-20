@@ -1,35 +1,55 @@
 # Progress
 
-Repository state as of 2026-09-13 (FOUND-001 session). Architecture session
-was 2026-09-12.
+Repository state as of 2026-09-19 (launch-hardening session).
 **The repository is the source of truth.** If this file and `git log` disagree,
 `git log` wins — and this file is wrong and should be fixed.
+
+Sections below the "Where the project stands" block are a per-session journal,
+appended to rather than rewritten; the oldest entries describe the state at the
+time they were written, not today's.
 
 ---
 
 ## Where the project stands
 
 **Phase 0 — architecture: complete.** The design is specified, the decisions
-are recorded with their costs, the backlog is prioritized, and the contract
-spine is implemented and tested.
+are recorded with their costs, and the backlog is prioritized.
 
-**Phase 1 — implementation: started.** FOUND-001..004, DB-001..007, TOOL-001
-and TOOL-002 are done. Continue at `docs/handoff.md` §3 with TOOL-003.
+**Phase 1 — implementation: complete end to end.** The canonical request runs
+against a real database, pauses for a human, resumes on the decision, verifies
+its simulated effect and terminates with a complete trace — driven from the
+operator console in a browser, live over SSE.
+
+**Phase 2 — launch hardening: this session.** The deployment shape, the access
+boundary and the demo dataset. The project is *not deployed* — see "Not done"
+below.
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
-foundation     ████████░░░░░░░░░░░░  FOUND-001, 002, 003, 004 done; 005 outstanding
+foundation     ████████████████████  FOUND-001..004 done
 persistence    ████████████████████  DB-001..007 done
-tools          ██████████░░░░░░░░░░  TOOL-001, 002, 003 done; TOOL-004..006 outstanding
+tools          ████████████████████  the nine tools, dispatch, mock adapters
 agent graph    ████████████████████  AGENT-001..009 complete
 hitl           ████████████████████  HITL-001..005 complete
-verification   ██████████████░░░░░░  VERIFY-001..002 complete; VERIFY-003 outstanding
-api            ███████████░░░░░░░░░  API-001, 002, 003, 007 done; API-004..006 outstanding
-observability  ██░░░░░░░░░░░░░░░░░░  redaction (§14.5) built by TOOL-002; OBS-001..005 outstanding
-frontend       ░░░░░░░░░░░░░░░░░░░░  FE-001..008
-evaluation     ████████████████████  EVAL-001..005 done
+verification   ████████████████████  invariant + read-back verifiers wired
+api            ████████████████████  runs, trace, SSE, approvals, evaluations, tools, health
+frontend       ████████████████████  runs, run detail, approvals, evaluations, tools, live SSE
+evaluation     ████████████████████  EVAL-001..005 done; 7/7 cases green
+deployment     ████████████░░░░░░░░  configuration and docs done; nothing is hosted yet
+observability  ████████░░░░░░░░░░░░  structured logs, redaction, the trace; OTel deferred (ADR-015)
 ```
+
+**Measured, this session, against PostgreSQL 16:**
+
+| Check | Result |
+|---|---|
+| `uv run pytest` | 1799 passed, 1 skipped (the opt-in live Groq smoke test) |
+| coverage | 93.65% (floor 80%) |
+| `ruff check` / `ruff format --check` / `mypy app` | clean |
+| `python -m app.evaluation.cli run --suite all` | 7/7 cases, 0 invariant violations |
+| frontend `typecheck` / `lint` / `vitest` / `build` | clean; 123 unit tests |
+| `playwright test` | 14 passed |
 
 ---
 
@@ -2246,3 +2266,118 @@ no new upgrade operations (this task adds no migration); the evaluation gate
 `python -m app.evaluation.cli run --suite all` passes 7/7 with 0 invariant
 violations. All against a real PostgreSQL 16 in this session, so nothing here
 was skipped for want of a database.
+
+---
+
+## LAUNCH-001 — hosted deployment hardening (2026-09-19)
+
+Making the system deployable for a **hosted operator demo** without changing
+what ADR-017 fenced. No application authentication was added.
+
+### Three defects found by actually running the thing
+
+1. **The canonical demo could not run against a seeded deployment.** The
+   README's worked example — "Find the top 3 fintech leads in London …" — is
+   the product's headline claim. `make seed` loaded eight companies, none of
+   them fintech and none of them in London, so `search_leads` returned zero
+   rows and the run died `failed(replan_budget_exhausted)`. Only the
+   *evaluation* fixtures carried the three London fintech rows, so CI was
+   green while the demo dataset could not serve the demo. Fixed by moving
+   `comp_ledgerline`/`comp_quillpay`/`comp_brasswire` and `L-201..L-203` into
+   `app/integrations/mock/fixtures.py`, field for field. The evaluation
+   dataset is now exactly the seed dataset plus `comp_vantage` (the §16.3
+   prompt-injection fixture), which is a stronger invariant than before: an
+   evaluation case can no longer pass against rows a real deployment does not
+   have. Pinned by two tests in `test_mock_integrations.py`.
+
+2. **A run that completed by approval never recorded that it ended.**
+   `Executor._settle` writes the terminal trace event, but a run resumed by an
+   operator decision is settled inside `ApprovalService.decide_approval`,
+   which transitioned the row and wrote nothing. So the canonical run's trace
+   stopped at `verification_passed`, and `use-run-events.ts` — which closes
+   the stream on a terminal *event* — was left reconnecting to a finished run.
+   Fixed by appending the terminal event at that settle, with the
+   status→kind map moved to `persistence/models.py::TERMINAL_TRACE_EVENTS` so
+   the two settle paths cannot drift. Five existing trace-sequence assertions
+   were updated to expect the event; `test_api_approvals.py` now pins it.
+
+3. **The production auth fuse was satisfiable by a typo.**
+   `OPSPILOT_AUTH_MODE` was free text, and `require_authorization` then asked
+   only for a non-empty `Authorization` header — a check any client passes.
+   See ADR-026: the field is now an enum whose single member, `proxy`, means
+   "an identity-aware proxy authenticates in front of this deployment", and
+   under it every endpoint requires the header that proxy stamps. It is
+   presence-only and the value is read as nothing; it exists so the app fails
+   closed if the proxy is bypassed. `AccessDenied` gives the 401 its own
+   exception class, replacing a handler that dispatched on whether the word
+   "Authorization" appeared in an exception message.
+
+### Also hardened
+
+- Production additionally refuses empty, wildcard or non-`https://` CORS
+  origins, `LOG_LEVEL=DEBUG`, and a non-zero `OPSPILOT_TOOL_FAILURE_RATE`. An
+  unrecognised `LOG_LEVEL` is now rejected instead of silently becoming INFO.
+- `backend/scripts/start.sh`: `$PORT`, opt-in `alembic upgrade head`, opt-in
+  additive seed (`python -m app.integrations.mock.seed --no-reset`, a new
+  flag), and reverse-proxy headers. Migrations stay opt-in because `/readyz`
+  already refuses traffic on a stale schema.
+- `backend/Dockerfile`: `ARG INSTALL_DEV=false` so a hosted image does not
+  ship pytest/mypy/ruff; `$PORT`-aware healthcheck; `start.sh` as `CMD`.
+  docker-compose passes `INSTALL_DEV=true` to keep `compose exec api pytest`.
+- The console sends credentials cross-origin (`credentials: "include"`,
+  `withCredentials` on the `EventSource`) so the proxy's cookie reaches the
+  API. The Playwright mock now answers with the CORS headers the real backend
+  sends — it had been wildcarding the origin, which a credentialed request
+  refuses; that mismatch is exactly what caught the change before deployment.
+- Security response headers on the console (`frame-ancestors 'none'` above
+  all: it performs approvals and must not be embeddable).
+- `railway.json`, `frontend/vercel.json`, and `.env.example` extended with the
+  access-boundary and deployment-process variables (placeholders only).
+- Fixed a pre-existing `ruff format --check` failure on `claude/great-euler-ql1wxj`
+  (a trailing blank line in `tests/test_api_contract.py`) that would have
+  failed CI.
+
+### Verified against a live stack, not asserted
+
+Real uvicorn, real PostgreSQL 16, real Next.js production build, real browser:
+
+- canonical run pauses at `awaiting_approval` with `mock_crm.email_outbox`
+  empty and the draft saved;
+- a decision carrying any other `args_hash` is refused `409
+  approval_superseded`, and still no outbox row;
+- approving from the console produces exactly one outbox row
+  (`provider=mock`, idempotency key `run:step:args_hash`), `verification_passed`
+  read back from the outbox, and `run_completed` as the trace's last event;
+- the run detail page, open and never reloaded, moved to `completed` over
+  SSE — 34 events, unique monotonic `seq`, no duplicates;
+- a reload reconstructs the finished run from the trace;
+- the rejection path ends `rejected(approval_rejected)` with no outbox row and
+  the decision recorded on the approval;
+- a decision on an expired approval is refused `409 approval_expired`;
+- every production fuse refuses as specified, and with
+  `OPSPILOT_AUTH_MODE=proxy` every endpoint returns 401 without the proxy
+  header — including `POST /approvals/{id}/decision` — while `/healthz` and
+  `/readyz` stay reachable for the platform probe;
+- 9/9 browser steps, 0 console errors, no failed requests other than an
+  `EventSource` aborted by navigation.
+
+### Not done, and why
+
+- **Nothing is deployed.** No `vercel`, `railway` or `cloudflared` CLI is
+  installed in this environment and no account is authenticated. Fabricating
+  credentials was not an option, so the deployment configuration is complete
+  and `docs/deployment.md` §5 states the exact one-time interactive login and
+  the Cloudflare Access policy that a human must perform.
+- **No run-submission form in the console.** The demo starts a run over
+  `POST /runs`; the operator drives the approval in the browser. Adding a
+  submission UI is a frontend feature, not launch hardening.
+- **Two pre-existing control-plane reporting gaps, reported not fixed:**
+  `agent_runs.step_count` stays 0 on a completed run (the console's "STEPS"
+  tile reads 0 while ten steps are listed), and `execution_steps.status` stays
+  `pending` for steps that succeeded — the run resource's own
+  `verification_status` and the trace both say otherwise. Neither affects
+  safety, both predate this branch, and both are denormalised-projection bugs
+  that deserve their own change.
+- **The reconciler's finalize path** emits `run_recovered`, not a terminal
+  event, so a run finalized by crash recovery has the same missing-terminal-
+  event shape defect (2) had. Out of scope here; worth its own fix.

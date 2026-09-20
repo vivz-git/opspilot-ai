@@ -611,11 +611,14 @@ class TestApprovalPauseAndResume:
         # first thing that happens after the grant.
         assert kinds.count("approval_requested") == 1
         assert kinds.count("approval_granted") == 1
-        assert kinds[-4:] == [
+        assert kinds[-5:] == [
             "approval_granted",
             "tool_started",
             "tool_succeeded",
             "verification_passed",
+            # The settle after the resume records the run ending; a run that
+            # finishes because a human approved it still has to say so.
+            "run_completed",
         ]
         granted = next(e for e in events if e.kind.value == "approval_granted")
         sends = [e for e in events if e.step_id == "s6"]
@@ -654,7 +657,7 @@ class TestApprovalPauseAndResume:
         assert approval.status is ApprovalStatus.REJECTED
 
         kinds = await h.kinds()
-        assert kinds[-2:] == ["approval_requested", "approval_rejected"]
+        assert kinds[-3:] == ["approval_requested", "approval_rejected", "run_rejected"]
         # Nothing was ever dispatched for the declined step.
         assert [e.kind.value for e in await h.events() if e.step_id == "s6"] == [
             "approval_requested",
@@ -1109,9 +1112,10 @@ class TestDurableStateAndResume:
         assert await h.count("mock_crm.email_outbox", {"run_id": str(h.run_id)}) == 1
         assert (await h.run_row()).status is RunStatus.COMPLETED
         # One timeline, across both processes.
-        assert (await h.kinds())[-4:] == [
+        assert (await h.kinds())[-5:] == [
             "approval_granted",
             "tool_started",
             "tool_succeeded",
             "verification_passed",
+            "run_completed",
         ]
