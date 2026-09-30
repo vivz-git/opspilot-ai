@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Render Blueprint for the OpsPilot API (docs/deployment.md).
+#
+# One Docker web service built from backend/Dockerfile — the same image and
+# the same scripts/start.sh entrypoint docker-compose and CI exercise, so the
+# hosted service runs the tested production path and nothing else.
+#
+# The database is NOT here: it is Supabase PostgreSQL, reached through
+# DATABASE_URL. Do not add a Render Postgres database — the free one expires
+# after 30 days and would take the demo's history with it.
+#
+# Nothing secret lives in this file. `sync: false` makes Render prompt for the
+# value when the Blueprint is applied and keeps it in Render's secret store.
+# ---------------------------------------------------------------------------
+services:
+  - type: web
+    name: opspilot-api
+    runtime: docker
+    # Free instances spin down after inactivity and take about a minute to
+    # wake — accepted for a single-operator demo (docs/deployment.md §7).
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    # Readiness, not liveness: database reachable AND at the migration head.
+    healthCheckPath: /readyz
+    # Runs are driven in-process (ADR-004); leases make a second instance
+    # safe, not useful. Never scale this service out.
+    numInstances: 1
+    # REQUIRED before the deployment counts as done (docs/deployment.md §4):
+    # the default *.onrender.com URL reaches this service WITHOUT passing
+    # Cloudflare Access, and the proxy-header fence (ADR-026) is presence-only,
+    # so a caller who finds that URL can forge its way past it. Once the
+    # Cloudflare-proxied API hostname is added and verified, uncomment both
+    # lines with the real hostname and re-sync — Render then answers every
+    # onrender.com request with 404 before it reaches the app.
+    # domains:
+    #   - <api-hostname>
+    # renderSubdomainPolicy: disabled
+    envVars:
+      # -- the security shape (ADR-017, ADR-026) ------------------------------
+      - key: OPSPILOT_ENV
+        value: production
+      - key: OPSPILOT_AUTH_MODE
+        value: proxy
+      - key: OPSPILOT_PROXY_IDENTITY_HEADER
+        value: Cf-Access-Authenticated-User-Email
+      # https://<console-hostname> — exactly one origin, never a wildcard.
+      - key: CORS_ALLOW_ORIGINS
+        sync: false
+      # -- the database (Supabase session pooler, TLS) ------------------------
+      # postgresql+asyncpg://postgres.<project-ref>:<password>@<pooler-host>:5432/postgres?ssl=require
+      - key: DATABASE_URL
+        sync: false
+      # -- the demo's safe defaults --------------------------------------------
+      - key: OPSPILOT_PLANNER
+        value: rules
+      - key: OPSPILOT_INTEGRATIONS
+        value: mock
+      - key: LOG_LEVEL
+        value: INFO
+      # -- the deploy process (backend/scripts/start.sh) ----------------------
+      # The free plan has no pre-deploy command, so migrations run on start;
+      # /readyz refuses traffic until the schema is at head either way.
+      - key: OPSPILOT_MIGRATE_ON_START
+        value: "true"
+      # Additive: never truncates what an operator is looking at.
+      - key: OPSPILOT_SEED_ON_START
+        value: "true"
+      # The container is reachable only through Render's proxy, whose
+      # addresses are not published; X-Forwarded-* only sets scheme and
+      # client address, and nothing in the app authorises on either.
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"

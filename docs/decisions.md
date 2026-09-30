@@ -33,6 +33,7 @@ Reversing an accepted ADR requires a new ADR, not an edit.
 | [022](#adr-022) | `rejected` is a terminal status distinct from `failed` | accepted |
 | [023](#adr-023) | Run ownership is a fenced lease; recovery is a checkpoint-driven state machine | accepted |
 | [026](#adr-026) | A hosted deployment is fenced by an identity-aware proxy, declared as `OPSPILOT_AUTH_MODE=proxy` | accepted |
+| [027](#adr-027) | The hosted target is Render + Supabase + Vercel, behind Cloudflare Access | accepted |
 
 ---
 
@@ -668,6 +669,50 @@ README is exactly what ADR-017 says a fuse is worth more than. *A shared
 secret header checked by the app*: that is application authentication with
 one credential, no rotation and no revocation — worse than the proxy, and it
 would have to live in the browser bundle to work from the console.
+
+---
+
+## ADR-027
+### The hosted target is Render + Supabase + Vercel, behind Cloudflare Access
+
+**Context.** LAUNCH-001 prepared a Railway deployment (API and Postgres on
+Railway). The project's supported hosted target is now a free Render web
+service for the API, Supabase PostgreSQL for the database, Vercel for the
+console, and Cloudflare Access in front of both hostnames. Render's free
+Postgres expires after 30 days, so it cannot hold the demo's history. And
+every Render web service is also published at `<service>.onrender.com`, a
+route to the origin that never passes through Cloudflare — while ADR-026's
+fence is a *presence* check on a header any direct caller can send.
+
+**Decision.** `render.yaml` (a Blueprint) replaces `railway.json`: one Docker
+web service built from `backend/Dockerfile` with `scripts/start.sh` as its
+entrypoint — the same image and path docker-compose and CI run — on the free
+plan, `numInstances: 1`, `healthCheckPath: /readyz`, migrate- and
+seed-on-start (the free plan has no pre-deploy step), and the security shape
+of ADR-026 as fixed values; `DATABASE_URL` and `CORS_ALLOW_ORIGINS` are
+`sync: false` secrets. The database is Supabase through its session pooler,
+reached by an unchanged persistence layer: the only application change is
+that `libpq_conninfo` now translates asyncpg's `ssl=` to libpq's `sslmode=`,
+so one TLS-bearing `DATABASE_URL` serves both drivers — previously such a URL
+crashed the checkpointer at boot. Disabling the `onrender.com` subdomain
+(`renderSubdomainPolicy: disabled`, once the Cloudflare-proxied custom domain
+is verified) is a **required** deployment step, and the verification includes
+proving that URL answers 404 even with a forged identity header.
+
+**Consequences.** Cloudflare Access remains the only boundary and ADR-017 and
+ADR-026 are unchanged; the deployment now has one more thing a human must
+configure correctly and prove. A free Render instance sleeps when idle and
+takes about a minute to wake — accepted for a single-operator demo and stated
+in `docs/deployment.md`; a run interrupted by a spin-down is resumed by the
+startup reconciler (ADR-023). No provider-specific code entered the
+application.
+
+**Alternatives rejected.** *Render Postgres*: expires on the free plan.
+*Verifying Cloudflare's signed `Cf-Access-Jwt-Assertion` in the app*: it would
+close the origin bypass inside the application, but it is application-level
+verification of identity — the step ADR-017/ADR-026 deliberately leave to a
+new mode and a new ADR — and it is unnecessary once the origin is reachable
+only through Cloudflare. *A shared secret header*: rejected in ADR-026.
 
 ---
 

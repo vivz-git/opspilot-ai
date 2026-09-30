@@ -12,19 +12,21 @@ budgeted, terminating unit of work with a status, a trace and a verdict.
 > **Project status — the system runs end to end.**
 > The agent, the nine tools, persistence, approvals, verification, recovery,
 > the evaluation suite, the HTTP API and the operator console are implemented
-> and tested: **1804 backend tests** (93% line coverage) plus 123 frontend
-> unit tests and 14 Playwright specs. The canonical request below runs against
+> and tested: **1823 backend tests** (94% line coverage) plus 130 frontend
+> unit tests and 16 Playwright specs. The canonical request below runs against
 > a real database, pauses for a human, and finishes with a verified simulated
 > effect and a complete trace.
 >
-> It is **not deployed** — and must not be deployed openly: OpsPilot has no
-> application authentication ([ADR-017](docs/decisions.md#adr-017)). The
-> supported hosted shape is a **hosted single-operator demo** — one console,
-> one operator, behind an identity-aware proxy —
+> The repository is engineering-complete. It is **not deployed** — and must
+> not be deployed openly: OpsPilot has no application authentication
+> ([ADR-017](docs/decisions.md#adr-017)). The supported hosted shape is a
+> **hosted single-operator demo** — Render (API) + Supabase (PostgreSQL) +
+> Vercel (console), both hostnames behind Cloudflare Access —
 > [`docs/deployment.md`](docs/deployment.md),
-> [ADR-026](docs/decisions.md#adr-026). The configuration for it is complete
-> and verified against a live stack in that exact shape; standing the hosted
-> environment up is still a human's step (`docs/deployment.md` §5).
+> [ADR-026](docs/decisions.md#adr-026), [ADR-027](docs/decisions.md#adr-027).
+> Its configuration is in the tree and the production image has been run in
+> that exact shape; creating the provider accounts and resources, setting the
+> secrets and proving the result is a human's step (`docs/deployment.md` §5).
 
 ---
 
@@ -75,24 +77,18 @@ make up-full                  # adds the console at http://localhost:3000
 deterministic rule planner (`OPSPILOT_PLANNER=auto`). Set it to get
 LLM-generated plans and outreach copy. Nothing else changes.
 
-Run the worked example against it — the console has no submission form yet, so
-the run starts over the API and you drive the approval in the browser:
-
-```bash
-curl -fsS -X POST http://localhost:8000/runs \
-  -H 'Content-Type: application/json' \
-  -d '{"user_request":"Find the top 3 fintech leads in London, research their companies, score them, draft outreach to the best one and email it to them.","auto_start":true}'
-```
-
-It pauses at `awaiting_approval`. Open `http://localhost:3000/runs/<run_id>`,
-follow the link to the approval, read the payload, approve — the timeline
-finishes live over SSE. [`docs/deployment.md` §6](docs/deployment.md) lists
+Run the worked example from the console: open `http://localhost:3000/runs`,
+click **Use the canonical request**, then **Submit run**. The console opens
+the new run; it pauses at `awaiting_approval`. Follow the link to the
+approval, read the payload, approve — the timeline finishes live over SSE.
+(`POST /runs` with `{"user_request": "…", "auto_start": true}` does the same
+from any HTTP client.) [`docs/deployment.md` §6](docs/deployment.md) lists
 what to check at each step.
 
 ```bash
 cd backend
 uv sync --locked --extra dev
-uv run pytest                 # 1804 passed, 1 skipped (the opt-in live Groq smoke test)
+uv run pytest                 # 1823 passed, 1 skipped (the opt-in live Groq smoke test)
 ```
 
 ## Documentation
@@ -100,7 +96,7 @@ uv run pytest                 # 1804 passed, 1 skipped (the opt-in live Groq smo
 | Document | What it is for |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | The specification. System, agent, graph, state, tool contracts, approval, retry, verification, persistence, API, observability, evaluation, security, testing, integration boundary. |
-| [`docs/decisions.md`](docs/decisions.md) | 26 ADRs — each decision, the alternative rejected, and what it costs. Plus the open questions. |
+| [`docs/decisions.md`](docs/decisions.md) | 27 ADRs — each decision, the alternative rejected, and what it costs. Plus the open questions. |
 | [`docs/tasks.md`](docs/tasks.md) | The prioritized backlog: 70 tasks with dependencies, acceptance criteria and model allocation. |
 | [`docs/progress.md`](docs/progress.md) | What is done, verified and outstanding. |
 | [`docs/handoff.md`](docs/handoff.md) | How the next session continues. **Start here.** |
@@ -136,7 +132,8 @@ Pydantic v2 · SQLAlchemy 2 async · Groq API (`openai/gpt-oss-120b`)
 **Data** PostgreSQL 16 — three schemas: control plane, LangGraph runtime,
 simulated system of record
 **Infra** Docker · docker-compose · GitHub Actions (lint, strict types, tests,
-gitleaks) · Railway (API + Postgres) · Vercel (console) · Cloudflare Access
+gitleaks) · Render (API) · Supabase (PostgreSQL) · Vercel (console) ·
+Cloudflare Access
 
 ## Security
 

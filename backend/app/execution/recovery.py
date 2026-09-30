@@ -30,6 +30,11 @@ intentional pause from being mistaken for a crash.
 
 "failed" is `run_failed`; [1]–[3] are `run_recovered` with `status` =
 `awaiting_approval`, the terminal status, and `resumed` respectively.
+`run_recovered` is an *observation* — the reconciler took the run over — and
+never the end of the story: every terminal settle here (R3, and R4 once the
+resumed graph finishes) goes through `settlement.settle_terminal`, so the
+trace then ends with the run's own terminal event (`run_completed`,
+`run_failed`, `run_rejected`, …), exactly as an uninterrupted run's does.
 "Released" means the lease is cleared in the same statement as the
 transition; no new owner survives the reconciliation except in R4, where
 the reconciler itself is the run's worker until the graph next stops. In
@@ -90,6 +95,7 @@ from app.agent.state import (
     RunStatus,
 )
 from app.execution.leases import LeaseConfig, LeaseHeartbeat, UnitOfWorkFactory
+from app.execution.settlement import settle_terminal
 from app.persistence.checkpointing import DURABILITY, thread_config
 from app.persistence.models import ApprovalRow, TraceEventKind, TraceEventSeverity
 from app.runtime import Clock
@@ -630,26 +636,24 @@ class Reconciler:
                 payload={**payload, "recovery": "finished_without_status"},
             )
             return
-        now = self._clock.now()
         async with self._uow_factory() as uow:
-            row = await uow.agent_runs.transition_status(
-                candidate.run_id,
+            # The run ends exactly as an uninterrupted run would — with its
+            # terminal event (§14.2). When the reconciler itself finalised a
+            # checkpoint that had already finished (R3), that is observed
+            # first as `run_recovered`; the terminal event is always last.
+            row = await settle_terminal(
+                uow,
+                run_id=candidate.run_id,
                 expected=_CLAIMABLE,
-                status=terminal,
                 owner=self._owner,
+                status=terminal,
                 status_reason=inspection.status_reason,
-                finished_at=now,
-                duration_ms=_duration_ms(candidate.started_at, now),
+                now=self._clock.now(),
+                started_at=candidate.started_at,
                 final_response=inspection.final_response,
-                release_lease=True,
+                payload={"status_reason": inspection.status_reason, "owner": self._owner},
+                recovered={**payload, "recovery": "finalized"} if event else None,
             )
-            if row is not None and event:
-                await uow.trace_events.append(
-                    run_id=candidate.run_id,
-                    kind=TraceEventKind.RUN_RECOVERED,
-                    status=terminal.value,
-                    payload={**payload, "recovery": "finalized"},
-                )
             if row is None:
                 await uow.agent_runs.release_lease(candidate.run_id, owner=self._owner)
             await uow.commit()
@@ -663,33 +667,27 @@ class Reconciler:
         error: BaseException | None,
         payload: dict[str, Any],
     ) -> None:
-        now = self._clock.now()
-        severity = TraceEventSeverity.ERROR if error is not None else TraceEventSeverity.WARNING
         async with self._uow_factory() as uow:
-            row = await uow.agent_runs.transition_status(
-                candidate.run_id,
+            row = await settle_terminal(
+                uow,
+                run_id=candidate.run_id,
                 expected=_CLAIMABLE,
-                status=RunStatus.FAILED,
                 owner=self._owner,
+                status=RunStatus.FAILED,
                 status_reason=reason,
-                finished_at=now,
-                duration_ms=_duration_ms(candidate.started_at, now),
-                release_lease=True,
+                now=self._clock.now(),
+                started_at=candidate.started_at,
+                severity=(
+                    TraceEventSeverity.ERROR if error is not None else TraceEventSeverity.WARNING
+                ),
+                error={
+                    "class": reason,
+                    "message": detail,
+                    "detail": repr(error) if error is not None else None,
+                },
+                payload=payload,
             )
-            if row is not None:
-                await uow.trace_events.append(
-                    run_id=candidate.run_id,
-                    kind=TraceEventKind.RUN_FAILED,
-                    severity=severity,
-                    status=RunStatus.FAILED.value,
-                    error={
-                        "class": reason,
-                        "message": detail,
-                        "detail": repr(error) if error is not None else None,
-                    },
-                    payload=payload,
-                )
-            else:
+            if row is None:
                 await uow.agent_runs.release_lease(candidate.run_id, owner=self._owner)
             await uow.commit()
 
@@ -704,12 +702,6 @@ class Reconciler:
                 payload={**payload, "recovery": status},
             )
             await uow.commit()
-
-
-def _duration_ms(started_at: datetime | None, finished_at: datetime) -> int | None:
-    if started_at is None:
-        return None
-    return max(0, int((finished_at - started_at).total_seconds() * 1000))
 
 
 def _iso(value: datetime | None) -> str | None:

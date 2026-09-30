@@ -63,6 +63,7 @@ import ast
 import asyncio
 import dataclasses
 import inspect
+import re
 import subprocess
 import sys
 import uuid
@@ -848,6 +849,9 @@ def mypy_available() -> bool:
     return find_spec("mypy") is not None
 
 
+_MYPY_ERROR_LINE = re.compile(r":(\d+)(?::\d+)?: error: ")
+
+
 def run_mypy(source: Path) -> dict[int, set[str]]:
     """Type-check one file with the project's own configuration and report
     `{line: {error codes}}`. Runs the same checker CI runs, from the same
@@ -870,11 +874,14 @@ def run_mypy(source: Path) -> dict[int, set[str]]:
     )
     found: dict[int, set[str]] = {}
     for line in completed.stdout.splitlines():
-        parts = line.split(":", 3)
-        if len(parts) < 4 or " error: " not in line:
+        # `path:line: error: ...` — matched from the line number, not by
+        # splitting on ":", so a Windows drive letter (`C:\...`) in the path
+        # cannot shift the fields.
+        match = _MYPY_ERROR_LINE.search(line)
+        if match is None:
             continue
         code = line.rsplit("[", 1)[-1].rstrip("]") if line.rstrip().endswith("]") else "?"
-        found.setdefault(int(parts[1]), set()).add(code)
+        found.setdefault(int(match.group(1)), set()).add(code)
     return found
 
 

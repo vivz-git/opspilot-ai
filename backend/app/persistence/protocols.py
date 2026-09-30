@@ -139,8 +139,13 @@ class AgentRunRepository(Protocol):
         plan: dict[str, Any],
         plan_revision: int,
         plan_history: list[Any] | None = None,
+        normalized_task: dict[str, Any] | None = None,
+        replan_count: int | None = None,
     ) -> AgentRun | None:
-        """Update current plan and append to plan history."""
+        """Update current plan and append to plan history.
+
+        `normalized_task` and `replan_count` ride along when given: they are
+        what the plan was made from and how many revisions preceded it."""
         ...
 
     async def update_final_response(
@@ -164,6 +169,16 @@ class AgentRunRepository(Protocol):
         replan_delta: int = 0,
     ) -> AgentRun | None:
         """Atomically increment denormalized execution counters."""
+        ...
+
+    async def refresh_step_counters(self, run_id: uuid.UUID) -> None:
+        """Recompute `step_count` and `retry_total` from `execution_steps`.
+
+        `step_count` is the number of step instances that actually executed
+        (`attempts > 0`, fan-out children included); `retry_total` is the sum
+        of their `retry_count`. One `UPDATE` with correlated subqueries, so it
+        is exact inside the caller's transaction and idempotent when a node is
+        re-executed after a crash — unlike a delta, it cannot double-count."""
         ...
 
     async def transition_status(
@@ -333,6 +348,33 @@ class ExecutionStepRepository(Protocol):
         self, step_uuid: uuid.UUID, *, retry_count_delta: int = 0
     ) -> ExecutionStep | None:
         """Increment attempts and retry count on a step."""
+        ...
+
+    async def begin_attempt(
+        self, step_uuid: uuid.UUID, *, attempt: int, started_at: datetime
+    ) -> ExecutionStep | None:
+        """Mark execution attempt `attempt` (1-based) as started: `running`,
+        `attempts = max(attempts, attempt)`, `retry_count = attempts - 1`.
+
+        `started_at` is written only on the first attempt — it is when the
+        step started, not when its latest retry did. The previous attempt's
+        `finished_at`, `duration_ms` and `error` are cleared, because the
+        step is no longer finished. Re-running the same attempt after a crash
+        writes the same values (§9.7: every node must be safe to run twice)."""
+        ...
+
+    async def settle_unsettled(
+        self,
+        run_id: uuid.UUID,
+        *,
+        finished_at: datetime,
+        error: dict[str, Any],
+    ) -> int:
+        """Close every step of a terminal run still `pending`/`ready`/
+        `running` as `failed` with `error`, so no row claims to be executing
+        after its run has ended. `verification_status` is left exactly as it
+        was — an unconfirmed effect stays unconfirmed (P5). Returns the
+        number of rows closed."""
         ...
 
 

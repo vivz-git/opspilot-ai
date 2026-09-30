@@ -54,16 +54,12 @@ Before adding anything here, the registered FastAPI routes and the eleven
    because it is the API's one guarantee against leaking exception internals
    to a client.
 
-**Genuine defect reported, not fixed.** §13.1 states "`trace_id` is echoed on
-every error", but `register_error_handlers` never passes `trace_id` to
-`problem_details(...)` on any of its ~13 handlers — every error response
-today omits the field entirely. This is pre-existing, applies uniformly to
-every error path (not something `budget_exhausted` introduced), and fixing
-it needs a request-correlation mechanism (e.g. middleware minting a
-per-request id) that doesn't exist yet and that no acceptance criterion of
-this task requires. Out of scope here; recorded for whoever owns OBS-005 or
-a future API task. The tests below assert what the API genuinely returns
-(no `trace_id` key), not the aspirational doc text.
+**`trace_id` on every error (§13.1).** When this module was written no error
+response carried `trace_id` — there was no per-request correlation at all.
+`app/api/correlation.py` now mints one per request, and
+`TestTraceIdCorrelation` below pins it on a representative error of every
+family: a domain 404, a 409, a 422, the generic 500, the access fence's 401,
+the framework's own unknown-route 404 and 405, and `/readyz`'s 503.
 
 **Evaluation and tool catalog endpoints.** §13.6 (API-005) and §13.7
 (API-006) are now implemented (`app/api/evaluations.py`, `app/api/tools.py`)
@@ -79,13 +75,17 @@ database, reached only through the HTTP route.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from app.agent.state import RunStatus
+from app.api import errors as api_errors
 from app.api.dependencies import get_run_service
+from app.config import AuthMode
 from app.errors import BudgetExhaustedError
 from app.execution.runs import RunCreateResult, RunService
 from app.main import create_app
@@ -174,6 +174,118 @@ class TestInternalErrorMapping:
         # No stack trace, no exception class name, leaked to the client.
         assert "RuntimeError" not in resp.text
         assert body["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# trace_id — per-request correlation on every error (§13.1, §16.5)
+# ---------------------------------------------------------------------------
+_HEX_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _assert_problem_with_trace_id(resp: Any, *, status: int, code: str) -> str:  # noqa: ANN401
+    assert resp.status_code == status
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    body = resp.json()
+    assert (body["status"], body["code"]) == (status, code)
+    assert isinstance(body.get("trace_id"), str) and _HEX_ID.match(body["trace_id"])
+    trace_id: str = body["trace_id"]
+    return trace_id
+
+
+class TestTraceIdCorrelation:
+    """Every error carries the correlation id its request was served under.
+    It is minted by the server per request — a run id, an approval id or a
+    trace `seq` is never reused as one, and a client cannot choose it."""
+
+    async def test_domain_errors_carry_a_fresh_trace_id_per_request(self) -> None:
+        run_id = uuid.uuid4()
+        mock_service = AsyncMock(spec=RunService)
+        mock_service.get_run_details.return_value = None
+        mock_service.create_run.side_effect = BudgetExhaustedError("over budget")
+        app = create_app()
+        app.dependency_overrides[get_run_service] = lambda: mock_service
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            missing = await client.get(f"/runs/{run_id}")
+            again = await client.get(f"/runs/{run_id}")
+            conflict = await client.post("/runs", json={"user_request": "one more"})
+            invalid = await client.post("/runs", json={})
+
+        first = _assert_problem_with_trace_id(missing, status=404, code="not_found")
+        second = _assert_problem_with_trace_id(again, status=404, code="not_found")
+        third = _assert_problem_with_trace_id(conflict, status=409, code="budget_exhausted")
+        fourth = _assert_problem_with_trace_id(invalid, status=422, code="validation_error")
+        assert len({first, second, third, fourth}) == 4  # one id per request
+        assert run_id.hex not in {first, second}  # a request id, never the run's id
+        # The rest of the envelope is exactly what it was.
+        assert missing.json()["instance"] == f"/runs/{run_id}"
+        assert invalid.json()["errors"]
+        # A client-supplied correlation header is not what gets echoed.
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            spoofed = await client.get(
+                f"/runs/{run_id}", headers={"X-Request-Id": "attacker-chosen", "X-Trace-Id": "x"}
+            )
+        assert "attacker-chosen" not in spoofed.text
+        _assert_problem_with_trace_id(spoofed, status=404, code="not_found")
+
+    async def test_the_generic_500_carries_the_trace_id_and_logs_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_service = AsyncMock(spec=RunService)
+        mock_service.get_run_details.side_effect = RuntimeError("boom with internals")
+        app = create_app()
+        app.dependency_overrides[get_run_service] = lambda: mock_service
+        logged: list[tuple[str, dict[str, Any]]] = []
+
+        class _Recorder:
+            def exception(self, event: str, **fields: Any) -> None:  # noqa: ANN401
+                logged.append((event, fields))
+
+        # structlog caches loggers on first use, so the module's logger is
+        # replaced rather than captured.
+        monkeypatch.setattr(api_errors, "_log", _Recorder())
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(f"/runs/{uuid.uuid4()}")
+
+        trace_id = _assert_problem_with_trace_id(resp, status=500, code="internal_error")
+        assert "boom" not in resp.text
+        # The operator's report maps to the server's log line (§13.1).
+        [(event, fields)] = logged
+        assert (event, fields["trace_id"]) == ("unhandled_api_error", trace_id)
+
+    async def test_framework_errors_use_the_same_envelope(self) -> None:
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            unknown = await client.get("/no-such-route")
+            wrong_method = await client.delete("/runs")
+
+        _assert_problem_with_trace_id(unknown, status=404, code="not_found")
+        assert unknown.json()["instance"] == "/no-such-route"
+        _assert_problem_with_trace_id(wrong_method, status=405, code="method_not_allowed")
+        assert wrong_method.headers.get("allow")  # the framework's header is preserved
+
+    async def test_the_access_fence_401_carries_a_trace_id(self) -> None:
+        proxied = harness_settings().model_copy(update={"auth_mode": AuthMode.PROXY})
+        app = create_app(settings=proxied)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            refused = await client.get("/runs")
+            schema = await client.get("/openapi.json")
+
+        _assert_problem_with_trace_id(refused, status=401, code="policy_violation")
+        _assert_problem_with_trace_id(schema, status=401, code="policy_violation")
+
+    async def test_readyz_503_carries_a_trace_id(self) -> None:
+        app = create_app()
+        app.state.db_engine = create_async_engine(
+            "postgresql+asyncpg://opspilot:opspilot@127.0.0.1:1/unreachable"
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/readyz")
+        await app.state.db_engine.dispose()
+
+        _assert_problem_with_trace_id(resp, status=503, code="integration_unavailable")
+        assert resp.json()["instance"] == "/readyz"
 
 
 # ---------------------------------------------------------------------------

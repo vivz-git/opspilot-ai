@@ -58,14 +58,16 @@ from app.execution.recovery import CheckpointPhase, LangGraphRunDriver
 from app.execution.runs import RunService
 from app.execution.runtime import build_driver
 from app.integrations.mock.seed import seed_database
+from app.main import create_app
 from app.persistence.checkpointing import open_checkpointer
-from app.persistence.models import AgentRun, ApprovalRow, ToolCallRow, TraceEvent
+from app.persistence.models import AgentRun, ApprovalRow, ExecutionStep, ToolCallRow, TraceEvent
 from app.persistence.protocols import UnitOfWorkFactory
 from app.persistence.session import create_session_factory
 from app.runtime import FixedClock, InMemoryCancellationSource, UuidIdGenerator
 from app.tools.contracts import ToolName
 from app.tools.registry import ToolContext, ToolImplementation, default_implementations
 from app.tools.schemas import SaveDraftOutput
+from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -277,6 +279,17 @@ class Harness:
             rows = await uow.tool_calls.list_by_run(self.run_id)
             await uow.commit()
         return rows
+
+    async def step_rows(self) -> list[ExecutionStep]:
+        async with self.uow_factory() as uow:
+            rows = await uow.execution_steps.list_by_run(self.run_id)
+            await uow.commit()
+        return rows
+
+    async def steps_by_id(self) -> dict[str, ExecutionStep]:
+        """The row for each step id under the latest plan revision that ran it."""
+        rows = sorted(await self.step_rows(), key=lambda r: r.plan_revision)
+        return {r.step_id: r for r in rows}
 
     async def approval_rows(self) -> list[ApprovalRow]:
         async with self.uow_factory() as uow:
@@ -1119,3 +1132,260 @@ class TestDurableStateAndResume:
             "verification_passed",
             "run_completed",
         ]
+
+
+# ---------------------------------------------------------------------------
+# 9. The control-plane projection: `execution_steps` and the run's counters
+# ---------------------------------------------------------------------------
+#: A row that has finished executing, one way or another (§12.4).
+SETTLED = {"succeeded", "failed", "skipped", "rejected"}
+
+
+def _row_view(row: ExecutionStep) -> tuple[str, int, int]:
+    """`(status, attempts, retry_count)` — what the run resource reports."""
+    return (row.status.value, row.attempts, row.retry_count)
+
+
+async def _run_resource(h: Harness) -> dict[str, Any]:
+    """`GET /runs/{id}` through the real app over ASGI, so the assertion is on
+    what an API consumer actually reads, not on the repository."""
+    app = create_app(settings=pinned_settings(), run_service=h.runs, clock=h.clock)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/runs/{h.run_id}")
+    assert response.status_code == 200
+    body: dict[str, Any] = response.json()
+    return body
+
+
+class TestControlPlaneProjection:
+    """`execution_steps` and `agent_runs`' denormalised columns mirror the run
+    as it executes (§12.3, §12.4): a row appears when a step's first attempt
+    starts and never for work that did not happen, moves through `running` to
+    a settled status, and carries real attempts, timestamps and durations;
+    `step_count` counts executed step instances and `retry_total` their
+    retries. Each test drives the production composition and reads the rows
+    back — the checkpoint and the trace are already asserted above."""
+
+    async def test_a_successful_run_settles_every_step_and_counts_them(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        h = await make_run(LOOKUP_AND_RESEARCH)
+        await h.start()
+
+        rows = await h.steps_by_id()
+        assert {sid: _row_view(r) for sid, r in rows.items()} == {
+            "s1": ("succeeded", 1, 0),
+            "s2": ("succeeded", 1, 0),
+        }
+        for row in rows.values():
+            assert row.started_at is not None and row.finished_at is not None
+            assert row.finished_at >= row.started_at
+            assert row.duration_ms == int((row.finished_at - row.started_at).total_seconds() * 1000)
+            assert row.error is None
+            assert row.result is not None
+        assert rows["s1"].verification_status is VerificationStatus.NOT_REQUIRED
+        assert rows["s2"].verification_status is VerificationStatus.PASSED
+        assert [r.seq for r in await h.step_rows()] == [1, 2]
+
+        run = await h.run_row()
+        assert (run.step_count, run.retry_total, run.replan_count) == (2, 0, 0)
+        # The plan the run executed from is on the run row, with its task.
+        assert run.plan is not None
+        assert [s["step_id"] for s in run.plan["steps"]] == ["s1", "s2"]
+        assert run.plan_revision == 0
+        assert run.normalized_task is not None and run.normalized_task["in_scope"] is True
+
+        resource = await _run_resource(h)
+        assert resource["counters"] == {"step_count": 2, "retry_total": 0, "replan_count": 0}
+        assert [(s["step_id"], s["status"], s["attempts"]) for s in resource["steps"]] == [
+            ("s1", "succeeded", 1),
+            ("s2", "succeeded", 1),
+        ]
+        assert resource["plan"]["steps"][0]["tool"] == "get_lead"
+
+    async def test_retries_are_attempts_on_one_step_not_extra_steps(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        """Two transient failures then success: one row, three attempts, two
+        retries, error cleared by the attempt that succeeded, and a duration
+        that spans the backoff the injected clock slept through."""
+        script = ToolScript().fails(
+            ToolName.RESEARCH_COMPANY, step_id="s2", attempts=[1, 2], error=transient
+        )
+        h = await make_run(LOOKUP_AND_RESEARCH, script=script, max_retries=2)
+        await h.start()
+
+        rows = await h.steps_by_id()
+        s2 = rows["s2"]
+        assert _row_view(s2) == ("succeeded", 3, 2)
+        assert s2.error is None
+        assert s2.started_at == T0  # when the step started, not its last retry
+        backoff_ms = sum(int(seconds * 1000) for seconds in h.clock.sleep_calls)
+        assert s2.duration_ms is not None and abs(s2.duration_ms - backoff_ms) <= 2
+        assert len(await h.step_rows()) == 2
+
+        run = await h.run_row()
+        # step_count counts step instances; the retries are in retry_total.
+        assert (run.step_count, run.retry_total) == (2, 2)
+        assert (await _run_resource(h))["counters"]["retry_total"] == 2
+
+    async def test_a_step_that_exhausts_its_retries_is_failed_with_its_error(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        script = ToolScript().fails(ToolName.RESEARCH_COMPANY, step_id="s2", error=transient)
+        h = await make_run(LOOKUP_AND_RESEARCH, script=script, max_retries=2)
+        await h.start()
+
+        rows = await h.steps_by_id()
+        assert _row_view(rows["s1"]) == ("succeeded", 1, 0)
+        s2 = rows["s2"]
+        assert _row_view(s2) == ("failed", 3, 2)
+        assert s2.error is not None and s2.error["class"] == "transient"
+        assert s2.finished_at is not None and s2.duration_ms is not None
+        # Evaluation invariant 3 now has real data to check (§15.5).
+        assert s2.attempts <= 1 + 2
+        run = await h.run_row()
+        assert (run.status, run.step_count, run.retry_total) == (RunStatus.FAILED, 2, 2)
+
+    async def test_a_skipped_optional_step_keeps_the_reason_it_was_skipped(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        script = ToolScript().fails(ToolName.SCORE_LEAD, step_id="s4", error=not_found)
+        h = await make_run(SCORE_TWO_LEADS, script=script)
+        await h.start()
+
+        rows = await h.steps_by_id()
+        assert _row_view(rows["s4"]) == ("skipped", 1, 0)
+        assert rows["s4"].error is not None and rows["s4"].error["class"] == "not_found"
+        assert rows["s4"].finished_at is not None
+        assert _row_view(rows["s3"]) == ("succeeded", 1, 0)
+        assert {r.status.value for r in await h.step_rows()} <= SETTLED
+        assert (await h.run_row()).status is RunStatus.COMPLETED
+
+    async def test_a_replanned_step_leaves_one_failed_row_per_revision(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        """Each revision's attempt is its own step instance (unique on
+        `(run, step, revision)`), and the run row carries the revision it
+        ended on, the plans it superseded and the replan count."""
+        script = ToolScript().fails(ToolName.SCORE_LEAD, step_id="s3", error=not_found)
+        h = await make_run(SCORE_TWO_LEADS, script=script, max_replans=2)
+        await h.start()
+
+        rows = await h.step_rows()
+        s3 = sorted((r for r in rows if r.step_id == "s3"), key=lambda r: r.plan_revision)
+        assert [(r.plan_revision, *_row_view(r)) for r in s3] == [
+            (0, "failed", 1, 0),
+            (1, "failed", 1, 0),
+            (2, "failed", 1, 0),
+        ]
+        assert {r.status.value for r in rows} <= SETTLED
+
+        run = await h.run_row()
+        assert (run.replan_count, run.plan_revision, len(run.plan_history)) == (2, 2, 2)
+        assert run.step_count == len(rows)
+        assert run.retry_total == 0
+
+    async def test_the_gated_step_has_no_row_until_a_human_approves_it(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        h = await make_run(DRAFT_AND_SEND)
+        assert await h.start() is ExecutionOutcome.PAUSED
+
+        paused = await h.steps_by_id()
+        assert set(paused) == {"s1", "s2", "s3", "s4", "s5"}  # nothing for s6 yet
+        assert {r.status.value for r in paused.values()} == {"succeeded"}
+        assert (await h.run_row()).step_count == 5
+        resource = await _run_resource(h)
+        assert resource["counters"]["step_count"] == 5
+        assert resource["pending_approval"]["step_id"] == "s6"
+
+        await h.decide("approve")
+
+        rows = await h.steps_by_id()
+        assert _row_view(rows["s6"]) == ("succeeded", 1, 0)
+        assert rows["s6"].verification_status is VerificationStatus.PASSED
+        run = await h.run_row()
+        assert (run.status, run.step_count) == (RunStatus.COMPLETED, 6)
+        # The approval settle materialises the run's duration like the executor's.
+        assert run.duration_ms is not None
+
+    async def test_a_rejected_step_never_gets_a_row(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        h = await make_run(DRAFT_AND_SEND)
+        await h.start()
+        await h.decide("reject", reason="Not this quarter.")
+
+        rows = await h.steps_by_id()
+        assert "s6" not in rows
+        assert {r.status.value for r in rows.values()} == {"succeeded"}
+        run = await h.run_row()
+        assert (run.status, run.step_count) == (RunStatus.REJECTED, 5)
+        assert run.duration_ms is not None
+
+    async def test_a_failed_read_back_fails_the_attempt_and_the_retry_succeeds(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        script = ToolScript().lies(
+            ToolName.SAVE_DRAFT, step_id="s5", attempts=[1], output=draft_saved_but_not_persisted
+        )
+        h = await make_run(DRAFT_AND_SEND, script=script, max_retries=2)
+        await h.start()
+
+        s5 = (await h.steps_by_id())["s5"]
+        assert _row_view(s5) == ("succeeded", 2, 1)
+        assert s5.verification_status is VerificationStatus.PASSED
+        assert s5.error is None
+
+    async def test_a_step_whose_effect_never_verifies_ends_failed_on_the_verdict(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        script = ToolScript().lies(
+            ToolName.SAVE_DRAFT, step_id="s5", output=draft_saved_but_not_persisted
+        )
+        h = await make_run(DRAFT_AND_SEND, script=script, max_retries=2)
+        await h.start()
+
+        rows = await h.steps_by_id()
+        s5 = rows["s5"]
+        assert _row_view(s5) == ("failed", 3, 2)
+        assert s5.verification_status is VerificationStatus.FAILED
+        assert s5.error is not None and s5.error["class"] == "verification_failed"
+        assert "s6" not in rows
+
+    async def test_cancellation_closes_the_step_it_interrupted(
+        self, make_run: Callable[..., Awaitable[Harness]]
+    ) -> None:
+        """The in-flight attempt finishes (cooperative, §13.2), but the run is
+        cancelled before its verification: the row is not left `running` on
+        a terminal run, it is closed with the run's reason and no verdict —
+        and the step that never started has no row."""
+        in_flight = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold(_ctx: ToolContext) -> None:
+            in_flight.set()
+            await release.wait()
+
+        script = ToolScript().blocks(ToolName.SCORE_LEAD, step_id="s3", hook=hold)
+        h = await make_run(SCORE_TWO_LEADS, script=script)
+        task = await h.launch()
+        await asyncio.wait_for(in_flight.wait(), timeout=10)
+        running = (await h.steps_by_id())["s3"]
+        assert _row_view(running) == ("running", 1, 0)
+        assert running.finished_at is None
+
+        await h.runs.cancel_run(h.run_id, reason="cancelled")
+        release.set()
+        await task
+
+        rows = await h.steps_by_id()
+        s3 = rows["s3"]
+        assert _row_view(s3) == ("failed", 1, 0)
+        assert s3.error is not None and s3.error["class"] == "cancelled"
+        assert s3.verification is None  # no verdict was ever recorded for it
+        assert "s4" not in rows
+        assert {r.status.value for r in rows.values()} <= SETTLED
+        run = await h.run_row()
+        assert (run.status, run.step_count) == (RunStatus.CANCELLED, len(rows))

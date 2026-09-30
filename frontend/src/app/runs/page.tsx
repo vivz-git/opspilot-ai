@@ -9,6 +9,7 @@ import {
   hasActiveFilters,
   type RunFiltersValue,
 } from "@/components/runs/run-filters";
+import { NewRunForm } from "@/components/runs/new-run-form";
 import { RunsPagination } from "@/components/runs/runs-pagination";
 import { RunsTable } from "@/components/runs/runs-table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -84,6 +85,8 @@ export default function RunsPage() {
         </p>
       </div>
 
+      <NewRunForm />
+
       <RunFilters value={filters} onChange={handleFiltersChange} />
 
       {isPending && (
@@ -111,7 +114,7 @@ export default function RunsPage() {
           <CardContent className="pt-6 text-sm text-muted-foreground">
             {hasActiveFilters(filters)
               ? "No runs match these filters."
-              : "No runs yet. Submit a request through the OpsPilot API to see it here."}
+              : "No runs yet. Submit a request above to start one."}
           </CardContent>
         </Card>
       )}

@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from starlette.middleware.cors import CORSMiddleware
 
 from app.api.approvals import router as approvals_router
+from app.api.correlation import RequestCorrelationMiddleware
 from app.api.dependencies import require_authorization, wire_runtime
 from app.api.errors import register_error_handlers
 from app.api.evaluations import router as evaluations_router
@@ -124,6 +125,10 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Added last, so it is the outermost of our middleware: every request —
+    # including one CORS or the access fence refuses — gets its `trace_id`
+    # before anything can fail (§13.1).
+    app.add_middleware(RequestCorrelationMiddleware)
 
     app.include_router(_schema_router(app))
     app.include_router(health_router)

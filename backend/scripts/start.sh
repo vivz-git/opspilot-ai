@@ -15,8 +15,9 @@
 # refuses traffic when the applied revision is not the code's head (§13.7), so
 # a container that boots without migrating fails its health check loudly
 # instead of serving a stale schema quietly. Set OPSPILOT_MIGRATE_ON_START=true
-# on platforms with no separate release phase (Railway), and leave it unset
-# where migrations run as their own step.
+# on platforms with no separate release phase (Render's free plan, whose
+# Blueprint `render.yaml` does), and leave it unset where migrations run as
+# their own step.
 # ---------------------------------------------------------------------------
 set -eu
 

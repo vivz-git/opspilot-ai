@@ -12,11 +12,15 @@ export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://loca
 
 type JsonOf<T> = T extends { content: { "application/json": infer R } } ? R : never;
 type Ok<T> = T extends { 200: infer R } ? JsonOf<R> : never;
+type Created<T> = T extends { 201: infer R } ? JsonOf<R> : never;
 
 export type Healthz = Ok<paths["/healthz"]["get"]["responses"]>;
 export type RunListResponse = Ok<paths["/runs"]["get"]["responses"]>;
 export type RunSummary = RunListResponse["items"][number];
 export type RunResource = Ok<paths["/runs/{run_id}"]["get"]["responses"]>;
+export type RunCreateRequest =
+  paths["/runs"]["post"]["requestBody"]["content"]["application/json"];
+export type CreatedRun = Created<paths["/runs"]["post"]["responses"]>;
 export type RunStepSummary = NonNullable<RunResource["steps"]>[number];
 export type RunPendingApproval = NonNullable<RunResource["pending_approval"]>;
 export type ApprovalQueueResponse = Ok<paths["/approvals/queue"]["get"]["responses"]>;
@@ -102,6 +106,16 @@ export function listRuns(query: RunListQuery = {}): Promise<RunListResponse> {
 
   const qs = params.toString();
   return request<RunListResponse>(`/runs${qs ? `?${qs}` : ""}`);
+}
+
+/** POST /runs — the backend creates the durable run and, with `auto_start`,
+ * queues it; everything after that is the server's lifecycle, not ours. */
+export function createRun(body: RunCreateRequest): Promise<CreatedRun> {
+  return request<CreatedRun>("/runs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export function getRun(runId: string): Promise<RunResource> {

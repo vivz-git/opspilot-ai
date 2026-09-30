@@ -814,7 +814,10 @@ class TestRealGraphComposition:
         row = await read_run(uow_factory, run_id)
         assert (row.status, row.lease_owner) == (RunStatus.COMPLETED, None)
         assert harness.calls(run_id) == {"prepare": 1, "work": 2, "finish": 1}
-        assert await trace_kinds(uow_factory, run_id) == [("run_recovered", "resumed")]
+        assert await trace_kinds(uow_factory, run_id) == [
+            ("run_recovered", "resumed"),
+            ("run_completed", "completed"),
+        ]
 
     async def test_the_real_approval_gate_pauses_the_executor_and_the_decision_completes_the_run(
         self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver, clock: FixedClock

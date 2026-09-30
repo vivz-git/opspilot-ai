@@ -24,6 +24,7 @@ from app.persistence.checkpointing import (
     thread_config,
 )
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.conninfo import conninfo_to_dict
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from recovery_harness import (
@@ -71,6 +72,31 @@ class TestConfigIdentity:
     def test_conninfo_drops_the_sqlalchemy_driver_suffix_and_keeps_the_target(self) -> None:
         conninfo = libpq_conninfo("postgresql+asyncpg://user:s3cret@db.example:5433/opspilot")
         assert conninfo == "postgresql://user:s3cret@db.example:5433/opspilot"
+
+    def test_conninfo_translates_asyncpg_tls_to_libpq(self) -> None:
+        """One `DATABASE_URL` must work for both drivers on a managed Postgres
+        that needs TLS (docs/deployment.md, Supabase): asyncpg takes `ssl=`,
+        libpq only `sslmode=`. A pooler-style user name survives untouched."""
+        url = (
+            "postgresql+asyncpg://postgres.abcdefgh:p%40ss@pooler.example.com:5432/postgres"
+            "?ssl=require"
+        )
+        conninfo = libpq_conninfo(url)
+        assert conninfo == (
+            "postgresql://postgres.abcdefgh:p%40ss@pooler.example.com:5432/postgres?sslmode=require"
+        )
+        # psycopg accepts it as a libpq conninfo.
+        params = conninfo_to_dict(conninfo)
+        assert (params["sslmode"], params["user"], params["password"]) == (
+            "require",
+            "postgres.abcdefgh",
+            "p@ss",
+        )
+        assert "ssl" not in params
+
+    def test_an_explicit_sslmode_wins_over_the_asyncpg_spelling(self) -> None:
+        conninfo = libpq_conninfo("postgresql+asyncpg://u:p@h/d?ssl=require&sslmode=verify-full")
+        assert conninfo_to_dict(conninfo)["sslmode"] == "verify-full"
 
 
 @pytest.mark.usefixtures("_database")

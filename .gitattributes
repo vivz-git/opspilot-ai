@@ -1,0 +1,6 @@
+# Files executed inside the Linux container keep LF on every checkout. With
+# `core.autocrlf=true` (the Windows default) `scripts/start.sh` would otherwise
+# be checked out with CRLF, and an image built from that working copy dies at
+# its entrypoint with `env: 'sh\r': No such file or directory`.
+*.sh text eol=lf
+backend/Dockerfile text eol=lf

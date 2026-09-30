@@ -80,8 +80,9 @@ from app.errors import (
     recovery_action,
 )
 from app.integrations.ports import Adapters
-from app.persistence.models import TraceEventKind, TraceEventSeverity
-from app.persistence.protocols import ApprovalUpsert, UnitOfWorkFactory
+from app.observability.redaction import redact_payload
+from app.persistence.models import ExecutionStep, TraceEventKind, TraceEventSeverity
+from app.persistence.protocols import ApprovalUpsert, UnitOfWork, UnitOfWorkFactory
 from app.runtime import (
     CancellationSource,
     Clock,
@@ -89,6 +90,7 @@ from app.runtime import (
     SeededRandom,
     SystemClock,
     UuidIdGenerator,
+    elapsed_ms,
 )
 from app.security import ApprovalGate, ApprovalToken, canonical_args_hash
 from app.tools.contracts import (
@@ -132,6 +134,14 @@ DEFAULT_APPROVAL_TTL: Final = timedelta(hours=24)
 #: The stored `payload_preview` is written through the same redaction the API
 #: applies when it serves it (§14.5); this is the byte budget it uses.
 _PREVIEW_MAX_BYTES: Final = 4096
+#: `execution_steps.result`/`.error` are "redacted and truncated" (§12.4).
+_STEP_RESULT_MAX_BYTES: Final = 8192
+_STEP_ERROR_MAX_BYTES: Final = 2048
+#: A step whose row carries one of these has finished (§12.4); anything else
+#: is still executing and has no `finished_at`/`duration_ms` yet.
+_SETTLED_STEP_STATUSES: Final = frozenset(
+    {StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED, StepStatus.REJECTED}
+)
 
 
 @dataclass(frozen=True)
@@ -326,6 +336,156 @@ class NodeHandlers:
             now=self._clock.now(),
         )
 
+    # ---------------------------------------------------------------------------
+    # Control-plane projection (§12.3, §12.4)
+    #
+    # `execution_steps` and the run's plan/counters mirror what the graph does,
+    # written at the moment it does it: a row appears when a step's first
+    # attempt starts (never for a step that was only planned, or is paused at
+    # the gate), moves to `running` at every attempt, and settles when the
+    # attempt — or its independent verification — decides the outcome. The
+    # checkpoint and the trace stay authoritative; like every other node-side
+    # write, these are best-effort, so a control-plane outage can never change
+    # what a run does, only what its reporting says until the next write.
+    # ---------------------------------------------------------------------------
+    async def _begin_step_attempt(
+        self,
+        state: AgentState,
+        plan: Plan,
+        step: PlanStep,
+        *,
+        resolved_args: dict[str, Any],
+        args_hash: str,
+        attempt: int,
+        seq: int,
+    ) -> uuid.UUID | None:
+        """Create the step's row on its first attempt, mark `attempt` started,
+        and recount the run's counters — one transaction. Returns the row id
+        the dispatcher records its `tool_calls` against."""
+        if self._uow_factory is None:
+            return None
+        try:
+            run_uuid = uuid.UUID(str(state["run_id"]))
+            async with self._uow_factory() as uow:
+                row = await uow.execution_steps.get_by_step_id(
+                    run_uuid, step.step_id, plan.revision
+                )
+                if row is None:
+                    row = await uow.execution_steps.create(
+                        run_id=run_uuid,
+                        step_id=step.step_id,
+                        plan_revision=plan.revision,
+                        seq=seq,
+                        tool=step.tool,
+                        parent_step_id=step.parent_step_id,
+                        args=resolved_args,
+                        args_hash=args_hash,
+                        depends_on=list(step.depends_on),
+                        optional=step.optional,
+                    )
+                await uow.execution_steps.begin_attempt(
+                    row.id, attempt=attempt, started_at=self._clock.now()
+                )
+                await uow.agent_runs.refresh_step_counters(run_uuid)
+                await uow.commit()
+                return row.id
+        except Exception as e:
+            _log.warning("execution_step_persistence_fallback", error=str(e))
+            return None
+
+    async def _write_step_outcome(
+        self,
+        uow: UnitOfWork,
+        row: ExecutionStep,
+        *,
+        status: StepStatus,
+        result: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record where one attempt left its step, inside the caller's
+        transaction. A settled status stamps `finished_at` and `duration_ms`
+        (first attempt's start to now, on the injected clock); `running` —
+        executed, awaiting its verdict — stamps neither."""
+        now = self._clock.now()
+        settled = status in _SETTLED_STEP_STATUSES
+        finished_at = now if settled else None
+        duration_ms = elapsed_ms(row.started_at, now) if settled else None
+        if result is not None:
+            await uow.execution_steps.record_result(
+                row.id,
+                result=redact_payload(result, max_bytes=_STEP_RESULT_MAX_BYTES),
+                status=status,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+        else:
+            await uow.execution_steps.update_status(
+                row.id,
+                status=status,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+                error=(
+                    redact_payload(error, max_bytes=_STEP_ERROR_MAX_BYTES)
+                    if error is not None
+                    else None
+                ),
+            )
+
+    async def _project_step(
+        self,
+        state: AgentState,
+        plan: Plan,
+        step_id: str,
+        *,
+        status: StepStatus,
+        result: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+    ) -> None:
+        """`_write_step_outcome` in a transaction of its own, for a step that
+        already has a row. No row means the step never executed, and nothing
+        is written for work that never happened."""
+        if self._uow_factory is None:
+            return
+        try:
+            run_uuid = uuid.UUID(str(state["run_id"]))
+            async with self._uow_factory() as uow:
+                row = await uow.execution_steps.get_by_step_id(run_uuid, step_id, plan.revision)
+                if row is not None:
+                    await self._write_step_outcome(
+                        uow, row, status=status, result=result, error=error
+                    )
+                await uow.commit()
+        except Exception as e:
+            _log.warning("execution_step_projection_fallback", error=str(e), step_id=step_id)
+
+    async def _persist_plan(
+        self,
+        state: AgentState,
+        plan: Plan,
+        *,
+        plan_history: list[Plan],
+        replan_count: int,
+    ) -> None:
+        """Mirror the plan the graph will execute from — with the task it was
+        made from, the revisions it replaced and how many there were — onto
+        the run row, so `GET /runs/{id}` shows what the run intends to do."""
+        if self._uow_factory is None:
+            return
+        task = state.get("normalized_task")
+        try:
+            async with self._uow_factory() as uow:
+                await uow.agent_runs.update_plan(
+                    uuid.UUID(str(state["run_id"])),
+                    plan=plan.model_dump(mode="json"),
+                    plan_revision=plan.revision,
+                    plan_history=[p.model_dump(mode="json") for p in plan_history],
+                    normalized_task=task.model_dump(mode="json") if task is not None else None,
+                    replan_count=replan_count,
+                )
+                await uow.commit()
+        except Exception as e:
+            _log.warning("plan_projection_fallback", error=str(e))
+
     async def _is_cancelled(self, state: AgentState) -> bool:
         """Cooperative cancellation check at node entry boundaries (§13.2)."""
         current_status = state.get("status")
@@ -451,7 +611,17 @@ class NodeHandlers:
             if issues:
                 raise PlanValidationError(issues)
         except Exception as exc:  # every planner failure is classified below
-            return self._planning_failure(exc, existing, revising, state)
+            failure = self._planning_failure(exc, existing, revising, state)
+            if revising and existing is not None:
+                # A failed revision still spent replan budget; the run row
+                # says so, with the plan it keeps executing from unchanged.
+                await self._persist_plan(
+                    state,
+                    existing,
+                    plan_history=[*state.get("plan_history", []), existing],
+                    replan_count=failure["replan_count"],
+                )
+            return failure
 
         accepted = carry_over_settled_steps(candidate, prior) if prior is not None else candidate
         identity = self._planner.identity
@@ -474,6 +644,12 @@ class NodeHandlers:
         if revising and existing is not None:
             delta["plan_history"] = [existing]
             delta["replan_count"] = state.get("replan_count", 0) + 1
+        await self._persist_plan(
+            state,
+            accepted,
+            plan_history=[*state.get("plan_history", []), *delta.get("plan_history", [])],
+            replan_count=delta.get("replan_count", state.get("replan_count", 0)),
+        )
         return delta
 
     def _planning_failure(
@@ -854,6 +1030,7 @@ class NodeHandlers:
         contract = self._get_contract(step.tool) or REGISTRY[step.tool]
         budgets = state.get("metadata", RunMetadata()).budgets
         args_hash = canonical_args_hash(step.args)
+        step_row_id: uuid.UUID | None = None
 
         try:
             # 1. Resolve $ref parameters from tool_results
@@ -933,29 +1110,19 @@ class NodeHandlers:
                     resolved_args=resolved_args,
                 )
 
-            # Resolve execution_step_id if uow_factory is provided
-            execution_step_id = uuid.UUID(hex=self._id_gen.new_id())
-            if self._uow_factory is not None:
-                try:
-                    run_uuid = uuid.UUID(str(state["run_id"]))
-                    async with self._uow_factory() as uow:
-                        step_row = await uow.execution_steps.get_by_step_id(
-                            run_uuid, current_step_id, plan.revision if plan else 0
-                        )
-                        if step_row is None:
-                            step_row = await uow.execution_steps.create(
-                                run_id=run_uuid,
-                                step_id=current_step_id,
-                                plan_revision=plan.revision if plan else 0,
-                                seq=step_count,
-                                tool=step.tool,
-                                args=resolved_args,
-                                args_hash=args_hash,
-                            )
-                            await uow.commit()
-                        execution_step_id = step_row.id
-                except Exception as e:
-                    _log.warning("execution_step_persistence_fallback", error=str(e))
+            # The attempt starts here: every check that can refuse it without
+            # executing anything has passed, so this is the first moment the
+            # step is genuinely executing (§12.4).
+            step_row_id = await self._begin_step_attempt(
+                state,
+                plan,
+                step,
+                resolved_args=resolved_args,
+                args_hash=args_hash,
+                attempt=attempt,
+                seq=step_count,
+            )
+            execution_step_id = step_row_id or uuid.UUID(hex=self._id_gen.new_id())
 
             dispatch_result = await self._registry.dispatch(
                 run_id=uuid.UUID(str(state["run_id"])),
@@ -1026,6 +1193,14 @@ class NodeHandlers:
                                 run_uuid, current_step_id, plan.revision if plan else 0
                             )
                             if step_row is not None:
+                                # Nothing to wait for: the step settles with
+                                # its result in the same transaction.
+                                await self._write_step_outcome(
+                                    uow,
+                                    step_row,
+                                    status=StepStatus.SUCCEEDED,
+                                    result=dispatch_result.output_data,
+                                )
                                 await uow.execution_steps.record_verification(
                                     step_row.id,
                                     verification_status=VerificationStatus.NOT_REQUIRED,
@@ -1045,6 +1220,16 @@ class NodeHandlers:
                             await uow.commit()
                     except Exception as e:
                         _log.warning("none_verification_persistence_fallback", error=str(e))
+            else:
+                # Executed, not yet settled: the result is recorded and the
+                # row stays `running` until `verify` rules on it.
+                await self._project_step(
+                    state,
+                    plan,
+                    current_step_id,
+                    status=StepStatus.RUNNING,
+                    result=dispatch_result.output_data,
+                )
 
             return delta
         except Exception as exc:
@@ -1080,6 +1265,17 @@ class NodeHandlers:
                 error_message=str(exc),
                 started_at=self._clock.now(),
             )
+            if step_row_id is not None:
+                # Only an attempt that actually started has a row to settle;
+                # a refusal before that (bad arguments, no grant) left none.
+                # A retry moves it back to `running` (`begin_attempt`).
+                await self._project_step(
+                    state,
+                    plan,
+                    current_step_id,
+                    status=StepStatus.FAILED,
+                    error={"class": err_class.value, "message": str(exc), "detail": err_detail},
+                )
             return {
                 "errors": [agent_err],
                 "tool_calls": [tool_call],
@@ -1342,6 +1538,28 @@ class NodeHandlers:
                         verification_status=result.status,
                         verification=result.model_dump(mode="json"),
                     )
+                    # The verdict settles the step: passed → `succeeded`, a
+                    # proven-false postcondition → `failed` (a retry reopens
+                    # it). `unconfirmed` settles nothing — it is an absence
+                    # of evidence, never a failure (P5) — so the row stays
+                    # `running` while the read-back is retried.
+                    if result.status in (
+                        VerificationStatus.PASSED,
+                        VerificationStatus.NOT_REQUIRED,
+                    ):
+                        await self._write_step_outcome(uow, step_row, status=StepStatus.SUCCEEDED)
+                    elif result.status is VerificationStatus.FAILED:
+                        await self._write_step_outcome(
+                            uow,
+                            step_row,
+                            status=StepStatus.FAILED,
+                            error={
+                                "class": ErrorClass.VERIFICATION_FAILED.value,
+                                "message": result.detail
+                                or f"Postcondition verification failed for step {step.step_id}",
+                                "detail": {"checks": [c.model_dump() for c in result.checks]},
+                            },
+                        )
 
                 is_ok = result.status in (
                     VerificationStatus.PASSED,
@@ -1514,7 +1732,7 @@ class NodeHandlers:
             and not is_safe_to_retry_mutation(verification, contract)
         ):
             if step.optional and plan is not None:
-                return self._skip_optional_step(plan, current_step_id)
+                return await self._skip_step(state, plan, current_step_id)
             return {"status_reason": "verification_failed"}
 
         # Crash / resume idempotency: has this attempt already been accounted for?
@@ -1560,7 +1778,7 @@ class NodeHandlers:
             }
 
         if action == RecoveryAction.SKIP and step.optional and plan is not None:
-            return self._skip_optional_step(plan, current_step_id)
+            return await self._skip_step(state, plan, current_step_id)
 
         if action == RecoveryAction.REPLAN:
             return {
@@ -1641,7 +1859,7 @@ class NodeHandlers:
 
         if verify_retries >= budgets.max_retries:
             if step.optional and plan is not None:
-                return self._skip_optional_step(plan, step_id)
+                return await self._skip_step(state, plan, step_id)
             return {"status_reason": "verification_unconfirmed"}
 
         new_retries = verify_retries + 1
@@ -1659,6 +1877,12 @@ class NodeHandlers:
             "retry_count": {key: new_retries},
             "status_reason": f"retry_verify_attempt_{new_retries}",
         }
+
+    async def _skip_step(self, state: AgentState, plan: Plan, step_id: str) -> dict[str, Any]:
+        """Skip an optional step, and settle its row `skipped` if it ever
+        executed — the failed attempt's `error` stays on it as the reason."""
+        await self._project_step(state, plan, step_id, status=StepStatus.SKIPPED)
+        return self._skip_optional_step(plan, step_id)
 
     @staticmethod
     def _skip_optional_step(plan: Plan, step_id: str) -> dict[str, Any]:

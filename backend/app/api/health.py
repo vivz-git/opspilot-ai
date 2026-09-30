@@ -21,6 +21,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.api.correlation import request_trace_id
+from app.api.errors import problem_details
+
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["health"])
@@ -114,21 +117,19 @@ async def healthz() -> dict[str, str]:
 
 @router.get("/readyz")
 async def readyz(
+    request: Request,
     engine: AsyncEngine = Depends(get_db_engine),
     expected_head: str | None = Depends(get_alembic_head),
 ) -> JSONResponse:
     result = await check_readiness(engine, expected_head)
     if not result.ready:
-        return JSONResponse(
-            status_code=503,
-            media_type="application/problem+json",
-            content={
-                "type": "https://opspilot.dev/errors/integration-unavailable",
-                "title": "Integration unavailable",
-                "status": 503,
-                "detail": result.detail,
-                "code": "integration_unavailable",
-            },
+        return problem_details(
+            503,
+            code="integration_unavailable",
+            title="Integration unavailable",
+            detail=result.detail or "not ready",
+            instance=request.url.path,
+            trace_id=request_trace_id(request),
         )
     return JSONResponse(
         status_code=200,

@@ -4,6 +4,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 
 import {
   createEvaluationRun,
+  createRun,
   decideApproval,
   getApproval,
   getEvaluationMetrics,
@@ -20,6 +21,7 @@ import {
   type EvaluationMetricsQuery,
   type EvaluationRunCreateRequest,
   type EvaluationRunListQuery,
+  type RunCreateRequest,
   type RunListQuery,
   type TraceEventResource,
 } from "./client";
@@ -77,6 +79,22 @@ export function useRun(runId: string) {
     queryKey: ["runs", runId],
     queryFn: () => getRun(runId),
     enabled: Boolean(runId),
+  });
+}
+
+/**
+ * Submit a new run. The response is the server's own `RunResource` for the
+ * run it created — it seeds the detail query so the page the operator lands
+ * on renders the real row at once; nothing here is a locally invented run.
+ */
+export function useCreateRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: RunCreateRequest) => createRun(body),
+    onSuccess: (run) => {
+      queryClient.setQueryData(["runs", run.run_id], run);
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
   });
 }
 

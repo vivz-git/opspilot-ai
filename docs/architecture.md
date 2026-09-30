@@ -1545,6 +1545,30 @@ plan-vs-actual table the timeline renders.
 `(run_id, status)`, `(verification_status)` where
 `verification_status = 'failed'` (the "what silently didn't work" query).
 
+**Lifecycle (the projection).** The row is written at the execution boundary
+in `execute_tool`/`verify`/`recover`, never for work that did not happen: it
+is created when the step's first attempt starts — after argument validation,
+the gate re-assertion and token minting, so a step paused at approval, or
+rejected there, has no row. Each attempt sets `running`,
+`attempts = max(attempts, attempt)` (idempotent under node re-execution) and
+`retry_count = attempts − 1`; `started_at` is the first attempt's start.
+The attempt then settles it: `succeeded` (verification `none`, or `verify`
+passed), `failed` with `error` (the tool failed, or `verify` proved the
+postcondition false — a retry reopens it), `skipped` (optional step
+abandoned by `recover`, keeping the error that caused it). `unconfirmed`
+settles nothing (P5): the row stays `running` while the read-back is retried.
+`finished_at`/`duration_ms` are stamped on settlement from the injected clock
+(`duration_ms = finished_at − started_at`, retry backoff included). When the
+run reaches a terminal status, `app/execution/settlement.py` closes any row
+still unsettled as `failed` with the run's `status_reason` and its
+`verification_status` untouched. `agent_runs.step_count` is the number of
+rows with `attempts > 0` (executed step instances, fan-out children and
+per-revision instances included; retries are not steps) and `retry_total`
+the sum of their `retry_count` — both recounted in the same transaction as
+each attempt start and at terminal settlement. `plan`, `plan_revision`,
+`plan_history`, `normalized_task` and `replan_count` are written by the
+`plan` node whenever it accepts (or fails to revise) a plan.
+
 ### 12.5 `opspilot.tool_calls`
 
 One row per **attempt**. Separate from `execution_steps` precisely because a
@@ -1699,7 +1723,11 @@ machine-readable `code`:
 ```
 
 Clients branch on `code`, never on `detail` prose. `trace_id` is echoed on every
-error so an operator report maps to logs.
+error so an operator report maps to logs. It is a **per-request correlation
+id**, minted server-side for each HTTP request by
+`app/api/correlation.py::RequestCorrelationMiddleware` (never taken from a
+client header) and bound into every log line written while serving that
+request — it is not a `run_id`, an `approval_id` or a trace-event `seq`.
 
 | `code` | HTTP | Meaning |
 |---|---|---|
@@ -1713,6 +1741,7 @@ error so an operator report maps to logs.
 | `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
 | `budget_exhausted` | 409 | Operation would exceed a configured budget |
 | `integration_unavailable` | 503 | Adapter or database unreachable; retryable |
+| `method_not_allowed` | 405 | The route exists but not for this method (framework-level; `Allow` header preserved) |
 | `internal_error` | 500 | Bug. Generic message only; detail goes to logs, never to the client (§16.5) |
 
 ### 13.2 Runs

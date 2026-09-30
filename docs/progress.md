@@ -1,6 +1,6 @@
 # Progress
 
-Repository state as of 2026-09-19 (launch-hardening session).
+Repository state as of 2026-09-30 (final engineering hardening, LAUNCH-003).
 **The repository is the source of truth.** If this file and `git log` disagree,
 `git log` wins — and this file is wrong and should be fixed.
 
@@ -20,36 +20,41 @@ against a real database, pauses for a human, resumes on the decision, verifies
 its simulated effect and terminates with a complete trace — driven from the
 operator console in a browser, live over SSE.
 
-**Phase 2 — launch hardening: this session.** The deployment shape, the access
-boundary and the demo dataset. The project is *not deployed* — see "Not done"
-below.
+**Phase 2 — launch hardening: engineering complete.** The deployment shape,
+the access boundary, the demo dataset (LAUNCH-001), and the final hardening
+pass (LAUNCH-003) are done. No known repository-level defect is open. The
+project is *not deployed*: the only remaining work is external — provider
+accounts, production secrets, deployment, the Cloudflare Access
+configuration and the hosted end-to-end verification (LAUNCH-002,
+`docs/deployment.md` §5).
 
 ```
 architecture   ████████████████████  complete
 contract spine ████████████████████  complete (state, contracts, errors, security, config)
 foundation     ████████████████████  FOUND-001..004 done
-persistence    ████████████████████  DB-001..007 done
+persistence    ████████████████████  DB-001..007 done; execution_steps/counters projected
 tools          ████████████████████  the nine tools, dispatch, mock adapters
 agent graph    ████████████████████  AGENT-001..009 complete
 hitl           ████████████████████  HITL-001..005 complete
 verification   ████████████████████  invariant + read-back verifiers wired
-api            ████████████████████  runs, trace, SSE, approvals, evaluations, tools, health
-frontend       ████████████████████  runs, run detail, approvals, evaluations, tools, live SSE
+api            ████████████████████  runs, trace, SSE, approvals, evaluations, tools, health; trace_id on errors
+frontend       ████████████████████  runs (incl. submission), run detail, approvals, evaluations, tools, live SSE
 evaluation     ████████████████████  EVAL-001..005 done; 7/7 cases green
-deployment     ████████████░░░░░░░░  configuration and docs done; nothing is hosted yet
-observability  ████████░░░░░░░░░░░░  structured logs, redaction, the trace; OTel deferred (ADR-015)
+deployment     ████████████████░░░░  Render + Supabase + Vercel + Cloudflare Access configured; nothing hosted
+observability  ████████░░░░░░░░░░░░  structured logs, redaction, the trace, request trace_id; OTel deferred (ADR-015)
 ```
 
-**Measured, this session, against PostgreSQL 16:**
+**Measured, 2026-09-30, against PostgreSQL 16:**
 
 | Check | Result |
 |---|---|
-| `uv run pytest` | 1799 passed, 1 skipped (the opt-in live Groq smoke test) |
-| coverage | 93.65% (floor 80%) |
+| `uv run pytest --cov=app --cov-fail-under=80` | 1823 passed, 1 skipped (the opt-in live Groq smoke test) |
+| coverage | 93.91% (floor 80%) |
 | `ruff check` / `ruff format --check` / `mypy app` | clean |
 | `python -m app.evaluation.cli run --suite all` | 7/7 cases, 0 invariant violations |
-| frontend `typecheck` / `lint` / `vitest` / `build` | clean; 123 unit tests |
-| `playwright test` | 14 passed |
+| frontend `typecheck` / `lint` / `vitest` / `build` | clean; 130 unit tests |
+| `schema.d.ts` regenerated from `app.openapi()` | no drift |
+| `playwright test` | 16 passed |
 
 ---
 
@@ -2500,3 +2505,143 @@ console, driven by a real Chromium:
   every step of a completed run as `pending`. That is an API-contract bug in
   the core runtime, not a deployment concern, and wiring persistence into the
   execution nodes does not belong in a deployment change.
+
+---
+
+## LAUNCH-003 — final engineering hardening before the hosted deployment (2026-09-30)
+
+Closes every repository-level defect the previous handoff listed, plus three
+found on the way, and moves the deployment target from Railway to Render +
+Supabase + Vercel + Cloudflare Access (ADR-027). PR #8 (LAUNCH-002's
+documentation) was already merged; this work starts from its merge commit.
+
+### Before: what a real canonical run persisted
+
+Driven over HTTP against the unmodified code and a real PostgreSQL 16: every
+`execution_steps` row `pending` with `attempts=0` and no duration,
+`agent_runs.step_count=0`, and `agent_runs.plan` **null** — so the console's
+Plan-vs-Actual panel could only say "No plan has been recorded". The trace was
+correct throughout (34 events, `run_completed` last).
+
+### Fixed
+
+1. **`execution_steps` lifecycle projection** (`app/agent/nodes.py`). The row
+   is written at the execution boundary: created when a step's first attempt
+   starts — after argument validation, the gate re-assertion and token minting,
+   so a paused or rejected gated step never gets a row — and moved to
+   `running` on every attempt (`begin_attempt`: `attempts=max(attempts,
+   attempt)`, idempotent under node re-execution; `retry_count=attempts−1`;
+   `started_at` only on the first). The attempt settles it: `succeeded` with
+   its redacted result (verification `none`, or `verify` passed), `failed`
+   with `{class, message, detail}` (tool failure, or a proven-false read-back —
+   a retry reopens it), `skipped` (optional step abandoned by `recover`).
+   `unconfirmed` settles nothing (P5). `finished_at`/`duration_ms` come from
+   the injected clock via one new `app.runtime.elapsed_ms`. The previously
+   uncalled `update_status`/`record_result` are now the write path.
+2. **`agent_runs.step_count`, `retry_total`, `replan_count`, `plan`.**
+   `step_count` counts executed step instances (`attempts > 0`) and
+   `retry_total` sums their retries — recounted by one `UPDATE` in the same
+   transaction as each attempt start (`refresh_step_counters`), so a
+   re-executed node cannot double-count. `retry_total` and `replan_count` had
+   the same never-written defect as `step_count`. The `plan` node now persists
+   `plan`, `plan_revision`, `plan_history`, `normalized_task` and
+   `replan_count` whenever it accepts a plan or fails a revision.
+3. **One terminal settlement** (`app/execution/settlement.py`). The executor,
+   `ApprovalService` and the reconciler each had their own "transition, then
+   append the terminal event" and they had drifted: the reconciler's finalize
+   (R3) wrote `run_recovered` where the run's terminal event belonged, and a
+   run the reconciler *resumed* (R4) settled with no event at all. All three
+   now call `settle_terminal`: one guarded transition, an optional
+   `run_recovered` observation, then the `TERMINAL_TRACE_EVENTS` event, always
+   last. Found on the way: the approval path never materialised
+   `agent_runs.duration_ms` — it does now. Once a run is terminal, any step
+   still unsettled (e.g. the step a cancellation interrupted before its
+   verification) is closed `failed` with the run's reason, verification status
+   untouched, and the counters are recounted.
+4. **`trace_id` on every error** (`app/api/correlation.py`). A pure ASGI
+   middleware mints a per-request id from the injected `IdGenerator` (never a
+   client header), puts it on the request and in structlog's context. Every
+   handler now echoes it; the generic 500 logs it explicitly (its handler runs
+   outside the middleware); framework 404/405s and `/readyz`'s 503 now use the
+   same problem+json envelope (`method_not_allowed` added to §13.1). Codes,
+   statuses and messages are otherwise unchanged; SSE is untouched.
+5. **Run submission in the console** (`components/runs/new-run-form.tsx` on
+   `/runs`). A request box, a one-click canonical request, **Submit run** →
+   `POST /runs` with `auto_start`, a disabled/`aria-busy` "Submitting…" state
+   with no animation, the server's §13.1 error (and its `trace_id`) on
+   refusal, and navigation to the run the server created, whose resource
+   seeds the detail query. No local run state.
+6. **Deployment target → Render + Supabase + Vercel + Cloudflare Access.**
+   `railway.json` removed; `render.yaml` (Blueprint) added: the existing
+   Dockerfile and `start.sh`, free plan, one instance, `/readyz` health check,
+   migrate/seed on start, secrets as `sync: false`. `docs/deployment.md`
+   rewritten. The one security consequence — `<service>.onrender.com` reaches
+   the origin around Cloudflare, and ADR-026's fence is presence-only — is
+   handled by making `renderSubdomainPolicy: disabled` a required step with a
+   forged-header verification (ADR-027).
+7. **Found: a TLS `DATABASE_URL` crashed the checkpointer.** SQLAlchemy passes
+   the URL query to `asyncpg.connect()` as kwargs (TLS is `ssl=require`), while
+   `libpq_conninfo` handed the same query to psycopg, which rejects `ssl`
+   (`invalid URI query parameter: "ssl"`, reproduced). It now translates `ssl`
+   to `sslmode`, so one Supabase URL serves both drivers.
+8. **Found: images built from a Windows checkout were broken**, and local
+   builds shipped `.venv`. `.gitattributes` pins `*.sh` and the Dockerfile to
+   LF (the entrypoint died with `env: 'sh\r'`); `backend/.dockerignore`
+   excludes virtualenvs, caches and env files. A Windows-only parser bug in a
+   TEST-003 test (splitting mypy output on `:` across a drive letter) was also
+   fixed without weakening it.
+
+### Tests added or changed
+
+- `test_graph_behavior.py::TestControlPlaneProjection` (10, production
+  composition, real Postgres, rows read back and `GET /runs/{id}` over ASGI):
+  success, retry, retry exhaustion, optional skip, replan (one failed row per
+  revision), approval pause/resume (no row for the gated step until approved),
+  rejection (never a row), failed-then-passing read-back, never-verifying
+  effect, cancellation mid-step.
+- `test_recovery.py`: R3 finalisation of a *failed* checkpoint (ends
+  `run_failed`, closes the dead worker's step, recounts), R4 resume ending
+  failed, and the rejected R3 ending `run_rejected`. Five existing assertions
+  that pinned the missing terminal event now require it.
+- `test_api_contract.py::TestTraceIdCorrelation` (5): domain 404/409/422, the
+  500 and its log line, framework 404/405, the fence's 401 (including the
+  schema) and `/readyz`'s 503 — fresh id per request, never a run id, never a
+  client-supplied value.
+- `test_checkpointing.py`: `ssl`→`sslmode` translation, checked with psycopg's
+  own parser.
+- Frontend: `new-run-form.test.tsx` (7) and `e2e/run-submission.spec.ts` (2:
+  submit the canonical request and land on the run; a refused submission
+  shows the reason and `trace_id` and stays put).
+
+### Verified against a live stack, not asserted
+
+- the canonical run over HTTP on the new code: 9 settled steps at the pause
+  and no row for `s8`, `step_count` 9 → 10, every step `succeeded` with
+  `attempts=1` and a real duration, `plan` persisted, trace unchanged at 34
+  events ending `run_completed`;
+- **the production image in the Render shape** (`PORT=10000`, production,
+  `proxy` auth, `ssl=` in `DATABASE_URL`, migrate + seed on start, an empty
+  database): migrated to head `c88ad060adfa`, seeded 11/14/5, checkpointer
+  ready, reconciled, Docker health `healthy`, `/healthz` and `/readyz` ok;
+  every operational route and `/openapi.json`, `/docs` 401 without the proxy
+  header (with `trace_id`) and 200 with it; CORS echoes only the allowlisted
+  origin; approve path → one `provider=mock` outbox row and `run_completed`;
+  reject path → no row, no `s8` step, `run_rejected`; both runs carry
+  `duration_ms`; a restart tops up 0 rows and keeps both runs;
+- all nine production fuses refuse to start the image;
+- evaluation gate 7/7 with 0 invariant violations, now including real
+  `execution_steps.attempts` for invariant 3.
+
+### Not done, and why
+
+- **Nothing is hosted (LAUNCH-002).** No Render, Supabase, Vercel or
+  Cloudflare resource exists and none was simulated. `render.yaml` follows
+  Render's Blueprint documentation but has not been applied by Render.
+- **Not re-verified in a browser against a live backend this session.** The
+  console was verified by Vitest and Playwright (with API interception); the
+  live SSE, reload-reconstruction and expired-approval behaviour are covered by
+  the backend suites and were browser-verified in LAUNCH-001/002, and are part
+  of the hosted verification in `docs/deployment.md` §5.3/§6.
+- Local tooling on Windows needs a selector event loop for psycopg
+  (uvicorn and the evaluation CLI were run that way here); CI and the Docker
+  image run Linux and are unaffected.

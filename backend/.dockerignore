@@ -1,0 +1,13 @@
+# The image installs its own environment from uv.lock (Dockerfile); nothing
+# from a developer's working copy belongs in the build context — above all no
+# local virtualenv and no environment file.
+.venv/
+.env
+.env.*
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

@@ -233,6 +233,9 @@ class Harness:
     work_started: asyncio.Event = field(default_factory=asyncio.Event)
     effect: Callable[[uuid.UUID], Awaitable[str]] | None = None
     effect_results: list[str] = field(default_factory=list)
+    #: When set, `finish` ends the run with this `(status, status_reason)`
+    #: instead of `completed` — a graph that reached END on a failure.
+    finish_as: tuple[RunStatus, str] | None = None
     _never: asyncio.Event = field(default_factory=asyncio.Event)
 
     def calls(self, run_id: uuid.UUID) -> dict[str, int]:
@@ -265,6 +268,9 @@ class Harness:
 
         async def finish(state: HarnessState) -> dict[str, Any]:
             self._count(state, "finish")
+            if self.finish_as is not None:
+                status, reason = self.finish_as
+                return {"log": ["finish"], "status": status.value, "status_reason": reason}
             if state.get("needs_approval") and state.get("decision") != "approve":
                 return {
                     "log": ["finish"],

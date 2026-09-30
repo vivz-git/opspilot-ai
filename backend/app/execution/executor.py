@@ -49,7 +49,6 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final
 
@@ -59,12 +58,8 @@ from app.agent.nodes import create_initial_state
 from app.agent.state import TERMINAL_RUN_STATUSES, Budgets, RunMetadata, RunStatus
 from app.execution.leases import LeaseConfig, LeaseNotAcquired, UnitOfWorkFactory, hold_lease
 from app.execution.recovery import CheckpointInspection, CheckpointPhase, RunDriver
-from app.persistence.models import (
-    TERMINAL_TRACE_EVENTS,
-    AgentRun,
-    TraceEventKind,
-    TraceEventSeverity,
-)
+from app.execution.settlement import settle_terminal
+from app.persistence.models import AgentRun, TraceEventSeverity
 from app.runtime import Clock
 
 __all__ = [
@@ -258,32 +253,19 @@ class Executor:
             await self._fail(run, None, detail="graph finished without a terminal status")
             return ExecutionOutcome.FAILED
 
-        now = self._clock.now()
         async with self._uow_factory() as uow:
-            row = await uow.agent_runs.transition_status(
-                run.id,
+            row = await settle_terminal(
+                uow,
+                run_id=run.id,
                 expected=(RunStatus.RUNNING,),
-                status=terminal,
                 owner=self._owner,
+                status=terminal,
                 status_reason=result.status_reason,
-                finished_at=now,
-                duration_ms=_duration_ms(run.started_at, now),
+                now=self._clock.now(),
+                started_at=run.started_at,
                 final_response=result.final_response,
-                release_lease=True,
+                payload={"status_reason": result.status_reason, "owner": self._owner},
             )
-            if row is not None:
-                await uow.trace_events.append(
-                    run_id=run.id,
-                    kind=TERMINAL_TRACE_EVENTS[terminal],
-                    severity=(
-                        TraceEventSeverity.WARNING
-                        if terminal is RunStatus.FAILED
-                        else TraceEventSeverity.INFO
-                    ),
-                    status=terminal.value,
-                    duration_ms=row.duration_ms,
-                    payload={"status_reason": result.status_reason, "owner": self._owner},
-                )
             await uow.commit()
         # `row is None` means the run was already terminal — cancelled by the
         # operator while the graph wound down — and that verdict stands.
@@ -297,35 +279,22 @@ class Executor:
         *,
         detail: str = "graph raised during execution",
     ) -> None:
-        now = self._clock.now()
         async with self._uow_factory() as uow:
-            row = await uow.agent_runs.transition_status(
-                run.id,
+            await settle_terminal(
+                uow,
+                run_id=run.id,
                 expected=(RunStatus.RUNNING,),
-                status=RunStatus.FAILED,
                 owner=self._owner,
+                status=RunStatus.FAILED,
                 status_reason=REASON_EXECUTION_FAILED,
-                finished_at=now,
-                duration_ms=_duration_ms(run.started_at, now),
-                release_lease=True,
+                now=self._clock.now(),
+                started_at=run.started_at,
+                severity=TraceEventSeverity.ERROR,
+                error={
+                    "class": REASON_EXECUTION_FAILED,
+                    "message": detail,
+                    "detail": repr(error) if error is not None else None,
+                },
+                payload={"owner": self._owner},
             )
-            if row is not None:
-                await uow.trace_events.append(
-                    run_id=run.id,
-                    kind=TraceEventKind.RUN_FAILED,
-                    severity=TraceEventSeverity.ERROR,
-                    status=RunStatus.FAILED.value,
-                    error={
-                        "class": REASON_EXECUTION_FAILED,
-                        "message": detail,
-                        "detail": repr(error) if error is not None else None,
-                    },
-                    payload={"owner": self._owner},
-                )
             await uow.commit()
-
-
-def _duration_ms(started_at: datetime | None, finished_at: datetime) -> int | None:
-    if started_at is None:
-        return None
-    return max(0, int((finished_at - started_at).total_seconds() * 1000))

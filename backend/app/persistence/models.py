@@ -107,8 +107,10 @@ class TraceEventKind(StrEnum):
 
 
 #: The trace event that records a run reaching each terminal status (§14.2).
-#: Every path that settles a run to a terminal status appends the matching
-#: event: the executor, and the approval-resume settle in `ApprovalService`.
+#: Every path that settles a run to a terminal status — the executor, the
+#: approval-resume settle in `ApprovalService` and the reconciler — does so
+#: through `app.execution.settlement.settle_terminal`, which appends the
+#: matching event; `RunService.cancel_run` appends `run_cancelled` itself.
 #: A terminal run without its terminal event is a trace that never says the
 #: run ended — and an SSE client waits for that event to stop reconnecting
 #: (`frontend/src/lib/api/use-run-events.ts`), so the two must not drift.

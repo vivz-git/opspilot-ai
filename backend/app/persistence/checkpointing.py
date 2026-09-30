@@ -91,8 +91,21 @@ _log = structlog.get_logger("opspilot.checkpointing")
 def libpq_conninfo(database_url: str) -> str:
     """Turn the SQLAlchemy URL in `Settings.database_url` into the libpq
     connection string psycopg expects — same host, database and
-    credentials, no `+asyncpg` driver suffix."""
-    return make_url(database_url).set(drivername="postgresql").render_as_string(hide_password=False)
+    credentials, no `+asyncpg` driver suffix.
+
+    TLS is the one option the two drivers spell differently. SQLAlchemy hands
+    the URL's query to `asyncpg.connect()` as keyword arguments, where TLS is
+    `ssl=require` (asyncpg has no `sslmode` keyword); libpq rejects `ssl` and
+    only knows `sslmode`. So a managed database that needs TLS is configured
+    once, asyncpg's way, and translated here — `ssl=<mode>` becomes
+    `sslmode=<mode>` (the mode names are the same in both drivers) unless
+    `sslmode` was given explicitly."""
+    url = make_url(database_url).set(drivername="postgresql")
+    query = dict(url.query)
+    ssl = query.pop("ssl", None)
+    if ssl is not None and "sslmode" not in query:
+        query["sslmode"] = ssl
+    return url.set(query=query).render_as_string(hide_password=False)
 
 
 def thread_config(run_id: uuid.UUID | str) -> RunnableConfig:

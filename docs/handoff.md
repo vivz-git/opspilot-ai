@@ -17,7 +17,7 @@ cat docs/tasks.md             # 2. what is next, with acceptance criteria
 cat docs/decisions.md         # 3. what is already decided, and why
 git status                    # 4. is the tree clean?
 git log --oneline -15         # 5. what actually landed
-cd backend && uv run pytest   # 6. still green? expect 1804 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
+cd backend && uv run pytest   # 6. still green? expect 1823 passed, 1 skipped (the opt-in live Groq smoke test) with DATABASE_URL at a reachable Postgres
 grep -rn "TODO\|FIXME" backend/app 2>/dev/null   # 7. any unfinished edges
 ```
 
@@ -32,67 +32,45 @@ code is what runs and the document is a bug — fix the document, do not
 
 ## 2. Where the project stands
 
-**The system runs end to end.** The contract spine, the foundation, the whole
-persistence layer, the nine tools behind `ToolRegistry.dispatch`, the
-LangGraph graph with all nine nodes, both planners, recovery, cancellation,
-the HITL approval path, the verifiers, the HTTP API (runs, trace, SSE,
-approvals, evaluations, tools, health), the evaluation runner and the operator
-console are implemented and tested: 1804 backend tests at 93% coverage, 123
-frontend unit tests, 14 Playwright specs, 7/7 evaluation cases.
+**The repository is engineering-complete.** The contract spine, the
+foundation, the whole persistence layer, the nine tools behind
+`ToolRegistry.dispatch`, the LangGraph graph with all nine nodes, both
+planners, recovery, cancellation, the HITL approval path, the verifiers, the
+HTTP API (runs, trace, SSE, approvals, evaluations, tools, health), the
+evaluation runner and the operator console — including run submission — are
+implemented and tested: 1823 backend tests at 94% coverage, 130 frontend unit
+tests, 16 Playwright specs, 7/7 evaluation cases with 0 invariant
+violations. No known repository-level defect is open (`docs/progress.md`
+§LAUNCH-003 closed the last five from the previous handoff and three more
+found on the way).
 
-The canonical request runs against a real database, pauses for a human,
-resumes on the decision, verifies its simulated effect and terminates with a
-complete trace — driven from the console in a browser, live over SSE. That was
-demonstrated, not assumed; `docs/progress.md` §LAUNCH-001 records exactly what
-was checked.
-
-**Nothing is hosted.** The deployment configuration exists
-(`docs/deployment.md`, `railway.json`, `frontend/vercel.json`,
-`backend/scripts/start.sh`) and LAUNCH-002 verified it against a live stack in
-the exact hosted shape, but no platform account has been reachable from any
-session that tried. LAUNCH-002 established *why*, and it is not the missing
-login LAUNCH-001 assumed: the sandbox's egress policy denies
-`backboard.railway.com`, `api.vercel.com` and `api.cloudflare.com` at the
-proxy (`403` on `CONNECT`), so the device-code flow cannot even start. Either
-run §5 yourself, or work from an environment whose egress policy permits those
-three hosts. A token alone will not help.
+**Nothing is hosted.** The deployment target is Render (API, free web
+service, `render.yaml`) + Supabase (PostgreSQL) + Vercel (console,
+`frontend/vercel.json`) behind Cloudflare Access (ADR-026, ADR-027). The
+production image has been run in exactly that shape against a local Postgres
+(`docs/progress.md` §LAUNCH-003), but no provider account, resource, hostname
+or Access policy exists, and none is described in this repository.
+LAUNCH-002 is the remaining task, and it is entirely external: provider
+accounts, secrets, deployment, the access layer and the hosted end-to-end
+check. Earlier sessions could not reach the providers' control planes at all
+(`docs/progress.md` §LAUNCH-002), so run it from an environment that can.
 
 **Do not expose this without the access layer.** OpsPilot authenticates
 nobody (ADR-017). The hosted shape is `OPSPILOT_AUTH_MODE=proxy` behind an
 identity-aware proxy (ADR-026), and the app's own header check is a
-fail-closed backstop, not authentication.
+fail-closed backstop, not authentication — which is why Render's
+`onrender.com` subdomain must be disabled (ADR-027).
 
 ## 3. Start here
 
-Pick from these, in the order a portfolio reviewer would notice them:
-
-1. **Finish the deployment.** `docs/deployment.md` §4 and §5: `railway login`,
-   `vercel login`, the Cloudflare Access applications, then the four
-   verification `curl`s in §5. `/runs` or `/openapi.json` returning `200`
-   means the access layer is not on — stop there. Read §5's "Deployment
-   status" first: this needs an environment that can reach the three
-   providers' control planes.
-2. **Two denormalised-projection bugs** (both pre-existing, both visible in
-   the console, neither a safety issue): `agent_runs.step_count` stays 0 on a
-   completed run, and `execution_steps.status` stays `pending` for steps that
-   succeeded. The run resource's `verification_status` and the trace both
-   disagree with those columns, so the projection is what is wrong.
-   LAUNCH-002 found the cause of the second:
-   `ExecutionStepRepository.update_status` and `record_result` have no caller
-   in the execution path, while `record_verification` does — which is exactly
-   why `verification_status` is the one column that is right, and why
-   `attempts`, `started_at`, `finished_at` and `duration_ms` are never written
-   either. The console reads the trace, so an operator sees the truth; an API
-   consumer reading `GET /runs/{id}` does not.
-3. **The reconciler's finalize path** emits `run_recovered` rather than the
-   run's terminal trace event — the same defect that
-   `ApprovalService.decide_approval` had until LAUNCH-001 fixed it there.
-   `persistence/models.py::TERMINAL_TRACE_EVENTS` is the shared map to use.
-4. **A run-submission form in the console.** The demo currently starts runs
-   over `POST /runs`; an operator console that cannot ask for anything is an
-   obvious gap.
-5. **`trace_id` is never echoed on error responses**, contradicting §13.1.
-   Needs per-request correlation (middleware) that does not exist yet.
+1. **Deploy (LAUNCH-002).** Follow `docs/deployment.md` §5 in order —
+   Supabase, Render Blueprint, Vercel, Cloudflare Access, disable the
+   `onrender.com` subdomain — then every check in §5.3 and the demo in §6.
+   `/runs` or `/openapi.json` returning `200` without an Access session, or
+   the `onrender.com` URL returning anything but `404`, means the boundary is
+   not in place: stop there.
+2. After that, only optional work remains in `docs/tasks.md` (OBS-004/005,
+   DOC-004, the open questions in `docs/decisions.md`).
 
 Whatever you pick: `docs/architecture.md` is the specification, and
 `docs/decisions.md` records what is already decided and what it cost.
@@ -230,8 +208,7 @@ it.
 |---|---|---|
 | Obtain a `GROQ_API_KEY` from <https://console.groq.com/keys> and put it in `.env` (`GROQ_MODEL=openai/gpt-oss-120b`, ADR-025) | `OPSPILOT_PLANNER=llm`; LLM-written plans and outreach copy | **No.** With no key, `auto` uses the deterministic rule planner and the template content generator. All nine tools, approvals, verification, the evaluation suite and the dashboard work unchanged. |
 | Choose and add a license file | Reuse and contribution clarity on a public repository | No, but decide early |
-| Provide a deployment target and credentials | Anything beyond local Docker | No. Local `docker compose` is the supported environment, and `OPSPILOT_ENV=production` deliberately refuses to start without authentication (ADR-017). |
-| Grant the Claude GitHub App access to `vivz-git/opspilot-ai` | Pushing this branch to the remote | **Yes, for pushing only.** The architecture session's ten commits exist locally on `claude/great-euler-ql1wxj`; `git push` returned 403 because the app is not installed for the repository. An org admin can install it at <https://github.com/apps/claude/installations/select_target>, or reconnect GitHub from claude.ai settings. Re-run `git push -u origin claude/great-euler-ql1wxj` afterwards — nothing needs rebuilding. |
+| Create the Render, Supabase, Vercel and Cloudflare accounts/resources, set the production secrets, deploy, configure Access and run the hosted verification | The hosted demo (LAUNCH-002, `docs/deployment.md` §5) | **Yes, for hosting only.** Local `docker compose` is fully supported, and `OPSPILOT_ENV=production` deliberately refuses to start without the access-boundary configuration (ADR-017, ADR-026). |
 
 If you hit a new blocker of this kind: add the correct placeholder to
 `.env.example`, wire it through `app/config.py`, document it in this table, and

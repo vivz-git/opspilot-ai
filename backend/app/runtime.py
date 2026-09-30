@@ -70,6 +70,15 @@ class FixedClock:
         self.advance(seconds=seconds)
 
 
+def elapsed_ms(started_at: datetime | None, finished_at: datetime) -> int | None:
+    """Whole milliseconds between two readings of the same `Clock`, never
+    negative; `None` when there is no start to measure from. The one
+    definition of every materialised `duration_ms` (§12.3, §12.4)."""
+    if started_at is None:
+        return None
+    return max(0, int((finished_at - started_at).total_seconds() * 1000))
+
+
 class UuidIdGenerator:
     """Real ids: a UUID4 hex string, optionally prefixed (e.g. `run_...`)."""
 

@@ -313,9 +313,11 @@ class TestCrashRecovery:
         assert after.values["log"] == ["prepare", "work", "finish"]
         assert after.next == ()
 
+        # Recovery is observed, then the run ends the way an uninterrupted run
+        # does: with its own terminal event, last (§14.2).
         kinds = await trace_kinds(uow_factory, run_id)
-        assert kinds == [("run_recovered", "resumed")]
-        [event] = await trace_events(uow_factory, run_id)
+        assert kinds == [("run_recovered", "resumed"), ("run_completed", "completed")]
+        event, _completed = await trace_events(uow_factory, run_id)
         assert event.payload["previous_owner"] == "worker-A"
         assert event.payload["recovered_by"] == "reconciler-B"
         assert event.payload["checkpoint_id"] == checkpoint_before_crash
@@ -452,7 +454,12 @@ class TestCrashRecovery:
         assert row.status is RunStatus.COMPLETED
         assert (row.lease_owner, row.lease_expires_at) == (None, None)
         assert harness.calls(run_id) == {"prepare": 1, "work": 1, "finish": 1}
-        assert await trace_kinds(uow_factory, run_id) == [("run_recovered", "completed")]
+        # R3: the finalisation is observed, and the run still ends with the
+        # terminal event an uninterrupted run would have written.
+        assert await trace_kinds(uow_factory, run_id) == [
+            ("run_recovered", "completed"),
+            ("run_completed", "completed"),
+        ]
 
     async def test_finished_checkpoint_carries_a_rejected_outcome_faithfully(
         self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
@@ -481,6 +488,97 @@ class TestCrashRecovery:
         assert (await rec.reconcile_once(limit=500)).outcomes[run_id] is RecoveryOutcome.FINALIZED
         row = await read_run(uow_factory, run_id)
         assert (row.status, row.status_reason) == (RunStatus.REJECTED, "approval_rejected")
+        # …and the trace ends as a rejected run's does, not on the observation.
+        assert (await trace_kinds(uow_factory, run_id))[-2:] == [
+            ("run_recovered", "rejected"),
+            ("run_rejected", "rejected"),
+        ]
+
+    async def test_finished_failed_checkpoint_is_finalized_with_run_failed_last(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """R3 for a graph that reached END on a *failure*: the row takes the
+        checkpoint's `failed` verdict and reason, and the trace ends with
+        `run_failed` — the same terminal event, at the same severity, that
+        `Executor._settle` writes for an uninterrupted failed run. A step
+        the dead worker left `running` is closed with the run's reason, and
+        the run's counters are recounted from the rows."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        harness = Harness(finish_as=(RunStatus.FAILED, "retry_budget_exhausted"))
+        graph = harness.build(checkpointer)
+        run_id = await create_run(uow_factory)
+        worker = await start_worker(
+            uow_factory=uow_factory, graph=graph, run_id=run_id, owner="worker-A", clock=clock
+        )
+        await worker.task
+        async with uow_factory() as uow:
+            step = await uow.execution_steps.create(
+                run_id=run_id, step_id="s1", plan_revision=0, seq=1, tool=ToolName.SEARCH_LEADS
+            )
+            await uow.execution_steps.begin_attempt(step.id, attempt=2, started_at=T0)
+            await uow.commit()
+        await worker.heartbeat.stop()  # died before writing `failed`
+
+        clock.advance(seconds=LEASE.ttl.total_seconds() + 1)
+        rec = reconciler(engine, LangGraphRunDriver(graph), clock, "reconciler-B")
+        assert (await rec.reconcile_once(limit=500)).outcomes[run_id] is RecoveryOutcome.FINALIZED
+
+        row = await read_run(uow_factory, run_id)
+        assert (row.status, row.status_reason) == (RunStatus.FAILED, "retry_budget_exhausted")
+        assert (row.lease_owner, row.lease_expires_at) == (None, None)
+        assert row.finished_at == clock.now()
+        assert (row.step_count, row.retry_total) == (1, 1)
+
+        assert await trace_kinds(uow_factory, run_id) == [
+            ("run_recovered", "failed"),
+            ("run_failed", "failed"),
+        ]
+        observed, terminal = await trace_events(uow_factory, run_id)
+        assert observed.payload["recovery"] == "finalized"
+        assert terminal.severity is TraceEventSeverity.WARNING
+        assert terminal.payload["status_reason"] == "retry_budget_exhausted"
+
+        async with uow_factory() as uow:
+            [closed] = await uow.execution_steps.list_by_run(run_id)
+            await uow.commit()
+        assert closed.status.value == "failed"
+        assert closed.error is not None and closed.error["class"] == "retry_budget_exhausted"
+        assert closed.finished_at == clock.now()
+        assert (closed.attempts, closed.retry_count) == (2, 1)
+
+    async def test_a_resumed_run_that_fails_ends_with_run_failed(
+        self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
+    ) -> None:
+        """R4 → a failed terminal: the resume is observed as `run_recovered`
+        and the run then ends with `run_failed`, never on the observation."""
+        uow_factory = uow_factory_for(engine)
+        clock = FixedClock(T0)
+        crashed = Harness(die_in_work=True)
+        run_id = await create_run(uow_factory)
+        worker = await start_worker(
+            uow_factory=uow_factory,
+            graph=crashed.build(checkpointer),
+            run_id=run_id,
+            owner="worker-A",
+            clock=clock,
+        )
+        await crashed.work_started.wait()
+        await worker.die()
+
+        clock.advance(seconds=LEASE.ttl.total_seconds() + 1)
+        restarted = Harness(finish_as=(RunStatus.FAILED, "verification_failed"))
+        rec = reconciler(
+            engine, LangGraphRunDriver(restarted.build(checkpointer)), clock, "reconciler-B"
+        )
+        assert (await rec.reconcile_once(limit=500)).outcomes[run_id] is RecoveryOutcome.RESUMED
+
+        row = await read_run(uow_factory, run_id)
+        assert (row.status, row.status_reason) == (RunStatus.FAILED, "verification_failed")
+        assert await trace_kinds(uow_factory, run_id) == [
+            ("run_recovered", "resumed"),
+            ("run_failed", "failed"),
+        ]
 
     async def test_a_resume_that_raises_settles_the_row_as_recovery_failed(
         self, engine: AsyncEngine, checkpointer: AsyncPostgresSaver
@@ -900,7 +998,10 @@ class TestReconciliationIdempotency:
             row = await read_run(uow_factory, run_id)
             assert row.status is RunStatus.COMPLETED
             assert (row.lease_owner, row.lease_expires_at) == (None, None)
-            assert await trace_kinds(uow_factory, run_id) == [("run_recovered", "resumed")]
+            assert await trace_kinds(uow_factory, run_id) == [
+                ("run_recovered", "resumed"),
+                ("run_completed", "completed"),
+            ]
         for run_id in orphans:
             assert harness.calls(run_id) == {"prepare": 0, "work": 1, "finish": 1}
 
@@ -927,7 +1028,8 @@ class TestObservability:
         await reconciler(engine, LangGraphRunDriver(graph), clock, "reconciler-B").reconcile_once(
             limit=500
         )
-        [event] = await trace_events(uow_factory, run_id)
+        event, terminal = await trace_events(uow_factory, run_id)
+        assert terminal.kind is TraceEventKind.RUN_COMPLETED
         assert event.kind is TraceEventKind.RUN_RECOVERED
         assert event.severity is TraceEventSeverity.INFO
         assert event.seq == 1

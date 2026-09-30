@@ -47,6 +47,7 @@ from app.persistence.models import (
     TraceEventSeverity,
 )
 from app.persistence.protocols import ApprovalUpsert, RunListResult
+from app.runtime import elapsed_ms
 from app.tools.contracts import RiskLevel, ToolName
 
 __all__ = [
@@ -162,6 +163,8 @@ class SqlAgentRunRepository:
         plan: dict[str, Any],
         plan_revision: int,
         plan_history: list[Any] | None = None,
+        normalized_task: dict[str, Any] | None = None,
+        replan_count: int | None = None,
     ) -> AgentRun | None:
         run = await self.get(run_id)
         if run is None:
@@ -170,6 +173,10 @@ class SqlAgentRunRepository:
         run.plan_revision = plan_revision
         if plan_history is not None:
             run.plan_history = plan_history
+        if normalized_task is not None:
+            run.normalized_task = normalized_task
+        if replan_count is not None:
+            run.replan_count = replan_count
         await self._session.flush()
         return run
 
@@ -210,6 +217,27 @@ class SqlAgentRunRepository:
         run.replan_count += replan_delta
         await self._session.flush()
         return run
+
+    async def refresh_step_counters(self, run_id: uuid.UUID) -> None:
+        executed = (
+            select(sa.func.count())
+            .select_from(ExecutionStep)
+            .where(ExecutionStep.run_id == run_id, ExecutionStep.attempts > 0)
+            .scalar_subquery()
+        )
+        retries = (
+            select(sa.func.coalesce(sa.func.sum(ExecutionStep.retry_count), 0))
+            .where(ExecutionStep.run_id == run_id)
+            .scalar_subquery()
+        )
+        stmt = (
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(step_count=executed, retry_total=retries)
+            .execution_options(synchronize_session="fetch")
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
 
     # -- Ownership and lifecycle (DB-007, ADR-023) ---------------------------
     #
@@ -408,6 +436,16 @@ class SqlAgentRunRepository:
         return list(res.scalars().all())
 
 
+#: Step statuses that say "not finished yet" — what `settle_unsettled` closes
+#: once the run itself has ended (§12.4).
+_UNSETTLED_STEP_STATUSES: Final = (
+    StepStatus.PENDING,
+    StepStatus.READY,
+    StepStatus.AWAITING_APPROVAL,
+    StepStatus.RUNNING,
+)
+
+
 class SqlExecutionStepRepository:
     """Async SQLAlchemy implementation of ExecutionStepRepository."""
 
@@ -545,6 +583,43 @@ class SqlExecutionStepRepository:
         step.retry_count += retry_count_delta
         await self._session.flush()
         return step
+
+    async def begin_attempt(
+        self, step_uuid: uuid.UUID, *, attempt: int, started_at: datetime
+    ) -> ExecutionStep | None:
+        step = await self.get(step_uuid)
+        if step is None:
+            return None
+        step.status = StepStatus.RUNNING
+        step.attempts = max(step.attempts, attempt)
+        step.retry_count = step.attempts - 1
+        if step.started_at is None:
+            step.started_at = started_at
+        step.finished_at = None
+        step.duration_ms = None
+        step.error = None
+        await self._session.flush()
+        return step
+
+    async def settle_unsettled(
+        self,
+        run_id: uuid.UUID,
+        *,
+        finished_at: datetime,
+        error: dict[str, Any],
+    ) -> int:
+        stmt = select(ExecutionStep).where(
+            ExecutionStep.run_id == run_id,
+            ExecutionStep.status.in_(_UNSETTLED_STEP_STATUSES),
+        )
+        rows = list((await self._session.execute(stmt)).scalars().all())
+        for step in rows:
+            step.status = StepStatus.FAILED
+            step.finished_at = finished_at
+            step.duration_ms = elapsed_ms(step.started_at, finished_at)
+            step.error = error
+        await self._session.flush()
+        return len(rows)
 
 
 class SqlToolCallRepository:
